@@ -935,9 +935,8 @@ The PR title should include the issue ID: {}
                                     )
                                 );
                                 let _ = stdout_early_failure_tx.send(msg);
-                                let utilization = rate_limit_info
-                                    .as_ref()
-                                    .and_then(|info| info.utilization);
+                                let utilization =
+                                    rate_limit_info.as_ref().and_then(|info| info.utilization);
                                 let rate_limit_type = rate_limit_info
                                     .as_ref()
                                     .and_then(|info| info.rate_limit_type.as_deref());
@@ -3438,8 +3437,7 @@ mod tests {
 
     #[test]
     fn test_stream_event_rate_limit_event_with_top_level_resets_at() {
-        let json =
-            r#"{"type":"rate_limit_event","resetsAt":"2026-02-23T06:00:00Z"}"#;
+        let json = r#"{"type":"rate_limit_event","resetsAt":"2026-02-23T06:00:00Z"}"#;
         let event: StreamEvent = serde_json::from_str(json).unwrap();
         match event {
             StreamEvent::RateLimitEvent {
@@ -3447,10 +3445,7 @@ mod tests {
                 rate_limit_info,
             } => {
                 assert!(rate_limit_info.is_none());
-                assert_eq!(
-                    resets_at.unwrap().as_str().unwrap(),
-                    "2026-02-23T06:00:00Z"
-                );
+                assert_eq!(resets_at.unwrap().as_str().unwrap(), "2026-02-23T06:00:00Z");
             }
             other => panic!("Expected RateLimitEvent, got {:?}", other),
         }
