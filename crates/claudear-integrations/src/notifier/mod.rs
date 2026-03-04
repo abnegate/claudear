@@ -160,6 +160,15 @@ pub trait Notifier: Send + Sync {
     fn supports_replies(&self) -> bool {
         false
     }
+
+    /// Notify that a repo swap is happening for an issue.
+    async fn notify_repo_swap(&self, issue: &Issue, from_repo: &str, to_repo: &str) -> Result<()> {
+        self.notify_status(&format!(
+            "Repo swap for {}: {} \u{2192} {}",
+            issue.short_id, from_repo, to_repo
+        ))
+        .await
+    }
 }
 
 /// Composite notifier that sends to multiple notifiers.

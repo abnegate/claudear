@@ -886,6 +886,16 @@ async fn process_issue(
             format!("Webhook processed: {} - failed", issue.short_id),
             json!({ "success": false, "error": error }),
         ),
+        ProcessingOutcome::WrongRepo {
+            original_repo,
+            suggested_repo,
+        } => (
+            format!(
+                "Webhook processed: {} - wrong repo ({})",
+                issue.short_id, original_repo
+            ),
+            json!({ "success": false, "wrong_repo": true, "original_repo": original_repo, "suggested_repo": suggested_repo }),
+        ),
     };
     let activity = ActivityLogEntry::new("webhook_processed", activity_msg)
         .with_source(source_name.clone())

@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 /// Result of attempting to resolve a repository for an issue.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum RepoResolution {
     /// Successfully resolved to a repository.
     Resolved {
@@ -368,18 +368,18 @@ pub struct RepoEmbedding {
     pub embedding: Vec<f32>,
 }
 
-// Scoring weights for weighted repository inference
-const WEIGHT_SENTRY_PROJECT: f32 = 35.0;
-const WEIGHT_EXPLICIT_REPO_REF: f32 = 45.0;
-const WEIGHT_DIRECT_FILE_MATCH: f32 = 41.0;
-const WEIGHT_FUZZY_SINGLE: f32 = 25.0;
-const WEIGHT_FUZZY_ALL_SAME_REPO: f32 = 22.0;
-const WEIGHT_BASENAME_SINGLE: f32 = 10.0;
-const WEIGHT_EMBEDDING_MULTIPLIER: f32 = 40.0;
+// Scoring weights for weighted repository inference (sum to 100)
+const WEIGHT_SENTRY_PROJECT: f32 = 5.0;
+const WEIGHT_EXPLICIT_REPO_REF: f32 = 30.0;
+const WEIGHT_DIRECT_FILE_MATCH: f32 = 25.0;
+const WEIGHT_FUZZY_SINGLE: f32 = 12.0;
+const WEIGHT_FUZZY_ALL_SAME_REPO: f32 = 10.0;
+const WEIGHT_BASENAME_SINGLE: f32 = 3.0;
+const WEIGHT_EMBEDDING_MULTIPLIER: f32 = 15.0;
 
 // Confidence thresholds for score-to-confidence mapping
-const THRESHOLD_HIGH: f32 = 32.0;
-const THRESHOLD_MEDIUM: f32 = 21.0;
+const THRESHOLD_HIGH: f32 = 35.0;
+const THRESHOLD_MEDIUM: f32 = 15.0;
 const THRESHOLD_LOW: f32 = 5.0;
 
 /// Internal signal from a single scoring strategy.
@@ -815,6 +815,16 @@ impl RepoInferrer {
     /// candidate with the highest aggregate score. Per-filename cascade
     /// ensures each filename only contributes its strongest signal.
     fn infer_scored(&self, issue: &Issue, query_embedding: Option<&[f32]>) -> Option<InferredRepo> {
+        self.infer_scored_inner(issue, query_embedding, &[])
+    }
+
+    /// Inner scoring logic with optional exclusions.
+    fn infer_scored_inner(
+        &self,
+        issue: &Issue,
+        query_embedding: Option<&[f32]>,
+        excluded_repos: &[String],
+    ) -> Option<InferredRepo> {
         let context = IssueContext::from_issue(issue);
         let index = match self.index.read() {
             Ok(i) => i,
@@ -997,6 +1007,11 @@ impl RepoInferrer {
         }
 
         // Pick the candidate with the highest total score
+        // Remove excluded repos from candidates
+        if !excluded_repos.is_empty() {
+            candidates.retain(|name, _| !excluded_repos.contains(name));
+        }
+
         if candidates.is_empty() {
             tracing::debug!(issue_id = %issue.short_id, "No repository match found");
             return None;
@@ -1084,6 +1099,18 @@ impl RepoInferrer {
         query_embedding: Option<&[f32]>,
     ) -> Option<InferredRepo> {
         self.infer_scored(issue, query_embedding)
+    }
+
+    /// Infer the target repository while excluding specific repos.
+    ///
+    /// Used for repo-swap retry: after Claude reports wrong_repo, re-infer
+    /// with the original repo excluded from candidates.
+    pub fn infer_excluding(
+        &self,
+        issue: &Issue,
+        excluded_repos: &[String],
+    ) -> Option<InferredRepo> {
+        self.infer_scored_inner(issue, None, excluded_repos)
     }
 
     /// Get the number of indexed repositories.
@@ -1235,7 +1262,7 @@ mod tests {
         assert!(result.is_some());
         let inferred = result.unwrap();
         assert_eq!(inferred.repo.name, "appwrite/console");
-        assert_eq!(inferred.confidence, Confidence::High);
+        assert_eq!(inferred.confidence, Confidence::Medium);
     }
 
     #[test]
@@ -1350,7 +1377,7 @@ mod tests {
         assert!(result.is_some());
         let inferred = result.unwrap();
         assert_eq!(inferred.repo.name, "appwrite/cloud");
-        assert_eq!(inferred.confidence, Confidence::High);
+        assert_eq!(inferred.confidence, Confidence::Low);
         assert!(inferred.reason.contains("Sentry project"));
     }
 
@@ -1766,21 +1793,21 @@ mod tests {
         }];
         let inferrer = RepoInferrer::with_embeddings(index, embeddings);
 
-        // High similarity (>= 0.8) -> High confidence
+        // High similarity (cos ~0.998) -> score ~15.0 -> Low confidence (single embedding alone)
         let issue = create_test_issue("linear", "test", "");
-        let high_emb = vec![0.95, 0.05, 0.0]; // cos sim ~0.998
+        let high_emb = vec![0.95, 0.05, 0.0];
         let result = inferrer.infer_with_embedding(&issue, Some(&high_emb));
         assert!(result.is_some());
-        assert_eq!(result.unwrap().confidence, Confidence::High);
+        assert_eq!(result.unwrap().confidence, Confidence::Low);
 
-        // Medium similarity (0.65-0.8) -> Medium confidence
-        let med_emb = vec![0.7, 0.7, 0.0]; // cos sim ~0.707
+        // Medium similarity (cos ~0.707) -> score ~10.6 -> Low confidence
+        let med_emb = vec![0.7, 0.7, 0.0];
         let result = inferrer.infer_with_embedding(&issue, Some(&med_emb));
         assert!(result.is_some());
-        assert_eq!(result.unwrap().confidence, Confidence::Medium);
+        assert_eq!(result.unwrap().confidence, Confidence::Low);
 
-        // Low similarity (0.5-0.65) -> Low confidence
-        let low_emb = vec![0.5, 0.85, 0.0]; // cos sim ~0.507
+        // Low similarity (cos ~0.507) -> score ~7.6 -> Low confidence
+        let low_emb = vec![0.5, 0.85, 0.0];
         let result = inferrer.infer_with_embedding(&issue, Some(&low_emb));
         assert!(result.is_some());
         assert_eq!(result.unwrap().confidence, Confidence::Low);
@@ -2543,10 +2570,11 @@ mod tests {
         let issue = create_test_issue("linear", "test", "");
 
         // cos_sim([1,0,0], [0.65, 0.76, 0]) = 0.65
+        // score = 0.65 * 15 = 9.75 -> Low confidence
         let emb = vec![0.65, 0.759_934, 0.0];
         let result = inferrer.infer_with_embedding(&issue, Some(&emb));
         assert!(result.is_some());
-        assert_eq!(result.unwrap().confidence, Confidence::Medium);
+        assert_eq!(result.unwrap().confidence, Confidence::Low);
     }
 
     #[test]
@@ -2561,10 +2589,11 @@ mod tests {
         let issue = create_test_issue("linear", "test", "");
 
         // cos_sim([1,0,0], [0.8, 0.6, 0]) = 0.8
+        // score = 0.8 * 15 = 12 -> Low confidence
         let emb = vec![0.8, 0.6, 0.0];
         let result = inferrer.infer_with_embedding(&issue, Some(&emb));
         assert!(result.is_some());
-        assert_eq!(result.unwrap().confidence, Confidence::High);
+        assert_eq!(result.unwrap().confidence, Confidence::Low);
     }
 
     #[test]
@@ -3195,7 +3224,7 @@ mod tests {
             .insert("filename".to_string(), json!("src/routes/auth.ts"));
 
         let result = inferrer.infer(&issue).unwrap();
-        assert_eq!(result.confidence, Confidence::High);
+        assert_eq!(result.confidence, Confidence::Medium);
         assert!(
             result.reason.contains("Direct file match") || result.reason.contains("Explicit repo"),
             "Expected direct file match reason, got: {}",
@@ -3216,7 +3245,7 @@ mod tests {
         );
 
         let result = inferrer.infer(&issue).unwrap();
-        assert_eq!(result.confidence, Confidence::High);
+        assert_eq!(result.confidence, Confidence::Medium);
         assert!(
             result.reason.contains("Explicit repo reference"),
             "Expected explicit repo reference reason, got: {}",
@@ -3235,7 +3264,7 @@ mod tests {
             .insert("project".to_string(), json!("cloud-staging"));
 
         let result = inferrer.infer(&issue).unwrap();
-        assert_eq!(result.confidence, Confidence::High);
+        assert_eq!(result.confidence, Confidence::Low);
         assert!(
             result.reason.contains("Sentry project"),
             "Expected Sentry project reason, got: {}",
@@ -3319,8 +3348,8 @@ mod tests {
 
         // "handler.py" doesn't exist as a basename in file_index
         // (basenames are "session_handler.py" and "token_handler.py")
-        // But search_files("handler.py") matches both via substring → all same repo → 22 points
-        // 22 >= THRESHOLD_MEDIUM (21) → Medium confidence
+        // But search_files("handler.py") matches both via substring → all same repo → 10 points
+        // 10 >= THRESHOLD_LOW (5) but < THRESHOLD_MEDIUM (15) → Low confidence
         let mut issue = create_test_issue("sentry", "Handler error", "");
         issue
             .metadata
@@ -3330,7 +3359,7 @@ mod tests {
         assert!(result.is_some());
         let inferred = result.unwrap();
         assert_eq!(inferred.repo.name, "org/service");
-        assert_eq!(inferred.confidence, Confidence::Medium);
+        assert_eq!(inferred.confidence, Confidence::Low);
     }
 
     #[test]
@@ -3367,15 +3396,15 @@ mod tests {
 
     #[test]
     fn test_scoring_constants() {
-        assert_eq!(WEIGHT_SENTRY_PROJECT, 35.0);
-        assert_eq!(WEIGHT_EXPLICIT_REPO_REF, 45.0);
-        assert_eq!(WEIGHT_DIRECT_FILE_MATCH, 41.0);
-        assert_eq!(WEIGHT_FUZZY_SINGLE, 25.0);
-        assert_eq!(WEIGHT_FUZZY_ALL_SAME_REPO, 22.0);
-        assert_eq!(WEIGHT_BASENAME_SINGLE, 10.0);
-        assert_eq!(WEIGHT_EMBEDDING_MULTIPLIER, 40.0);
-        assert_eq!(THRESHOLD_HIGH, 32.0);
-        assert_eq!(THRESHOLD_MEDIUM, 21.0);
+        assert_eq!(WEIGHT_SENTRY_PROJECT, 5.0);
+        assert_eq!(WEIGHT_EXPLICIT_REPO_REF, 30.0);
+        assert_eq!(WEIGHT_DIRECT_FILE_MATCH, 25.0);
+        assert_eq!(WEIGHT_FUZZY_SINGLE, 12.0);
+        assert_eq!(WEIGHT_FUZZY_ALL_SAME_REPO, 10.0);
+        assert_eq!(WEIGHT_BASENAME_SINGLE, 3.0);
+        assert_eq!(WEIGHT_EMBEDDING_MULTIPLIER, 15.0);
+        assert_eq!(THRESHOLD_HIGH, 35.0);
+        assert_eq!(THRESHOLD_MEDIUM, 15.0);
         assert_eq!(THRESHOLD_LOW, 5.0);
     }
 }

@@ -76,6 +76,10 @@ const RESULT_SCHEMA: &str = r#"{
         "confidence_reasoning": {
             "type": ["string", "null"],
             "description": "Brief explanation of your confidence level (e.g. what makes you certain or uncertain)"
+        },
+        "wrong_repo": {
+            "type": ["string", "null"],
+            "description": "If this is the wrong repository for the issue, set this to the name of the correct repository in 'org/repo' format. Leave null if this is the correct repository."
         }
     }
 }"#;
@@ -183,6 +187,8 @@ struct StructuredResult {
     confidence: u8,
     #[serde(default)]
     confidence_reasoning: Option<String>,
+    #[serde(default)]
+    wrong_repo: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -311,17 +317,34 @@ impl ClaudeAgentRunner {
         let template_loader = TemplateLoader::new(project_dir);
         if let Ok(template) = template_loader.get_template(issue) {
             let agent_md = template_loader.load_agent_md();
-            let template_context =
+            let mut template_context =
                 TemplateContext::new(issue.clone(), context.to_string()).with_agent_md(agent_md);
+            if let Some(repo_name) = issue.get_metadata::<String>("target_repo_name") {
+                template_context = template_context.with_variable("repo_name", repo_name);
+            }
             return self.template_renderer.render(&template, &template_context);
         }
 
         // Fallback to simple format
+        let repo_name_section = issue
+            .get_metadata::<String>("target_repo_name")
+            .map(|name| {
+                format!(
+                    r#"
+IMPORTANT - Repository Verification:
+You are working in the repository: {}
+Before starting any work, verify this is the correct repository for this issue by checking that the file paths, modules, or stack traces reference code in this codebase.
+If this is NOT the correct repository, set "wrong_repo" in your response to the name of the repository you believe is correct (in "org/repo" format) and do NOT attempt any fixes.
+"#,
+                    name
+                )
+            })
+            .unwrap_or_default();
         format!(
             r#"You are fixing an issue from {}. Here is the issue context:
 
 {}
-
+{}
 Your task:
 1. Analyze the issue/error and any stack traces
 2. Find the relevant code in this codebase
@@ -333,7 +356,7 @@ Your task:
 
 The PR title should include the issue ID: {}
 "#,
-            issue.source, context, issue.short_id
+            issue.source, context, repo_name_section, issue.short_id
         )
     }
 
@@ -1295,6 +1318,7 @@ The PR title should include the issue ID: {}
                     used_qa_ids: Vec::new(),
                     confidence: 0,
                     confidence_reasoning: None,
+                    wrong_repo: None,
                 });
             }
             WaitOutcome::EarlyFailure(msg) => {
@@ -1436,6 +1460,7 @@ The PR title should include the issue ID: {}
             blocking_question,
             confidence,
             confidence_reasoning,
+            wrong_repo,
         ) = structured_result
             .as_ref()
             .and_then(|val| serde_json::from_value::<StructuredResult>(val.clone()).ok())
@@ -1460,11 +1485,12 @@ The PR title should include the issue ID: {}
                     sr_question,
                     sr.confidence,
                     sr.confidence_reasoning,
+                    sr.wrong_repo,
                 )
             })
             .unwrap_or_else(|| {
                 let (s, o, p, q) = legacy_fallback();
-                (s, o, p, None, q, 0, None)
+                (s, o, p, None, q, 0, None, None)
             });
 
         // Process-level failure always overrides model's self-reported success.
@@ -1633,6 +1659,7 @@ The PR title should include the issue ID: {}
             used_qa_ids: Vec::new(),
             confidence,
             confidence_reasoning,
+            wrong_repo,
         })
     }
 
@@ -2117,6 +2144,7 @@ mod tests {
             used_qa_ids: Vec::new(),
             confidence: 0,
             confidence_reasoning: None,
+            wrong_repo: None,
         };
         assert!(result.success);
         assert!(result.pr_url.is_some());
@@ -2135,6 +2163,7 @@ mod tests {
             used_qa_ids: Vec::new(),
             confidence: 0,
             confidence_reasoning: None,
+            wrong_repo: None,
         };
         assert!(!result.success);
         assert!(result.pr_url.is_none());
@@ -2163,6 +2192,7 @@ mod tests {
             used_qa_ids: Vec::new(),
             confidence: 0,
             confidence_reasoning: None,
+            wrong_repo: None,
         };
         assert!(!result.success);
         assert!(result.output.is_empty());
@@ -2263,6 +2293,7 @@ mod tests {
             used_qa_ids: Vec::new(),
             confidence: 0,
             confidence_reasoning: None,
+            wrong_repo: None,
         };
         assert!(result.success);
         assert_eq!(result.output.len(), 10000);
@@ -2280,6 +2311,7 @@ mod tests {
             used_qa_ids: Vec::new(),
             confidence: 0,
             confidence_reasoning: None,
+            wrong_repo: None,
         };
         assert!(result.error.is_some());
         assert!(result.error.unwrap().is_empty());
@@ -6193,6 +6225,7 @@ more output"#;
             blocking_question: None,
             confidence: 0,
             confidence_reasoning: None,
+            wrong_repo: None,
         };
         let debug = format!("{:?}", sr);
         assert!(debug.contains("StructuredResult"));

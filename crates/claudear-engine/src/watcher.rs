@@ -10299,6 +10299,7 @@ mod tests {
                     used_qa_ids: Vec::new(),
                     confidence: 0,
                     confidence_reasoning: None,
+                    wrong_repo: None,
                 })
             }
         }
@@ -10370,6 +10371,7 @@ mod tests {
                     used_qa_ids: Vec::new(),
                     confidence: 0,
                     confidence_reasoning: None,
+                    wrong_repo: None,
                 })
             }
         }

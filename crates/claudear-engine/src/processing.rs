@@ -95,6 +95,11 @@ pub enum ProcessingOutcome {
     CompletedNoPr { reason: String },
     /// Processing failed.
     Failed { error: String },
+    /// Claude detected it was working in the wrong repository.
+    WrongRepo {
+        suggested_repo: Option<String>,
+        original_repo: String,
+    },
 }
 
 impl IssueProcessor {
@@ -112,6 +117,15 @@ impl IssueProcessor {
         context_provider: &dyn ContextProvider,
     ) -> ProcessingOutcome {
         match self.run_inner(input, context_provider).await {
+            Ok(ProcessingOutcome::WrongRepo {
+                original_repo,
+                suggested_repo,
+            }) => ProcessingOutcome::Failed {
+                error: format!(
+                    "Wrong repo detected (was: {}, suggested: {:?}), not retried",
+                    original_repo, suggested_repo
+                ),
+            },
             Ok(outcome) => outcome,
             Err(e) => ProcessingOutcome::Failed {
                 error: e.to_string(),
@@ -127,12 +141,16 @@ impl IssueProcessor {
         let ProcessingInput {
             ref mut issue,
             ref source_name,
-            ref resolution,
+            ref mut resolution,
             attempt_id,
             ref review_feedback,
             ref existing_pr_branch,
             ..
         } = input;
+
+        const MAX_REPO_SWAPS: u8 = 1;
+        let mut repo_swap_attempts: u8 = 0;
+        let mut excluded_repos: Vec<String> = Vec::new();
 
         let project_dir = match resolution {
             RepoResolution::Resolved { project_dir, .. } => project_dir.clone(),
@@ -313,20 +331,148 @@ impl IssueProcessor {
             }
         }
 
-        // --- Main processing pipeline ---
+        // --- Main processing pipeline (with repo-swap retry) ---
         let processing_started_at = std::time::Instant::now();
-        let result = self
-            .execute_pipeline(
-                issue,
-                source_name,
-                resolution,
-                attempt_id,
-                review_feedback.as_deref(),
-                existing_pr_branch.as_deref(),
-                &effective_project_dir,
-                context_provider,
-            )
-            .await;
+        let mut current_resolution = resolution.clone();
+        let mut current_project_dir = project_dir.clone();
+        let mut current_effective_dir = effective_project_dir.clone();
+
+        let result = loop {
+            let pipeline_result = self
+                .execute_pipeline(
+                    issue,
+                    source_name,
+                    &current_resolution,
+                    attempt_id,
+                    review_feedback.as_deref(),
+                    existing_pr_branch.as_deref(),
+                    &current_effective_dir,
+                    context_provider,
+                )
+                .await;
+
+            // Check if we got a WrongRepo outcome and can retry
+            match &pipeline_result {
+                Ok(ProcessingOutcome::WrongRepo {
+                    suggested_repo,
+                    original_repo,
+                }) if repo_swap_attempts < MAX_REPO_SWAPS => {
+                    repo_swap_attempts += 1;
+                    excluded_repos.push(original_repo.clone());
+
+                    // Cleanup current worktree before swapping
+                    self.cleanup_worktree(&current_resolution, issue, &current_project_dir)
+                        .await;
+
+                    // Record inference feedback as activity
+                    let feedback_activity = ActivityLogEntry::new(
+                        "inference_feedback",
+                        format!(
+                            "Wrong repo inference for {}: was {}, suggested {:?}",
+                            issue.short_id, original_repo, suggested_repo
+                        ),
+                    )
+                    .with_source(source_name.to_string())
+                    .with_issue(issue.id.clone(), issue.short_id.clone())
+                    .with_metadata(json!({
+                        "was_correct": false,
+                        "original_repo": original_repo,
+                        "suggested_repo": suggested_repo,
+                    }));
+                    self.tracker.record_activity(&feedback_activity).ok();
+
+                    // Resolve alternative repo
+                    let alt_resolution = self
+                        .resolve_alternative_repo(issue, suggested_repo.as_deref(), &excluded_repos)
+                        .await;
+                    match alt_resolution {
+                        RepoResolution::Skip { reason } => {
+                            tracing::warn!(
+                                short_id = %issue.short_id,
+                                reason = %reason,
+                                "No alternative repo found after wrong_repo detection"
+                            );
+                            break Ok(ProcessingOutcome::Failed {
+                                error: format!(
+                                    "Wrong repo detected (was: {}), no alternative found: {}",
+                                    original_repo, reason
+                                ),
+                            });
+                        }
+                        new_resolution => {
+                            let new_repo_name =
+                                new_resolution.repo_name().unwrap_or("unknown").to_string();
+                            tracing::info!(
+                                short_id = %issue.short_id,
+                                from = %original_repo,
+                                to = %new_repo_name,
+                                "Swapping to alternative repository"
+                            );
+
+                            // Notify about repo swap
+                            let _ = self
+                                .notifier
+                                .notify_repo_swap(issue, original_repo, &new_repo_name)
+                                .await;
+
+                            // Set up new repo: fetch + worktree
+                            let new_project_dir = match &new_resolution {
+                                RepoResolution::Resolved { project_dir, .. } => project_dir.clone(),
+                                RepoResolution::Skip { .. } => unreachable!(),
+                            };
+
+                            if let (Some(scm_url), Some(default_branch), Some(repo_name)) = (
+                                new_resolution.scm_url(),
+                                new_resolution.default_branch(),
+                                new_resolution.repo_name(),
+                            ) {
+                                if let Err(e) =
+                                    GitOps::ensure_repo_fetched(&new_project_dir, scm_url).await
+                                {
+                                    break Ok(ProcessingOutcome::Failed {
+                                        error: format!(
+                                            "Failed to fetch alternative repo {}: {}",
+                                            repo_name, e
+                                        ),
+                                    });
+                                }
+                                self.reindex_repo(repo_name, &new_project_dir).await;
+
+                                let checkout_ref = format!("origin/{}", default_branch);
+                                let wt_path = worktree_path(
+                                    &self.config.workspace,
+                                    repo_name,
+                                    &issue.short_id,
+                                );
+                                if let Err(e) = GitOps::create_worktree(
+                                    &new_project_dir,
+                                    &wt_path,
+                                    &checkout_ref,
+                                )
+                                .await
+                                {
+                                    break Ok(ProcessingOutcome::Failed {
+                                        error: format!(
+                                            "Failed to create worktree for alternative repo {}: {}",
+                                            repo_name, e
+                                        ),
+                                    });
+                                }
+
+                                current_effective_dir = wt_path;
+                            } else {
+                                current_effective_dir = new_project_dir.clone();
+                            }
+
+                            current_project_dir = new_project_dir;
+                            current_resolution = new_resolution;
+                            continue;
+                        }
+                    }
+                }
+                _ => break pipeline_result,
+            }
+        };
 
         // Handle pipeline errors
         if let Err(ref e) = result {
@@ -371,9 +517,9 @@ impl IssueProcessor {
         // Run code quality evaluation (AFTER hook)
         if !eval_before_snapshots.is_empty() {
             let eval_attempt_id = attempt_id.unwrap_or(0);
-            let eval_repo = resolution.repo_name().unwrap_or("unknown");
+            let eval_repo = current_resolution.repo_name().unwrap_or("unknown");
             match claudear_analysis::evaluation::CodeQualityEvaluator::run_after_and_compute_deltas(
-                &effective_project_dir,
+                &current_effective_dir,
                 &self.config.evaluation,
                 eval_before_snapshots,
                 eval_attempt_id,
@@ -427,10 +573,20 @@ impl IssueProcessor {
         }
 
         // Cleanup worktree
-        self.cleanup_worktree(resolution, issue, &project_dir).await;
+        self.cleanup_worktree(&current_resolution, issue, &current_project_dir)
+            .await;
 
-        // Convert result to outcome
+        // Convert result to outcome, converting any surviving WrongRepo to Failed
         match result {
+            Ok(ProcessingOutcome::WrongRepo {
+                original_repo,
+                suggested_repo,
+            }) => Ok(ProcessingOutcome::Failed {
+                error: format!(
+                    "Wrong repo detected (was: {}, suggested: {:?}), retries exhausted",
+                    original_repo, suggested_repo
+                ),
+            }),
             Ok(outcome) => Ok(outcome),
             Err(e) => Ok(ProcessingOutcome::Failed {
                 error: e.to_string(),
@@ -453,6 +609,11 @@ impl IssueProcessor {
     ) -> Result<ProcessingOutcome> {
         // Notify start
         self.notifier.notify_start(issue).await?;
+
+        // Set repo name in issue metadata for template rendering
+        if let Some(name) = resolution.repo_name() {
+            issue.set_metadata("target_repo_name", name.to_string());
+        }
 
         // Find similar issues for context
         let similar_issues_context =
@@ -827,6 +988,40 @@ impl IssueProcessor {
             }
         }
 
+        // Check for wrong_repo signal before handling the result
+        if let Some(ref suggested) = claude_result.wrong_repo {
+            let original_repo = resolution.repo_name().unwrap_or("unknown").to_string();
+            tracing::warn!(
+                short_id = %issue.short_id,
+                original_repo = %original_repo,
+                suggested_repo = %suggested,
+                "Claude detected wrong repository"
+            );
+            let activity = ActivityLogEntry::new(
+                "wrong_repo_detected",
+                format!(
+                    "Wrong repo detected for {}: {} (suggested: {})",
+                    issue.short_id, original_repo, suggested
+                ),
+            )
+            .with_source(source_name.to_string())
+            .with_issue(issue.id.clone(), issue.short_id.clone())
+            .with_metadata(json!({
+                "original_repo": original_repo,
+                "suggested_repo": suggested,
+            }));
+            self.tracker.record_activity(&activity).ok();
+
+            let metric = ProcessingMetric::new("wrong_repo_detected", 1.0)
+                .with_source(source_name.to_string());
+            self.tracker.record_metric(&metric).ok();
+
+            return Ok(ProcessingOutcome::WrongRepo {
+                suggested_repo: Some(suggested.clone()),
+                original_repo,
+            });
+        }
+
         // Handle result
         if claude_result.success {
             // For review reruns, resolve the effective PR URL
@@ -1124,6 +1319,52 @@ impl IssueProcessor {
                     );
                 }
             }
+        }
+    }
+
+    /// Resolve an alternative repository after a wrong_repo detection.
+    ///
+    /// 1. Try Claude's suggested repo name via `resolve_repo_for_cascade`
+    /// 2. Fallback: re-infer with exclusions via `inferrer.infer_excluding()`
+    /// 3. If neither works, return `RepoResolution::Skip`
+    async fn resolve_alternative_repo(
+        &self,
+        issue: &Issue,
+        suggested: Option<&str>,
+        excluded_repos: &[String],
+    ) -> RepoResolution {
+        let Some(inferrer) = &self.inferrer else {
+            return RepoResolution::Skip {
+                reason: "No inferrer available for repo swap".to_string(),
+            };
+        };
+
+        // Try Claude's suggested repo first
+        if let Some(suggested_name) = suggested {
+            if !excluded_repos.contains(&suggested_name.to_string()) {
+                let resolution = claudear_analysis::inference::resolve_repo_for_cascade(
+                    Some(inferrer),
+                    suggested_name,
+                );
+                if resolution.is_resolved() {
+                    return resolution;
+                }
+            }
+        }
+
+        // Fallback: re-infer with exclusions
+        if let Some(inferred) = inferrer.infer_excluding(issue, excluded_repos) {
+            return RepoResolution::Resolved {
+                project_dir: inferred.repo.path,
+                repo_name: inferred.repo.name,
+                repo_id: None,
+                scm_url: inferred.repo.scm_url,
+                default_branch: inferred.repo.default_branch,
+            };
+        }
+
+        RepoResolution::Skip {
+            reason: format!("No alternative repo found (excluded: {:?})", excluded_repos),
         }
     }
 }
@@ -2868,6 +3109,7 @@ mod tests {
             used_qa_ids: vec![],
             confidence: 0,
             confidence_reasoning: None,
+            wrong_repo: None,
         };
         assert!(result.success);
         assert!(result.pr_url.is_some());
@@ -2886,6 +3128,7 @@ mod tests {
             used_qa_ids: vec![],
             confidence: 0,
             confidence_reasoning: None,
+            wrong_repo: None,
         };
         assert!(!result.success);
         assert!(result.pr_url.is_none());
@@ -2909,6 +3152,7 @@ mod tests {
             used_qa_ids: vec![1, 2, 3],
             confidence: 0,
             confidence_reasoning: None,
+            wrong_repo: None,
         };
         assert!(result.blocking_question.is_some());
         let bq = result.blocking_question.unwrap();
@@ -2930,6 +3174,7 @@ mod tests {
             used_qa_ids: vec![10, 20],
             confidence: 0,
             confidence_reasoning: None,
+            wrong_repo: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let deserialized: claudear_core::types::AgentResult = serde_json::from_str(&json).unwrap();
@@ -3633,6 +3878,7 @@ mod tests {
                 used_qa_ids: vec![],
                 confidence: 0,
                 confidence_reasoning: None,
+                wrong_repo: None,
             })
         }
     }

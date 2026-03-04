@@ -262,6 +262,7 @@ impl AgentRunner for CodexAgentRunner {
                     used_qa_ids: Vec::new(),
                     confidence: 0,
                     confidence_reasoning: None,
+                    wrong_repo: None,
                 });
             }
         };
@@ -326,6 +327,7 @@ impl AgentRunner for CodexAgentRunner {
             used_qa_ids: Vec::new(),
             confidence: 0,
             confidence_reasoning: None,
+            wrong_repo: None,
         })
     }
 }

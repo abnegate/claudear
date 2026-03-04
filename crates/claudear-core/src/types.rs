@@ -246,6 +246,9 @@ pub struct AgentResult {
     /// Reasoning behind the confidence score.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub confidence_reasoning: Option<String>,
+    /// If Claude detected it's working in the wrong repository, the suggested correct repo.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wrong_repo: Option<String>,
 }
 
 /// Structured blocking question emitted by Claude.
@@ -3104,6 +3107,7 @@ mod tests {
             used_qa_ids: Vec::new(),
             confidence: 0,
             confidence_reasoning: None,
+            wrong_repo: None,
         };
         assert!(result.success);
         assert!(result.pr_url.is_some());
@@ -3122,6 +3126,7 @@ mod tests {
             used_qa_ids: Vec::new(),
             confidence: 0,
             confidence_reasoning: None,
+            wrong_repo: None,
         };
         assert!(!result.success);
         assert!(result.pr_url.is_none());
@@ -3459,6 +3464,7 @@ mod tests {
             used_qa_ids: Vec::new(),
             confidence: 0,
             confidence_reasoning: None,
+            wrong_repo: None,
         };
 
         assert!(result.output.is_empty());
@@ -5460,6 +5466,7 @@ mod tests {
             used_qa_ids: vec![1, 2, 3],
             confidence: 0,
             confidence_reasoning: None,
+            wrong_repo: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let parsed: AgentResult = serde_json::from_str(&json).unwrap();
@@ -5482,6 +5489,7 @@ mod tests {
             used_qa_ids: Vec::new(),
             confidence: 0,
             confidence_reasoning: None,
+            wrong_repo: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         assert!(!json.contains("pr_url"));
@@ -6145,6 +6153,7 @@ mod tests {
             used_qa_ids: vec![1, 2, 3],
             confidence: 0,
             confidence_reasoning: None,
+            wrong_repo: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"success\":true"));
@@ -6165,6 +6174,7 @@ mod tests {
             used_qa_ids: Vec::new(),
             confidence: 0,
             confidence_reasoning: None,
+            wrong_repo: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"success\":false"));
@@ -6189,6 +6199,7 @@ mod tests {
             used_qa_ids: Vec::new(),
             confidence: 0,
             confidence_reasoning: None,
+            wrong_repo: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let deser: AgentResult = serde_json::from_str(&json).unwrap();
@@ -6210,6 +6221,7 @@ mod tests {
             used_qa_ids: vec![5, 10],
             confidence: 85,
             confidence_reasoning: Some("Tests pass and fix is straightforward".to_string()),
+            wrong_repo: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         let deser: AgentResult = serde_json::from_str(&json).unwrap();
@@ -6247,6 +6259,7 @@ mod tests {
             used_qa_ids: vec![],
             confidence: 92,
             confidence_reasoning: Some("All tests pass, fix is straightforward".to_string()),
+            wrong_repo: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         let deser: AgentResult = serde_json::from_str(&json).unwrap();
@@ -6269,6 +6282,7 @@ mod tests {
             used_qa_ids: vec![],
             confidence: 75,
             confidence_reasoning: None,
+            wrong_repo: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"confidence\":75"));
@@ -6290,6 +6304,7 @@ mod tests {
             used_qa_ids: vec![],
             confidence: 60,
             confidence_reasoning: Some("Moderate certainty".to_string()),
+            wrong_repo: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"confidence\":60"));
@@ -6308,6 +6323,7 @@ mod tests {
             used_qa_ids: vec![],
             confidence: 100,
             confidence_reasoning: None,
+            wrong_repo: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let deser: AgentResult = serde_json::from_str(&json).unwrap();
@@ -6350,6 +6366,7 @@ mod tests {
             confidence_reasoning: Some(
                 "Exact reproduction test added, fix is minimal and targeted".to_string(),
             ),
+            wrong_repo: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let deser: AgentResult = serde_json::from_str(&json).unwrap();
@@ -6374,6 +6391,7 @@ mod tests {
             used_qa_ids: vec![],
             confidence: 40,
             confidence_reasoning: Some(String::new()),
+            wrong_repo: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         // Empty string is still Some(""), so it should be serialized
@@ -6403,6 +6421,7 @@ mod tests {
             used_qa_ids: vec![],
             confidence: 0,
             confidence_reasoning: Some("Code doesn't compile after changes".to_string()),
+            wrong_repo: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let deser: AgentResult = serde_json::from_str(&json).unwrap();

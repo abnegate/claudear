@@ -16,7 +16,12 @@ pub use renderer::{TemplateContext, TemplateRenderer};
 pub const DEFAULT_FIX_TEMPLATE: &str = r#"You are fixing an issue from {{source}}. Here is the issue context:
 
 {{context}}
-
+{{#if repo_name}}
+IMPORTANT - Repository Verification:
+You are working in the repository: {{repo_name}}
+Before starting any work, verify this is the correct repository for this issue by checking that the file paths, modules, or stack traces reference code in this codebase.
+If this is NOT the correct repository, set "wrong_repo" in your response to the name of the repository you believe is correct (in "org/repo" format) and do NOT attempt any fixes.
+{{/if}}
 Your task:
 1. Analyze the issue/error and any stack traces
 2. Find the relevant code in this codebase
@@ -37,6 +42,12 @@ pub const DEFAULT_LINEAR_TEMPLATE: &str = r#"{{#if has_agent_md}}
 {{agent_md}}
 
 ---
+{{/if}}
+{{#if repo_name}}
+IMPORTANT - Repository Verification:
+You are working in the repository: {{repo_name}}
+Before starting any work, verify this is the correct repository for this issue by checking that the file paths, modules, or stack traces reference code in this codebase.
+If this is NOT the correct repository, set "wrong_repo" in your response to the name of the repository you believe is correct (in "org/repo" format) and do NOT attempt any fixes.
 {{/if}}
 Address the following Linear issue:
 
@@ -61,6 +72,12 @@ pub const DEFAULT_SENTRY_TEMPLATE: &str = r#"{{#if has_agent_md}}
 {{agent_md}}
 
 ---
+{{/if}}
+{{#if repo_name}}
+IMPORTANT - Repository Verification:
+You are working in the repository: {{repo_name}}
+Before starting any work, verify this is the correct repository for this issue by checking that the file paths, modules, or stack traces reference code in this codebase.
+If this is NOT the correct repository, set "wrong_repo" in your response to the name of the repository you believe is correct (in "org/repo" format) and do NOT attempt any fixes.
 {{/if}}
 Fix the following error from Sentry:
 
