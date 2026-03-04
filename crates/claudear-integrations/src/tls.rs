@@ -3,6 +3,7 @@
 //! When `tls.enabled = true`, the server provisions and auto-renews
 //! certificates using `rustls-acme`. Otherwise, plain HTTP is served.
 
+use crate::port_forward;
 use axum::Router;
 use claudear_config::config::TlsConfig;
 use claudear_core::error::Result;
@@ -26,6 +27,38 @@ pub async fn serve_with_tls(tls_config: &TlsConfig, bind_address: &str, app: Rou
             "Failed to create ACME cache directory"
         );
     }
+
+    // --- macOS port forwarding for privileged ports ---
+    let mut redirects = Vec::new();
+
+    let actual_https_port = if port_forward::needs_port_forward(tls_config.https_port) {
+        let high = port_forward::forwarded_port(tls_config.https_port);
+        redirects.push((tls_config.https_port, high));
+        high
+    } else {
+        tls_config.https_port
+    };
+
+    let actual_redirect_port = if tls_config.http_redirect_port > 0
+        && port_forward::needs_port_forward(tls_config.http_redirect_port)
+    {
+        let high = port_forward::forwarded_port(tls_config.http_redirect_port);
+        redirects.push((tls_config.http_redirect_port, high));
+        high
+    } else {
+        tls_config.http_redirect_port
+    };
+
+    // Set up pf rules — the guard cleans them up when the server stops.
+    let _pf_guard = if !redirects.is_empty() {
+        Some(
+            port_forward::setup_port_forward(&redirects, bind_address)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
+        )
+    } else {
+        None
+    };
+    // --- end port forwarding ---
 
     let domains = tls_config.domains.clone();
     let cache_dir = tls_config.cache_dir.clone();
@@ -53,12 +86,12 @@ pub async fn serve_with_tls(tls_config: &TlsConfig, bind_address: &str, app: Rou
     });
 
     // Optionally spawn HTTP→HTTPS redirect
-    if tls_config.http_redirect_port > 0 {
+    if actual_redirect_port > 0 {
         let https_port = tls_config.https_port;
-        let redirect_addr: SocketAddr = format!("{bind_address}:{}", tls_config.http_redirect_port)
+        let redirect_addr: SocketAddr = format!("{bind_address}:{actual_redirect_port}")
             .parse()
             .unwrap_or_else(|_| {
-                SocketAddr::from((Ipv4Addr::UNSPECIFIED, tls_config.http_redirect_port))
+                SocketAddr::from((Ipv4Addr::UNSPECIFIED, actual_redirect_port))
             });
 
         tokio::spawn(async move {
@@ -103,11 +136,18 @@ pub async fn serve_with_tls(tls_config: &TlsConfig, bind_address: &str, app: Rou
     }
 
     // Serve the main app over HTTPS
-    let addr: SocketAddr = format!("{bind_address}:{}", tls_config.https_port)
+    let addr: SocketAddr = format!("{bind_address}:{actual_https_port}")
         .parse()
-        .unwrap_or_else(|_| SocketAddr::from((Ipv4Addr::UNSPECIFIED, tls_config.https_port)));
+        .unwrap_or_else(|_| SocketAddr::from((Ipv4Addr::UNSPECIFIED, actual_https_port)));
 
     tracing::info!("HTTPS server listening on {}", addr);
+    if actual_https_port != tls_config.https_port {
+        tracing::info!(
+            "Traffic on :{} is forwarded to :{} via port forwarding",
+            tls_config.https_port,
+            actual_https_port,
+        );
+    }
     tracing::info!(
         domains = ?tls_config.domains,
         production = tls_config.production,
@@ -125,21 +165,37 @@ pub async fn serve_with_tls(tls_config: &TlsConfig, bind_address: &str, app: Rou
 
 /// Serve an Axum app over plain HTTP.
 pub async fn serve_plain_http(bind_address: &str, port: u16, app: Router) -> Result<()> {
-    let addr = format!("{bind_address}:{port}");
+    // Set up port forwarding if needed (macOS + privileged port + non-root).
+    let (actual_port, _pf_guard) = if port_forward::needs_port_forward(port) {
+        let high = port_forward::forwarded_port(port);
+        let guard = port_forward::setup_port_forward(&[(port, high)], bind_address)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        (high, Some(guard))
+    } else {
+        (port, None)
+    };
+
+    let addr = format!("{bind_address}:{actual_port}");
     let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
-        if e.kind() == std::io::ErrorKind::PermissionDenied && port < 1024 {
+        if e.kind() == std::io::ErrorKind::PermissionDenied && actual_port < 1024 {
             std::io::Error::new(
                 e.kind(),
                 format!(
                     "Cannot bind to port {} (privileged ports < 1024 require root). \
                      Use a port >= 1024 or run with elevated privileges.",
-                    port
+                    actual_port
                 ),
             )
         } else {
             e
         }
     })?;
+
+    if actual_port != port {
+        tracing::info!(
+            "Listening on :{actual_port}, traffic on :{port} forwarded via port forwarding"
+        );
+    }
 
     axum::serve(listener, app).await?;
 

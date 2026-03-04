@@ -15,5 +15,6 @@ pub mod runner;
 pub mod scm;
 pub mod source;
 pub mod telemetry;
+pub mod port_forward;
 pub mod tls;
 pub mod webhook;
