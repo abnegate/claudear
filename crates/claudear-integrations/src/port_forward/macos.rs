@@ -172,10 +172,7 @@ mod tests {
 
     #[test]
     fn multiple_redirects_multiple_interfaces() {
-        let rules = build_rules(
-            &[(443, 8443), (80, 8080)],
-            &["lo0".into(), "en0".into()],
-        );
+        let rules = build_rules(&[(443, 8443), (80, 8080)], &["lo0".into(), "en0".into()]);
         let lines: Vec<&str> = rules.lines().collect();
         assert_eq!(lines.len(), 4); // 2 redirects × 2 interfaces
     }

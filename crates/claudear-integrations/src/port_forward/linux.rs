@@ -74,21 +74,46 @@ pub fn cleanup_hint(redirects: &[(u16, u16)]) -> Vec<String> {
 /// Build iptables arguments for a PREROUTING REDIRECT rule.
 pub fn build_prerouting_args(action: &str, from_port: u16, to_port: u16) -> Vec<String> {
     vec![
-        "-t".into(), "nat".into(), action.into(), "PREROUTING".into(),
-        "-p".into(), "tcp".into(), "--dport".into(), from_port.to_string(),
-        "-j".into(), "REDIRECT".into(), "--to-port".into(), to_port.to_string(),
-        "-m".into(), "comment".into(), "--comment".into(), IPTABLES_COMMENT.into(),
+        "-t".into(),
+        "nat".into(),
+        action.into(),
+        "PREROUTING".into(),
+        "-p".into(),
+        "tcp".into(),
+        "--dport".into(),
+        from_port.to_string(),
+        "-j".into(),
+        "REDIRECT".into(),
+        "--to-port".into(),
+        to_port.to_string(),
+        "-m".into(),
+        "comment".into(),
+        "--comment".into(),
+        IPTABLES_COMMENT.into(),
     ]
 }
 
 /// Build iptables arguments for an OUTPUT loopback REDIRECT rule.
 pub fn build_output_lo_args(action: &str, from_port: u16, to_port: u16) -> Vec<String> {
     vec![
-        "-t".into(), "nat".into(), action.into(), "OUTPUT".into(),
-        "-o".into(), "lo".into(),
-        "-p".into(), "tcp".into(), "--dport".into(), from_port.to_string(),
-        "-j".into(), "REDIRECT".into(), "--to-port".into(), to_port.to_string(),
-        "-m".into(), "comment".into(), "--comment".into(), IPTABLES_COMMENT.into(),
+        "-t".into(),
+        "nat".into(),
+        action.into(),
+        "OUTPUT".into(),
+        "-o".into(),
+        "lo".into(),
+        "-p".into(),
+        "tcp".into(),
+        "--dport".into(),
+        from_port.to_string(),
+        "-j".into(),
+        "REDIRECT".into(),
+        "--to-port".into(),
+        to_port.to_string(),
+        "-m".into(),
+        "comment".into(),
+        "--comment".into(),
+        IPTABLES_COMMENT.into(),
     ]
 }
 
@@ -150,10 +175,22 @@ mod tests {
         assert_eq!(
             args,
             vec![
-                "-t", "nat", "-A", "PREROUTING",
-                "-p", "tcp", "--dport", "443",
-                "-j", "REDIRECT", "--to-port", "8443",
-                "-m", "comment", "--comment", IPTABLES_COMMENT,
+                "-t",
+                "nat",
+                "-A",
+                "PREROUTING",
+                "-p",
+                "tcp",
+                "--dport",
+                "443",
+                "-j",
+                "REDIRECT",
+                "--to-port",
+                "8443",
+                "-m",
+                "comment",
+                "--comment",
+                IPTABLES_COMMENT,
             ]
         );
     }
@@ -189,11 +226,24 @@ mod tests {
         assert_eq!(
             args,
             vec![
-                "-t", "nat", "-A", "OUTPUT",
-                "-o", "lo",
-                "-p", "tcp", "--dport", "443",
-                "-j", "REDIRECT", "--to-port", "8443",
-                "-m", "comment", "--comment", IPTABLES_COMMENT,
+                "-t",
+                "nat",
+                "-A",
+                "OUTPUT",
+                "-o",
+                "lo",
+                "-p",
+                "tcp",
+                "--dport",
+                "443",
+                "-j",
+                "REDIRECT",
+                "--to-port",
+                "8443",
+                "-m",
+                "comment",
+                "--comment",
+                IPTABLES_COMMENT,
             ]
         );
     }

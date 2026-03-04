@@ -47,9 +47,7 @@ fn parse_approval_reply(answer: &str) -> Option<bool> {
     match normalized.as_str() {
         "yes" | "y" | "approve" | "ok" | "sure" | "go ahead" | "lgtm" | "yep" | "yeah"
         | "proceed" => Some(true),
-        "no" | "n" | "skip" | "deny" | "reject" | "nope" | "nah" | "stop" | "pass" => {
-            Some(false)
-        }
+        "no" | "n" | "skip" | "deny" | "reject" | "nope" | "nah" | "stop" | "pass" => Some(false),
         _ => None,
     }
 }
@@ -2912,10 +2910,10 @@ Create a PR with your changes.{custom_instructions}"#,
             }
 
             // Approval gate: if enabled, ask human before processing
-            if self.config.ask.require_approval {
-                if !self.request_approval(source.name(), &issue).await {
-                    continue;
-                }
+            if self.config.ask.require_approval
+                && !self.request_approval(source.name(), &issue).await
+            {
+                continue;
             }
 
             // Process the issue
@@ -2957,10 +2955,7 @@ Create a PR with your changes.{custom_instructions}"#,
             issue_id: issue.id.clone(),
             short_id: issue.short_id.clone(),
             question: BlockingQuestion {
-                question: format!(
-                    "Should I work on {}: {}?",
-                    issue.short_id, issue.title
-                ),
+                question: format!("Should I work on {}: {}?", issue.short_id, issue.title),
                 why: Some("Approval required before processing".to_string()),
                 context: issue.description.clone(),
                 options: vec!["Yes".to_string(), "No".to_string()],
@@ -11642,7 +11637,9 @@ mod tests {
 
     #[test]
     fn test_parse_approval_reply_yes_variants() {
-        for word in &["yes", "y", "approve", "ok", "sure", "go ahead", "lgtm", "yep", "yeah", "proceed"] {
+        for word in &[
+            "yes", "y", "approve", "ok", "sure", "go ahead", "lgtm", "yep", "yeah", "proceed",
+        ] {
             assert_eq!(
                 parse_approval_reply(word),
                 Some(true),
@@ -11654,7 +11651,9 @@ mod tests {
 
     #[test]
     fn test_parse_approval_reply_no_variants() {
-        for word in &["no", "n", "skip", "deny", "reject", "nope", "nah", "stop", "pass"] {
+        for word in &[
+            "no", "n", "skip", "deny", "reject", "nope", "nah", "stop", "pass",
+        ] {
             assert_eq!(
                 parse_approval_reply(word),
                 Some(false),
