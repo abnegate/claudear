@@ -5,16 +5,17 @@ use crate::retry::RetryManager;
 use chrono::{DateTime, Utc};
 use claudear_analysis::feedback::{FeedbackAnalyzer, IssueEmbeddingService, Outcome};
 use claudear_analysis::inference::{resolve_repo_for_issue, RepoInferrer, RepoResolution};
+use claudear_analysis::qa::build_correlation_id;
 use claudear_analysis::repo::{worktree_path, GitOps, RepoRelationships};
 use claudear_config::config::Config;
 use claudear_config::users::UserRegistry;
 use claudear_core::error::Result;
 use claudear_core::types::{
-    ActivityLogEntry, FixAttemptStats, FixAttemptStatus, Issue, IssueEmbedding, IssueType,
-    MatchPriority, MatchResult, ProcessingMetric, RegressionWatch,
+    ActivityLogEntry, AskRequest, BlockingQuestion, FixAttemptStats, FixAttemptStatus, Issue,
+    IssueEmbedding, IssueType, MatchPriority, MatchResult, ProcessingMetric, RegressionWatch,
 };
 use claudear_integrations::github::GitHubClient;
-use claudear_integrations::notifier::Notifier;
+use claudear_integrations::notifier::{send_to_all_and_wait_first_reply, Notifier};
 use claudear_integrations::runner::{self, AgentRunner};
 use claudear_integrations::scm::{
     PrReviewState, PrStatus, ReviewEvent, ReviewWatcher, ScmProvider,
@@ -32,6 +33,25 @@ use tokio::time::{interval, Duration};
 /// Extracts the source name from a processing key of the form "source:issue_id".
 fn source_from_processing_key(key: &str) -> &str {
     key.split_once(':').map_or(key, |(source, _)| source)
+}
+
+/// Parse a human reply to an approval request.
+///
+/// Returns `Some(true)` for affirmative, `Some(false)` for negative, `None` for unrecognized.
+fn parse_approval_reply(answer: &str) -> Option<bool> {
+    let normalized = answer
+        .trim()
+        .trim_end_matches(|c: char| c.is_ascii_punctuation())
+        .to_lowercase();
+
+    match normalized.as_str() {
+        "yes" | "y" | "approve" | "ok" | "sure" | "go ahead" | "lgtm" | "yep" | "yeah"
+        | "proceed" => Some(true),
+        "no" | "n" | "skip" | "deny" | "reject" | "nope" | "nah" | "stop" | "pass" => {
+            Some(false)
+        }
+        _ => None,
+    }
 }
 
 /// Tracks which issues are currently being processed, with O(1) per-source count lookups.
@@ -2891,6 +2911,13 @@ Create a PR with your changes.{custom_instructions}"#,
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
 
+            // Approval gate: if enabled, ask human before processing
+            if self.config.ask.require_approval {
+                if !self.request_approval(source.name(), &issue).await {
+                    continue;
+                }
+            }
+
             // Process the issue
             let source_clone = Arc::clone(source);
             let this = self;
@@ -2917,6 +2944,98 @@ Create a PR with your changes.{custom_instructions}"#,
     /// Number of active processing items for a specific source.
     async fn active_processing_for_source(&self, source_name: &str) -> usize {
         self.processing.read().await.source_count(source_name)
+    }
+
+    /// Request human approval before processing an issue.
+    ///
+    /// Returns `true` if approved, `false` otherwise (denied, timeout, error, unrecognized).
+    async fn request_approval(&self, source_name: &str, issue: &Issue) -> bool {
+        let ask_request = AskRequest {
+            correlation_id: build_correlation_id(&issue.short_id),
+            source: source_name.to_string(),
+            repo: None,
+            issue_id: issue.id.clone(),
+            short_id: issue.short_id.clone(),
+            question: BlockingQuestion {
+                question: format!(
+                    "Should I work on {}: {}?",
+                    issue.short_id, issue.title
+                ),
+                why: Some("Approval required before processing".to_string()),
+                context: issue.description.clone(),
+                options: vec!["Yes".to_string(), "No".to_string()],
+            },
+            asked_at: chrono::Utc::now(),
+            target_discord_id: None,
+            target_email: None,
+            target_slack_id: None,
+        };
+
+        let activity = ActivityLogEntry::new(
+            "approval_requested",
+            format!("Requesting approval for {}", issue.short_id),
+        )
+        .with_source(source_name.to_string())
+        .with_issue(issue.id.clone(), issue.short_id.clone())
+        .with_metadata(json!({
+            "correlation_id": ask_request.correlation_id,
+        }));
+        self.tracker.record_activity(&activity).ok();
+
+        let timeout_secs = self
+            .config
+            .ask
+            .approval_timeout_secs
+            .unwrap_or(self.config.ask.wait_timeout_secs);
+
+        let reply = send_to_all_and_wait_first_reply(
+            Arc::clone(&self.notifier),
+            issue,
+            &ask_request,
+            Duration::from_secs(timeout_secs),
+            Duration::from_secs(self.config.ask.poll_interval_secs),
+        )
+        .await;
+
+        let approved = match reply {
+            Ok(Some(ref r)) => parse_approval_reply(&r.answer).unwrap_or(false),
+            Ok(None) => {
+                tracing::info!(
+                    short_id = %issue.short_id,
+                    "Approval timed out, skipping issue"
+                );
+                false
+            }
+            Err(ref e) => {
+                tracing::warn!(
+                    short_id = %issue.short_id,
+                    error = %e,
+                    "Error requesting approval, skipping issue"
+                );
+                false
+            }
+        };
+
+        let decision = if approved {
+            "approval_granted"
+        } else {
+            "approval_denied"
+        };
+        self.record_issue_decision(
+            issue,
+            decision,
+            format!(
+                "Approval {} for {}",
+                if approved { "granted" } else { "denied" },
+                issue.short_id
+            ),
+            json!({
+                "correlation_id": ask_request.correlation_id,
+                "reply": reply.as_ref().ok().and_then(|r| r.as_ref().map(|r| &r.answer)),
+            }),
+        );
+
+        approved
     }
 
     fn record_source_decision(
@@ -11462,5 +11581,381 @@ mod tests {
         assert_eq!(issues[1].0.priority, IssuePriority::Critical);
         assert_eq!(issues[2].0.id, "3");
         assert_eq!(issues[2].0.priority, IssuePriority::High);
+    }
+
+    // --- parse_approval_reply ---
+
+    #[test]
+    fn test_parse_approval_reply_multiple_punctuation() {
+        assert_eq!(parse_approval_reply("yes!!!"), Some(true));
+        assert_eq!(parse_approval_reply("no..."), Some(false));
+        assert_eq!(parse_approval_reply("approve!!"), Some(true));
+        assert_eq!(parse_approval_reply("reject??"), Some(false));
+    }
+
+    #[test]
+    fn test_parse_approval_reply_mixed_case_with_punctuation() {
+        assert_eq!(parse_approval_reply("Go Ahead!"), Some(true));
+        assert_eq!(parse_approval_reply("PROCEED."), Some(true));
+        assert_eq!(parse_approval_reply("NOPE!"), Some(false));
+        assert_eq!(parse_approval_reply("Pass."), Some(false));
+    }
+
+    #[test]
+    fn test_parse_approval_reply_only_whitespace() {
+        assert_eq!(parse_approval_reply("   "), None);
+        assert_eq!(parse_approval_reply("\t"), None);
+        assert_eq!(parse_approval_reply("\n"), None);
+    }
+
+    #[test]
+    fn test_parse_approval_reply_only_punctuation() {
+        assert_eq!(parse_approval_reply("!!!"), None);
+        assert_eq!(parse_approval_reply("..."), None);
+        assert_eq!(parse_approval_reply("?"), None);
+    }
+
+    #[test]
+    fn test_parse_approval_reply_partial_match_not_accepted() {
+        // "yesss" is not "yes", "noo" is not "no"
+        assert_eq!(parse_approval_reply("yesss"), None);
+        assert_eq!(parse_approval_reply("noo"), None);
+        assert_eq!(parse_approval_reply("approved"), None);
+        assert_eq!(parse_approval_reply("rejected"), None);
+        assert_eq!(parse_approval_reply("skipping"), None);
+        assert_eq!(parse_approval_reply("okayy"), None);
+    }
+
+    #[test]
+    fn test_parse_approval_reply_with_newlines() {
+        // Newline after the word — trim handles leading/trailing whitespace
+        assert_eq!(parse_approval_reply("yes\n"), Some(true));
+        assert_eq!(parse_approval_reply("\nno\n"), Some(false));
+    }
+
+    #[test]
+    fn test_parse_approval_reply_multiword_with_extra_spaces() {
+        assert_eq!(parse_approval_reply("  go ahead  "), Some(true));
+        // Extra internal spacing should NOT match
+        assert_eq!(parse_approval_reply("go  ahead"), None);
+    }
+
+    #[test]
+    fn test_parse_approval_reply_yes_variants() {
+        for word in &["yes", "y", "approve", "ok", "sure", "go ahead", "lgtm", "yep", "yeah", "proceed"] {
+            assert_eq!(
+                parse_approval_reply(word),
+                Some(true),
+                "Expected Some(true) for {:?}",
+                word
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_approval_reply_no_variants() {
+        for word in &["no", "n", "skip", "deny", "reject", "nope", "nah", "stop", "pass"] {
+            assert_eq!(
+                parse_approval_reply(word),
+                Some(false),
+                "Expected Some(false) for {:?}",
+                word
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_approval_reply_case_insensitive() {
+        assert_eq!(parse_approval_reply("YES"), Some(true));
+        assert_eq!(parse_approval_reply("Yes"), Some(true));
+        assert_eq!(parse_approval_reply("LGTM"), Some(true));
+        assert_eq!(parse_approval_reply("NO"), Some(false));
+        assert_eq!(parse_approval_reply("Skip"), Some(false));
+    }
+
+    #[test]
+    fn test_parse_approval_reply_with_whitespace_and_punctuation() {
+        assert_eq!(parse_approval_reply("  yes  "), Some(true));
+        assert_eq!(parse_approval_reply("no!"), Some(false));
+        assert_eq!(parse_approval_reply("  approve. "), Some(true));
+        assert_eq!(parse_approval_reply("reject!"), Some(false));
+    }
+
+    #[test]
+    fn test_parse_approval_reply_unrecognized() {
+        assert_eq!(parse_approval_reply("maybe"), None);
+        assert_eq!(parse_approval_reply(""), None);
+        assert_eq!(parse_approval_reply("I think so"), None);
+        assert_eq!(parse_approval_reply("not sure"), None);
+    }
+
+    // --- request_approval integration tests ---
+
+    use claudear_core::types::{AskDelivery, AskReply};
+    use std::sync::Mutex;
+
+    /// A mock notifier that supports replies and returns pre-configured answers.
+    struct ApprovalMockNotifier {
+        /// Pre-configured reply to return on poll, or None for timeout simulation.
+        reply: Mutex<Option<String>>,
+        /// Track how many times ask_question was called.
+        ask_count: AtomicUsize,
+    }
+
+    impl ApprovalMockNotifier {
+        fn with_reply(answer: &str) -> Self {
+            Self {
+                reply: Mutex::new(Some(answer.to_string())),
+                ask_count: AtomicUsize::new(0),
+            }
+        }
+
+        fn with_no_reply() -> Self {
+            Self {
+                reply: Mutex::new(None),
+                ask_count: AtomicUsize::new(0),
+            }
+        }
+
+        fn ask_count(&self) -> usize {
+            self.ask_count.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl Notifier for ApprovalMockNotifier {
+        fn name(&self) -> &str {
+            "approval_mock"
+        }
+        fn is_enabled(&self) -> bool {
+            true
+        }
+        async fn notify_start(&self, _issue: &Issue) -> Result<()> {
+            Ok(())
+        }
+        async fn notify_success(&self, _issue: &Issue, _pr_url: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn notify_completed(&self, _issue: &Issue) -> Result<()> {
+            Ok(())
+        }
+        async fn notify_failed(&self, _issue: &Issue, _error: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn notify_status(&self, _message: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn notify_urgent_issues(&self, _issues: &[Issue]) -> Result<()> {
+            Ok(())
+        }
+        async fn ask_question(
+            &self,
+            _issue: &Issue,
+            _request: &AskRequest,
+        ) -> Result<Option<AskDelivery>> {
+            self.ask_count.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(Some(AskDelivery {
+                channel: "approval_mock".to_string(),
+                target: None,
+                message_id: Some("msg-1".to_string()),
+            }))
+        }
+
+        async fn poll_question_replies(
+            &self,
+            request: &AskRequest,
+            _since: DateTime<Utc>,
+        ) -> Result<Vec<AskReply>> {
+            let reply = self.reply.lock().unwrap();
+            match reply.as_ref() {
+                Some(answer) => Ok(vec![AskReply {
+                    correlation_id: request.correlation_id.clone(),
+                    channel: "approval_mock".to_string(),
+                    responder: Some("test-user".to_string()),
+                    answer: answer.clone(),
+                    replied_at: Utc::now(),
+                }]),
+                None => Ok(vec![]),
+            }
+        }
+
+        fn supports_replies(&self) -> bool {
+            true
+        }
+    }
+
+    fn create_approval_watcher(
+        notifier: Arc<dyn Notifier>,
+        tracker: Arc<SqliteTracker>,
+        require_approval: bool,
+        approval_timeout_secs: Option<u64>,
+    ) -> Watcher {
+        let mut config = test_config();
+        config.ask.require_approval = require_approval;
+        config.ask.approval_timeout_secs = approval_timeout_secs;
+        // Use short timeouts for tests
+        config.ask.wait_timeout_secs = 2;
+        config.ask.poll_interval_secs = 1;
+        Watcher::new(WatcherOptions {
+            config,
+            sources: vec![],
+            notifier,
+            tracker: tracker.clone(),
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            code_search_service: None,
+            relationships: None,
+            github_client: None,
+            scm_provider: None,
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(claudear_integrations::runner::ClaudeAgentRunner::new(
+                claudear_integrations::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
+            dry_run: false,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_request_approval_yes_reply() {
+        let notifier = Arc::new(ApprovalMockNotifier::with_reply("yes"));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = create_approval_watcher(notifier.clone(), tracker.clone(), true, None);
+
+        let issue = test_issue();
+        let approved = watcher.request_approval("test", &issue).await;
+
+        assert!(approved);
+        assert_eq!(notifier.ask_count(), 1);
+
+        // Verify activity was logged
+        let activities = tracker.get_recent_activities(10, None).unwrap();
+        let decisions: Vec<_> = activities
+            .iter()
+            .filter(|a| a.activity_type == "decision")
+            .collect();
+        assert!(
+            decisions.iter().any(|a| a.message.contains("granted")),
+            "Expected approval_granted decision in activities"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_approval_no_reply() {
+        let notifier = Arc::new(ApprovalMockNotifier::with_reply("no"));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = create_approval_watcher(notifier.clone(), tracker.clone(), true, None);
+
+        let issue = test_issue();
+        let approved = watcher.request_approval("test", &issue).await;
+
+        assert!(!approved);
+        assert_eq!(notifier.ask_count(), 1);
+
+        let activities = tracker.get_recent_activities(10, None).unwrap();
+        let decisions: Vec<_> = activities
+            .iter()
+            .filter(|a| a.activity_type == "decision")
+            .collect();
+        assert!(
+            decisions.iter().any(|a| a.message.contains("denied")),
+            "Expected approval_denied decision in activities"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_approval_approve_variant() {
+        let notifier = Arc::new(ApprovalMockNotifier::with_reply("approve"));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = create_approval_watcher(notifier.clone(), tracker.clone(), true, None);
+
+        let issue = test_issue();
+        assert!(watcher.request_approval("test", &issue).await);
+    }
+
+    #[tokio::test]
+    async fn test_request_approval_skip_variant() {
+        let notifier = Arc::new(ApprovalMockNotifier::with_reply("skip"));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = create_approval_watcher(notifier.clone(), tracker.clone(), true, None);
+
+        let issue = test_issue();
+        assert!(!watcher.request_approval("test", &issue).await);
+    }
+
+    #[tokio::test]
+    async fn test_request_approval_unrecognized_reply_denies() {
+        let notifier = Arc::new(ApprovalMockNotifier::with_reply("maybe later"));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = create_approval_watcher(notifier.clone(), tracker.clone(), true, None);
+
+        let issue = test_issue();
+        let approved = watcher.request_approval("test", &issue).await;
+
+        assert!(!approved, "Unrecognized reply should be treated as denied");
+    }
+
+    #[tokio::test]
+    async fn test_request_approval_timeout_denies() {
+        let notifier = Arc::new(ApprovalMockNotifier::with_no_reply());
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        // Use very short timeout so test doesn't hang
+        let watcher = create_approval_watcher(notifier.clone(), tracker.clone(), true, Some(1));
+
+        let issue = test_issue();
+        let approved = watcher.request_approval("test", &issue).await;
+
+        assert!(!approved, "Timeout should be treated as denied");
+    }
+
+    #[tokio::test]
+    async fn test_request_approval_uses_custom_timeout() {
+        let notifier = Arc::new(ApprovalMockNotifier::with_reply("yes"));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = create_approval_watcher(notifier.clone(), tracker.clone(), true, Some(60));
+
+        let issue = test_issue();
+        // Should still approve since mock replies immediately
+        assert!(watcher.request_approval("test", &issue).await);
+    }
+
+    #[tokio::test]
+    async fn test_request_approval_logs_approval_requested_activity() {
+        let notifier = Arc::new(ApprovalMockNotifier::with_reply("yes"));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = create_approval_watcher(notifier.clone(), tracker.clone(), true, None);
+
+        let issue = test_issue();
+        watcher.request_approval("test", &issue).await;
+
+        let activities = tracker.get_recent_activities(10, None).unwrap();
+        assert!(
+            activities
+                .iter()
+                .any(|a| a.activity_type == "approval_requested"),
+            "Expected approval_requested activity to be logged"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_approval_lgtm_variant() {
+        let notifier = Arc::new(ApprovalMockNotifier::with_reply("LGTM"));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = create_approval_watcher(notifier.clone(), tracker.clone(), true, None);
+
+        let issue = test_issue();
+        assert!(watcher.request_approval("test", &issue).await);
+    }
+
+    #[tokio::test]
+    async fn test_request_approval_reject_variant() {
+        let notifier = Arc::new(ApprovalMockNotifier::with_reply("reject"));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = create_approval_watcher(notifier.clone(), tracker.clone(), true, None);
+
+        let issue = test_issue();
+        assert!(!watcher.request_approval("test", &issue).await);
     }
 }

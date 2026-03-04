@@ -549,6 +549,11 @@ pub struct AskConfig {
     pub max_reuse_candidates: usize,
     /// Continue with best effort when no reply is received.
     pub best_effort_on_timeout: bool,
+    /// Require human approval before processing each issue.
+    pub require_approval: bool,
+    /// Timeout for approval requests (falls back to wait_timeout_secs when None).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_timeout_secs: Option<u64>,
 }
 
 impl Default for AskConfig {
@@ -562,6 +567,8 @@ impl Default for AskConfig {
             semantic_threshold_global: 0.88,
             max_reuse_candidates: 3,
             best_effort_on_timeout: true,
+            require_approval: false,
+            approval_timeout_secs: None,
         }
     }
 }
@@ -2207,6 +2214,15 @@ impl Config {
         if let Ok(v) = env::var("CLAUDEAR_ASK_BEST_EFFORT_ON_TIMEOUT") {
             self.ask.best_effort_on_timeout = v.to_lowercase() == "true" || v == "1";
         }
+        if let Ok(v) = env::var("CLAUDEAR_ASK_REQUIRE_APPROVAL") {
+            self.ask.require_approval = v.to_lowercase() == "true" || v == "1";
+        }
+        if let Some(v) = env::var("CLAUDEAR_ASK_APPROVAL_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.ask.approval_timeout_secs = Some(v);
+        }
 
         // SMS
         if let Ok(v) = env::var("CLAUDEAR_TWILIO_ACCOUNT_SID") {
@@ -3082,6 +3098,8 @@ mod tests {
         "CLAUDEAR_ASK_SEMANTIC_THRESHOLD_GLOBAL",
         "CLAUDEAR_ASK_MAX_REUSE_CANDIDATES",
         "CLAUDEAR_ASK_BEST_EFFORT_ON_TIMEOUT",
+        "CLAUDEAR_ASK_REQUIRE_APPROVAL",
+        "CLAUDEAR_ASK_APPROVAL_TIMEOUT_SECS",
         "CLAUDEAR_TWILIO_ACCOUNT_SID",
         "CLAUDEAR_TWILIO_AUTH_TOKEN",
         "CLAUDEAR_TWILIO_FROM_NUMBER",
@@ -5392,6 +5410,121 @@ workspace = "/tmp/repos"
         assert!((config.semantic_threshold_global - 0.88).abs() < 0.01);
         assert_eq!(config.max_reuse_candidates, 3);
         assert!(config.best_effort_on_timeout);
+        assert!(!config.require_approval);
+        assert_eq!(config.approval_timeout_secs, None);
+    }
+
+    #[test]
+    fn test_ask_config_approval_from_toml() {
+        with_env(&[], || {
+            let toml_str = r#"
+workspace = "/tmp/test"
+
+[ask]
+require_approval = true
+approval_timeout_secs = 300
+"#;
+            let file = create_temp_toml(toml_str);
+            let config = Config::load(file.path()).unwrap();
+            assert!(config.ask.require_approval);
+            assert_eq!(config.ask.approval_timeout_secs, Some(300));
+        });
+    }
+
+    #[test]
+    fn test_ask_config_approval_only_flag_from_toml() {
+        with_env(&[], || {
+            let toml_str = r#"
+workspace = "/tmp/test"
+
+[ask]
+require_approval = true
+"#;
+            let file = create_temp_toml(toml_str);
+            let config = Config::load(file.path()).unwrap();
+            assert!(config.ask.require_approval);
+            assert_eq!(config.ask.approval_timeout_secs, None);
+        });
+    }
+
+    #[test]
+    fn test_ask_config_approval_false_explicit_from_toml() {
+        with_env(&[], || {
+            let toml_str = r#"
+workspace = "/tmp/test"
+
+[ask]
+require_approval = false
+"#;
+            let file = create_temp_toml(toml_str);
+            let config = Config::load(file.path()).unwrap();
+            assert!(!config.ask.require_approval);
+        });
+    }
+
+    #[test]
+    fn test_env_override_ask_approval_config() {
+        let toml_str = r#"
+workspace = "/tmp/repos"
+"#;
+        let file = create_temp_toml(toml_str);
+
+        with_env(
+            &[
+                ("CLAUDEAR_ASK_REQUIRE_APPROVAL", "true"),
+                ("CLAUDEAR_ASK_APPROVAL_TIMEOUT_SECS", "120"),
+            ],
+            || {
+                let config = Config::load(file.path()).unwrap();
+                assert!(config.ask.require_approval);
+                assert_eq!(config.ask.approval_timeout_secs, Some(120));
+            },
+        );
+    }
+
+    #[test]
+    fn test_env_override_ask_approval_false() {
+        let toml_str = r#"
+workspace = "/tmp/repos"
+
+[ask]
+require_approval = true
+"#;
+        let file = create_temp_toml(toml_str);
+
+        with_env(&[("CLAUDEAR_ASK_REQUIRE_APPROVAL", "false")], || {
+            let config = Config::load(file.path()).unwrap();
+            assert!(!config.ask.require_approval);
+        });
+    }
+
+    #[test]
+    fn test_env_override_ask_approval_with_1() {
+        let toml_str = r#"
+workspace = "/tmp/repos"
+"#;
+        let file = create_temp_toml(toml_str);
+
+        with_env(&[("CLAUDEAR_ASK_REQUIRE_APPROVAL", "1")], || {
+            let config = Config::load(file.path()).unwrap();
+            assert!(config.ask.require_approval);
+        });
+    }
+
+    #[test]
+    fn test_ask_config_approval_timeout_not_set_by_invalid_env() {
+        let toml_str = r#"
+workspace = "/tmp/repos"
+"#;
+        let file = create_temp_toml(toml_str);
+
+        with_env(
+            &[("CLAUDEAR_ASK_APPROVAL_TIMEOUT_SECS", "not_a_number")],
+            || {
+                let config = Config::load(file.path()).unwrap();
+                assert_eq!(config.ask.approval_timeout_secs, None);
+            },
+        );
     }
 
     #[test]
