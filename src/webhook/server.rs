@@ -234,7 +234,7 @@ impl WebhookServer {
         let app = Router::new()
             .route("/health", get(health_handler))
             .route(
-                "/webhook/:source",
+                "/webhook/{source}",
                 get(webhook_verify_handler)
                     .post(webhook_handler)
                     .layer(concurrency_layer),
