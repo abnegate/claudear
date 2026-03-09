@@ -92,7 +92,7 @@ jobs:
           sed -i.bak '/^\[package\]/,/^$/ s/^version = .*/version = "'"${VERSION}"'"/' Cargo.toml && rm -f Cargo.toml.bak
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
