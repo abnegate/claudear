@@ -126,7 +126,7 @@ rust-embed = "8.5"
 mime_guess = "2.0"
 
 # Authentication
-bcrypt = "0.18"
+bcrypt = "0.19"
 tower-cookies = "0.11"
 
 # Email (SMTP)
