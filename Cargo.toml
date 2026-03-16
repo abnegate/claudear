@@ -45,7 +45,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 
 # Error monitoring
-sentry = { version = "0.46", features = ["tower-axum-matched-path", "tracing", "rustls", "backtrace", "contexts", "debug-images", "panic", "anyhow", "reqwest"], default-features = false }
+sentry = { version = "0.47", features = ["tower-axum-matched-path", "tracing", "rustls", "backtrace", "contexts", "debug-images", "panic", "anyhow", "reqwest"], default-features = false }
 
 # Error handling
 thiserror = "2"
