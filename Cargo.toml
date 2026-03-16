@@ -17,7 +17,7 @@ tower-http = { version = "0.6", features = ["trace", "cors", "fs", "limit"] }
 rustls-acme = { version = "0.15", features = ["axum", "aws-lc-rs"] }
 
 # Database
-rusqlite = { version = "0.38", features = ["bundled", "load_extension"] }
+rusqlite = { version = "0.39", features = ["bundled", "load_extension"] }
 
 # Embeddings
 fastembed = { version = "5", default-features = false, features = ["hf-hub-rustls-tls"] }
