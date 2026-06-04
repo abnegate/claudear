@@ -116,6 +116,11 @@ pub struct DiscordMessageReference {
     pub channel_id: Option<String>,
     /// Referenced guild ID.
     pub guild_id: Option<String>,
+    /// When `Some(false)`, sending still succeeds even if the referenced
+    /// message no longer exists (Discord defaults this to `true`, which would
+    /// otherwise fail the whole send if the original message was deleted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fail_if_not_exists: Option<bool>,
 }
 
 /// Parameters for creating a thread.
@@ -229,6 +234,8 @@ impl CreateMessageParams {
             message_id: Some(message_id.into()),
             channel_id: None,
             guild_id: None,
+            // Still deliver even if the referenced message was deleted.
+            fail_if_not_exists: Some(false),
         });
         self
     }
@@ -1091,6 +1098,7 @@ mod tests {
                 message_id: Some("msg-1".to_string()),
                 channel_id: Some("chan-1".to_string()),
                 guild_id: None,
+                fail_if_not_exists: None,
             }),
             thread: None,
             webhook_id: Some("wh-123".to_string()),
@@ -1209,6 +1217,7 @@ mod tests {
                 message_id: Some("msg-orig".to_string()),
                 channel_id: Some("chan-rt".to_string()),
                 guild_id: Some("guild-rt".to_string()),
+                fail_if_not_exists: None,
             }),
             thread: None,
             webhook_id: Some("wh-rt".to_string()),
