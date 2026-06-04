@@ -1307,9 +1307,7 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
             .into_iter()
             .enumerate()
         {
-            let _ = self
-                .send_to_issue_channel(issue, message, i == 0)
-                .await?;
+            let _ = self.send_to_issue_channel(issue, message, i == 0).await?;
         }
         Ok(())
     }
