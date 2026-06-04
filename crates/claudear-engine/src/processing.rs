@@ -132,10 +132,22 @@ impl IssueProcessor {
         // resolved repo directly (or a scratch dir on Skip). Anything ambiguous or
         // non-question falls through to normal processing.
         if matches!(input.intent, Some(Intent::Question)) {
+            tracing::info!(
+                short_id = %input.issue.short_id,
+                source = %input.source_name,
+                intent = "question",
+                "Routing to read-only Q&A answer path"
+            );
             return self
                 .answer_question_issue(&input.issue, &input.resolution, &input.source_name)
                 .await;
         }
+        tracing::info!(
+            short_id = %input.issue.short_id,
+            source = %input.source_name,
+            intent = if matches!(input.intent, Some(Intent::FixRequest)) { "fix" } else { "unclassified" },
+            "Routing to fix pipeline"
+        );
 
         match self.run_inner(input, context_provider).await {
             Ok(ProcessingOutcome::WrongRepo {

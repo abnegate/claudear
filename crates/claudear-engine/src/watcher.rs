@@ -3371,8 +3371,18 @@ Create a PR with your changes.{custom_instructions}"#,
         }
         self.active_processing.fetch_add(1, Ordering::SeqCst);
 
+        let intent_label = match intent {
+            Some(Intent::Question) => "question",
+            Some(Intent::FixRequest) => "fix",
+            None => "unclassified",
+        };
         tracing::info!("");
-        tracing::info!(short_id = %issue.short_id, title = %issue.title, "Processing issue");
+        tracing::info!(
+            short_id = %issue.short_id,
+            title = %issue.title,
+            intent = intent_label,
+            "Processing issue"
+        );
         tracing::info!(short_id = %issue.short_id, reason = %match_result.reason, "Match reason");
         tracing::info!(short_id = %issue.short_id, priority = ?match_result.priority, "Match priority");
         self.record_issue_decision(
