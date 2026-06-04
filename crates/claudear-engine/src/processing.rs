@@ -26,6 +26,8 @@ use claudear_storage::{classify_error, compute_error_hash, FixAttemptTracker};
 use serde_json::json;
 use std::sync::Arc;
 
+use crate::llm_analyzer::Intent;
+
 /// Trait for building issue context. Both `IssueSource` and `WebhookHandler` satisfy this.
 #[async_trait]
 pub trait ContextProvider: Send + Sync {
@@ -62,7 +64,7 @@ impl ContextProvider for WebhookContext<'_> {
 
 /// Whether a source is conversational and therefore eligible for question/answer
 /// handling. Tracker-style sources (Sentry, Linear, GitHub, etc.) are not.
-fn qa_eligible_source(source: &str) -> bool {
+pub(crate) fn qa_eligible_source(source: &str) -> bool {
     matches!(source, "discord" | "slack" | "telegram" | "whatsapp")
 }
 
@@ -92,6 +94,7 @@ pub struct ProcessingInput {
     pub attempt_id: Option<i64>,
     pub review_feedback: Option<String>,
     pub existing_pr_branch: Option<String>,
+    pub intent: Option<Intent>,
 }
 
 /// What happened during processing.
@@ -128,10 +131,7 @@ impl IssueProcessor {
         // before any repo fetch / worktree setup since the answer path reads the
         // resolved repo directly (or a scratch dir on Skip). Anything ambiguous or
         // non-question falls through to normal processing.
-        if self.config.qa.enabled
-            && qa_eligible_source(&input.source_name)
-            && self.qa_classify_is_question(&input.issue).await
-        {
+        if matches!(input.intent, Some(Intent::Question)) {
             return self
                 .answer_question_issue(&input.issue, &input.resolution, &input.source_name)
                 .await;
@@ -1370,28 +1370,6 @@ impl IssueProcessor {
         }
     }
 
-    /// Classify whether an incoming message is a pure question. Returns false
-    /// (i.e. treat as a fix request) when no classifier is available or the
-    /// result is ambiguous — preserving the default issue-resolution behaviour.
-    async fn qa_classify_is_question(&self, issue: &Issue) -> bool {
-        let Some(analyzer) = self.llm_analyzer.clone() else {
-            return false;
-        };
-        // `classify_intent` runs a synchronous, CPU-bound local LLM inference.
-        // Run it on the blocking pool so it never stalls the async runtime — the
-        // same worker threads drive the source poll loop, so a blocking call here
-        // would otherwise pause polling for the duration of the inference.
-        let issue = issue.clone();
-        tokio::task::spawn_blocking(move || {
-            matches!(
-                analyzer.classify_intent(&issue),
-                Some(crate::llm_analyzer::Intent::Question)
-            )
-        })
-        .await
-        .unwrap_or(false)
-    }
-
     /// Answer a pure question with RAG-grounded context, read-only (no PR).
     async fn answer_question_issue(
         &self,
@@ -1991,6 +1969,7 @@ mod tests {
             attempt_id: Some(42),
             review_feedback: Some("Fix the tests".to_string()),
             existing_pr_branch: Some("claudear/fix-123".to_string()),
+            intent: None,
         };
 
         assert_eq!(input.source_name, "linear");
@@ -2017,6 +1996,7 @@ mod tests {
             attempt_id: None,
             review_feedback: None,
             existing_pr_branch: None,
+            intent: None,
         };
 
         assert!(input.attempt_id.is_none());
@@ -2916,6 +2896,7 @@ mod tests {
             attempt_id: None,
             review_feedback: None,
             existing_pr_branch: None,
+            intent: None,
         };
 
         // Use a dummy context provider
