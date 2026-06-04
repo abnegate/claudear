@@ -8325,4 +8325,37 @@ workspace = "/tmp/repos"
         let wrapper: Wrapper = toml::from_str(toml_str).unwrap();
         assert!(wrapper.agent.use_llm);
     }
+
+    #[test]
+    fn test_qa_max_qa_per_cycle_from_toml() {
+        let toml_str = r#"
+            [qa]
+            enabled = true
+            max_qa_per_cycle = 30
+        "#;
+        #[derive(Deserialize)]
+        struct Wrapper {
+            qa: QaConfig,
+        }
+        let wrapper: Wrapper = toml::from_str(toml_str).unwrap();
+        assert_eq!(wrapper.qa.max_qa_per_cycle, Some(30));
+    }
+
+    #[test]
+    fn test_qa_max_qa_per_cycle_defaults_when_omitted() {
+        // `[qa]` present but key omitted falls back to the QaConfig default.
+        let toml_str = r#"
+            [qa]
+            enabled = true
+        "#;
+        #[derive(Deserialize)]
+        struct Wrapper {
+            qa: QaConfig,
+        }
+        let wrapper: Wrapper = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            wrapper.qa.max_qa_per_cycle,
+            QaConfig::default().max_qa_per_cycle
+        );
+    }
 }

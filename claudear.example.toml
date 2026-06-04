@@ -850,6 +850,11 @@ max_context_chunks = 8
 # Timeout for generating an answer, in seconds (default: 600)
 answer_timeout_secs = 600
 
+# Max questions answered per poll cycle. Separate from the global max_issues_per_cycle so a
+# burst of fix requests can't starve fast read-only answers; typically set higher than the
+# issue cap. Omit to fall back to max_issues_per_cycle. (default: 20)
+max_qa_per_cycle = 20
+
 # ============================================
 # Code Indexing
 # ============================================
