@@ -612,8 +612,8 @@ pub struct QaConfig {
     pub max_context_chunks: usize,
     /// Timeout for generating an answer, in seconds (default: 600).
     pub answer_timeout_secs: u64,
-    /// Maximum qa to process per poll cycle for this source (overrides global).
-    pub max_qa_per_cycle: Option<usize>,
+    /// Maximum qa to process per poll cycle (independent from issue limits).
+    pub max_qa_per_cycle: usize,
 }
 
 impl Default for QaConfig {
@@ -622,7 +622,7 @@ impl Default for QaConfig {
             enabled: false,
             max_context_chunks: 8,
             answer_timeout_secs: 600,
-            max_qa_per_cycle: Some(20),
+            max_qa_per_cycle: 20,
         }
     }
 }
@@ -8338,7 +8338,7 @@ workspace = "/tmp/repos"
             qa: QaConfig,
         }
         let wrapper: Wrapper = toml::from_str(toml_str).unwrap();
-        assert_eq!(wrapper.qa.max_qa_per_cycle, Some(30));
+        assert_eq!(wrapper.qa.max_qa_per_cycle, 30);
     }
 
     #[test]

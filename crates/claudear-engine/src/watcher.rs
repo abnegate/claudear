@@ -2857,8 +2857,8 @@ Create a PR with your changes.{custom_instructions}"#,
         // Apply per-source max issues per cycle limit (falls back to global)
         let source_max_issues = self.config.max_issues_per_cycle_for(source.name());
         // QA gets its own per-cycle budget so questions (answered read-only, fast) are not
-        // starved by a burst of fix requests. Falls back to the issue cap when unset.
-        let source_max_qa = self.config.qa.max_qa_per_cycle.unwrap_or(source_max_issues);
+        // starved by a burst of fix requests.
+        let source_max_qa = self.config.qa.max_qa_per_cycle;
 
         // Order candidates first (prioritisation engine or legacy sort), WITHOUT capping yet —
         // the cap(s) are applied after the QA/fix partition below.
