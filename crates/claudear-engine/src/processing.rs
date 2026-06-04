@@ -66,6 +66,12 @@ fn qa_eligible_source(source: &str) -> bool {
     matches!(source, "discord" | "slack" | "telegram" | "whatsapp")
 }
 
+/// Whether a source is conversational and therefore eligible for question/answer
+/// handling. Tracker-style sources (Sentry, Linear, GitHub, etc.) are not.
+fn qa_eligible_source(source: &str) -> bool {
+    matches!(source, "discord" | "slack" | "telegram" | "whatsapp")
+}
+
 /// Holds shared services needed to process an issue.
 pub struct IssueProcessor {
     pub config: Config,

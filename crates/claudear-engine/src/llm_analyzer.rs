@@ -38,6 +38,19 @@ pub enum Intent {
 /// Maximum description length included in the intent-classification prompt.
 const MAX_INTENT_DESC_CHARS: usize = 1500;
 
+/// Whether an incoming chat-source message is a pure question or a request
+/// that should be routed to the issue-resolution (fix/feature) pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Intent {
+    /// The user is only asking for information/explanation; no code change wanted.
+    Question,
+    /// The user wants something fixed/changed/built (the safe default on any doubt).
+    FixRequest,
+}
+
+/// Maximum description length included in the intent-classification prompt.
+const MAX_INTENT_DESC_CHARS: usize = 1500;
+
 pub struct LlmAnalyzerImpl {
     engine: Arc<LlmEngine>,
 }
@@ -45,6 +58,17 @@ pub struct LlmAnalyzerImpl {
 impl LlmAnalyzerImpl {
     pub fn new(engine: Arc<LlmEngine>) -> Self {
         Self { engine }
+    }
+
+    /// Classify an incoming message as a pure question vs a fix/feature request.
+    ///
+    /// Returns `None` when the model is unavailable or the response cannot be
+    /// parsed. Callers MUST treat `None` (and any ambiguity) as a fix request,
+    /// preserving the default issue-resolution behaviour.
+    pub fn classify_intent(&self, issue: &Issue) -> Option<Intent> {
+        let prompt = build_intent_prompt(issue);
+        let response = self.complete(&prompt, 8)?;
+        parse_intent(&response)
     }
 
     /// Classify an incoming message as a pure question vs a fix/feature request.
@@ -309,6 +333,63 @@ fn build_correlation_prompt(
          <|assistant|>",
         pairs, issues_context
     )
+}
+
+/// Build the question-vs-fix intent classification prompt.
+///
+/// The prompt is biased toward `fix`: only an unambiguous, information-seeking
+/// message that wants no code change should be classified as a question.
+fn build_intent_prompt(issue: &Issue) -> String {
+    let mut body = String::new();
+    if let Some(desc) = issue.description.as_deref() {
+        let desc = desc.trim();
+        if !desc.is_empty() && desc != issue.title {
+            body = truncate(desc, MAX_INTENT_DESC_CHARS);
+        }
+    }
+
+    format!(
+        "<|system|>\n\
+         You classify an incoming developer-support message into exactly one of:\n\
+         - \"question\": the user is ONLY asking for information, an explanation, or how \
+         something works, and does NOT want any code changed.\n\
+         - \"fix\": the user wants something fixed, changed, added, built, or implemented, \
+         OR the message reports a bug, OR it is ambiguous / could require a code change.\n\
+         When in doubt, answer \"fix\".\n\
+         Respond with ONLY the single word: question or fix.\n\
+         <|end|>\n\
+         <|user|>\n\
+         Title: {}\n\
+         {}\n\
+         <|end|>\n\
+         <|assistant|>",
+        truncate(&issue.title, MAX_METADATA_CHARS * 4),
+        body
+    )
+}
+
+/// Parse the intent classification response. Biased toward `FixRequest`:
+/// only a clear "question" answer yields `Intent::Question`.
+fn parse_intent(s: &str) -> Option<Intent> {
+    let lower = s.trim().to_lowercase();
+    let first = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .find(|t| !t.is_empty())
+        .unwrap_or("");
+
+    match first {
+        "question" => Some(Intent::Question),
+        "fix" => Some(Intent::FixRequest),
+        _ => {
+            if lower.contains("question") && !lower.contains("fix") {
+                Some(Intent::Question)
+            } else if lower.contains("fix") {
+                Some(Intent::FixRequest)
+            } else {
+                None
+            }
+        }
+    }
 }
 
 /// Build the question-vs-fix intent classification prompt.
