@@ -130,7 +130,7 @@ impl IssueProcessor {
         // non-question falls through to normal processing.
         if self.config.qa.enabled
             && qa_eligible_source(&input.source_name)
-            && self.qa_classify_is_question(&input.issue)
+            && self.qa_classify_is_question(&input.issue).await
         {
             return self
                 .answer_question_issue(&input.issue, &input.resolution, &input.source_name)
@@ -1373,14 +1373,23 @@ impl IssueProcessor {
     /// Classify whether an incoming message is a pure question. Returns false
     /// (i.e. treat as a fix request) when no classifier is available or the
     /// result is ambiguous — preserving the default issue-resolution behaviour.
-    fn qa_classify_is_question(&self, issue: &Issue) -> bool {
-        match self.llm_analyzer.as_ref() {
-            Some(analyzer) => matches!(
-                analyzer.classify_intent(issue),
+    async fn qa_classify_is_question(&self, issue: &Issue) -> bool {
+        let Some(analyzer) = self.llm_analyzer.clone() else {
+            return false;
+        };
+        // `classify_intent` runs a synchronous, CPU-bound local LLM inference.
+        // Run it on the blocking pool so it never stalls the async runtime — the
+        // same worker threads drive the source poll loop, so a blocking call here
+        // would otherwise pause polling for the duration of the inference.
+        let issue = issue.clone();
+        tokio::task::spawn_blocking(move || {
+            matches!(
+                analyzer.classify_intent(&issue),
                 Some(crate::llm_analyzer::Intent::Question)
-            ),
-            None => false,
-        }
+            )
+        })
+        .await
+        .unwrap_or(false)
     }
 
     /// Answer a pure question with RAG-grounded context, read-only (no PR).

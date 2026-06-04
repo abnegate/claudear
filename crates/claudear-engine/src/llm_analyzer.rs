@@ -836,6 +836,96 @@ mod tests {
         assert_eq!(parse_intent(""), None);
     }
 
+    #[test]
+    fn test_parse_intent_handles_noisy_model_output() {
+        // Real local-LLM outputs are rarely a bare word: leading labels,
+        // punctuation, code fences, and trailing prose all appear in practice.
+        assert_eq!(parse_intent("question\n"), Some(Intent::Question));
+        assert_eq!(parse_intent("\"question\""), Some(Intent::Question));
+        assert_eq!(parse_intent("- fix"), Some(Intent::FixRequest));
+        assert_eq!(parse_intent("Answer: question"), Some(Intent::Question));
+        assert_eq!(
+            parse_intent("FIX\nbecause it reports a bug"),
+            Some(Intent::FixRequest)
+        );
+    }
+
+    #[test]
+    fn test_parse_intent_first_clean_token_decides() {
+        // A clean leading verdict short-circuits: the first exact "question"/"fix"
+        // token wins immediately, before the both-present fix-bias fallback.
+        assert_eq!(
+            parse_intent("question, you could also fix the docs later"),
+            Some(Intent::Question)
+        );
+        assert_eq!(
+            parse_intent("fix the rest is noise"),
+            Some(Intent::FixRequest)
+        );
+        // The fix-bias only applies when neither word leads cleanly.
+        assert_eq!(
+            parse_intent("this looks like a question but may need a fix"),
+            Some(Intent::FixRequest)
+        );
+    }
+
+    // --- Intent prompt construction (what the model actually sees) ---
+
+    #[test]
+    fn test_build_intent_prompt_embeds_title_and_instructions() {
+        let issue = sample_issue("DISCORD-1", "what is query not equal syntax?");
+        let prompt = build_intent_prompt(&issue);
+
+        // The user's actual message must reach the model.
+        assert!(prompt.contains("what is query not equal syntax?"));
+        // The classification contract must be present and biased to fix.
+        assert!(prompt.contains("\"question\""));
+        assert!(prompt.contains("\"fix\""));
+        assert!(prompt.contains("When in doubt, answer \"fix\"."));
+        assert!(prompt.contains("ONLY the single word"));
+    }
+
+    #[test]
+    fn test_build_intent_prompt_includes_distinct_description() {
+        let mut issue = sample_issue("DISCORD-2", "Realtime onClose error");
+        issue.description = Some(
+            "triggerStats(): Argument #2 ($projectId) must be of type string, null given".into(),
+        );
+        let prompt = build_intent_prompt(&issue);
+
+        assert!(prompt.contains("Realtime onClose error"));
+        assert!(prompt.contains("triggerStats()"));
+    }
+
+    #[test]
+    fn test_build_intent_prompt_omits_description_when_same_as_title() {
+        // Avoid duplicating the title into the body (wastes context / confuses
+        // the classifier).
+        let mut issue = sample_issue("DISCORD-3", "how do I paginate results?");
+        issue.description = Some("how do I paginate results?".into());
+        let prompt = build_intent_prompt(&issue);
+
+        // Title appears exactly once (in the `Title:` line), not duplicated.
+        assert_eq!(prompt.matches("how do I paginate results?").count(), 1);
+    }
+
+    #[test]
+    fn test_build_intent_prompt_truncates_long_description() {
+        let mut issue = sample_issue("DISCORD-4", "long one");
+        // Use 'Z', which never appears in the static prompt template, so the
+        // count reflects only the (truncated) description body.
+        issue.description = Some("Z".repeat(MAX_INTENT_DESC_CHARS * 4));
+        let prompt = build_intent_prompt(&issue);
+
+        let body_len = prompt.matches('Z').count();
+        assert!(body_len > 0, "description missing from prompt");
+        assert!(
+            body_len <= MAX_INTENT_DESC_CHARS,
+            "body not truncated: {body_len}"
+        );
+        assert!(!prompt.contains(&"Z".repeat(MAX_INTENT_DESC_CHARS * 4)));
+    }
+
     // --- Assessment response parsing ---
 
     #[test]
