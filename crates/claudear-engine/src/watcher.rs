@@ -3013,16 +3013,14 @@ Create a PR with your changes.{custom_instructions}"#,
             let intents: Vec<Intent> = tokio::task::spawn_blocking(move || {
                 issues_for_intent
                     .iter()
-                    .map(|issue| match analyzer.classify_intent(issue) {
-                        Some(Intent::Question) => Intent::Question,
-                        _ => Intent::FixRequest,
-                    })
+                    .map(|issue| analyzer.classify_intent(issue).unwrap_or(Intent::Fix))
                     .collect()
             })
             .await
-            .unwrap_or_else(|_| vec![Intent::FixRequest; ordered_len]);
+            .unwrap_or_else(|_| vec![Intent::Fix; ordered_len]);
 
-            // Partition preserving prioritisation order within each bucket.
+            // Partition preserving prioritisation order within each bucket. Only
+            // pure questions take the QA bucket; bug/security/fix are processed.
             let mut questions: Vec<(Issue, MatchResult, Option<Intent>)> = Vec::new();
             let mut fixes: Vec<(Issue, MatchResult, Option<Intent>)> = Vec::new();
             for ((issue, match_result), intent) in ordered.into_iter().zip(intents) {
@@ -3030,9 +3028,7 @@ Create a PR with your changes.{custom_instructions}"#,
                     Intent::Question => {
                         questions.push((issue, match_result, Some(Intent::Question)))
                     }
-                    Intent::FixRequest => {
-                        fixes.push((issue, match_result, Some(Intent::FixRequest)))
-                    }
+                    other => fixes.push((issue, match_result, Some(other))),
                 }
             }
             questions.truncate(source_max_qa);
@@ -3453,7 +3449,9 @@ Create a PR with your changes.{custom_instructions}"#,
 
         let intent_label = match intent {
             Some(Intent::Question) => "question",
-            Some(Intent::FixRequest) => "fix",
+            Some(Intent::Bug) => "bug",
+            Some(Intent::Security) => "security",
+            Some(Intent::Fix) => "fix",
             None => "unclassified",
         };
         tracing::info!("");
@@ -4290,6 +4288,7 @@ Create a PR with your changes.{custom_instructions}"#,
             attempt_id,
             review_feedback: None,
             existing_pr_branch: None,
+            intent: None,
         };
 
         let context_provider = crate::processing::SourceContext(source.as_ref());

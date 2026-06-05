@@ -899,31 +899,10 @@ mod tests {
         // punctuation, code fences, and trailing prose all appear in practice.
         assert_eq!(parse_intent("question\n"), Some(Intent::Question));
         assert_eq!(parse_intent("\"question\""), Some(Intent::Question));
-        assert_eq!(parse_intent("- fix"), Some(Intent::FixRequest));
+        assert_eq!(parse_intent("- fix"), Some(Intent::Fix));
         assert_eq!(parse_intent("Answer: question"), Some(Intent::Question));
-        assert_eq!(
-            parse_intent("FIX\nbecause it reports a bug"),
-            Some(Intent::FixRequest)
-        );
-    }
-
-    #[test]
-    fn test_parse_intent_first_clean_token_decides() {
-        // A clean leading verdict short-circuits: the first exact "question"/"fix"
-        // token wins immediately, before the both-present fix-bias fallback.
-        assert_eq!(
-            parse_intent("question, you could also fix the docs later"),
-            Some(Intent::Question)
-        );
-        assert_eq!(
-            parse_intent("fix the rest is noise"),
-            Some(Intent::FixRequest)
-        );
-        // The fix-bias only applies when neither word leads cleanly.
-        assert_eq!(
-            parse_intent("this looks like a question but may need a fix"),
-            Some(Intent::FixRequest)
-        );
+        // "bug" leads cleanly even when followed by other prose.
+        assert_eq!(parse_intent("bug\nbecause it crashes"), Some(Intent::Bug));
     }
 
     // --- Intent prompt construction (what the model actually sees) ---
@@ -935,11 +914,13 @@ mod tests {
 
         // The user's actual message must reach the model.
         assert!(prompt.contains("what is query not equal syntax?"));
-        // The classification contract must be present and biased to fix.
+        // The classification contract (all four categories) must be present.
+        assert!(prompt.contains("\"bug\""));
+        assert!(prompt.contains("\"security\""));
         assert!(prompt.contains("\"question\""));
         assert!(prompt.contains("\"fix\""));
-        assert!(prompt.contains("When in doubt, answer \"fix\"."));
-        assert!(prompt.contains("ONLY the single word"));
+        assert!(prompt.contains("When in doubt about a code problem, answer \"bug\"."));
+        assert!(prompt.contains("ONLY one word"));
     }
 
     #[test]

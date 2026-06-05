@@ -200,7 +200,7 @@ impl IssueProcessor {
         tracing::info!(
             short_id = %input.issue.short_id,
             source = %input.source_name,
-            intent = if matches!(input.intent, Some(Intent::FixRequest)) { "fix" } else { "unclassified" },
+            intent = ?input.intent,
             "Routing to fix pipeline"
         );
 
@@ -1583,7 +1583,13 @@ impl IssueProcessor {
         input: ProcessingInput,
         context_provider: &dyn ContextProvider,
     ) -> ProcessingOutcome {
-        if self.classify_is_bug_or_security(&input.issue) {
+        // Prefer the intent decided upstream (carried on the input); only classify
+        // here as a fallback when the caller didn't pre-classify.
+        let is_bug_or_security = match input.intent {
+            Some(intent) => intent.is_bug_or_security(),
+            None => self.classify_is_bug_or_security(&input.issue),
+        };
+        if is_bug_or_security {
             // Verify before spending an expensive fix run.
             let verdict = self
                 .run_verify(&input.issue, &input.resolution, &input.source_name)
