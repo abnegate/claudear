@@ -216,6 +216,8 @@ pub struct IssuesConfig {
     pub discord: Option<DiscordSourceConfig>,
     /// Slack as an issue source (bot_token + channel for inbound messages).
     pub slack: Option<SlackSourceConfig>,
+    /// HelpScout as an issue source (support conversations from one or more mailboxes).
+    pub helpscout: Option<HelpScoutConfig>,
 }
 
 /// Notifier configuration group.
@@ -406,6 +408,9 @@ pub struct Config {
     /// RAG-grounded question answering configuration.
     #[serde(default)]
     pub qa: QaConfig,
+    /// Reply-action configuration (per-inbox templates used as soft guidelines).
+    #[serde(default)]
+    pub reply: ReplyConfig,
 }
 
 fn default_storage_dir() -> PathBuf {
@@ -596,6 +601,7 @@ impl Default for Config {
             tls: TlsConfig::default(),
             embedding: EmbeddingModelConfig::default(),
             qa: QaConfig::default(),
+            reply: ReplyConfig::default(),
         }
     }
 }
@@ -625,6 +631,54 @@ impl Default for QaConfig {
             max_context_chunks: 8,
             answer_timeout_secs: 600,
         }
+    }
+}
+
+/// Reply-action configuration.
+///
+/// The Reply action generates a grounded, human-sounding response to a ticket.
+/// Templates are keyed by "inbox" (a HelpScout mailbox id, or a source name in
+/// general) and are treated as *soft guidelines* — the agent is told to follow
+/// the tone/structure loosely and vary naturally, not reproduce them verbatim.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReplyConfig {
+    /// Enable the reply action (default: false).
+    pub enabled: bool,
+    /// Instruct the agent to sound as human as possible (default: true).
+    pub sound_human: bool,
+    /// Fallback template guideline used when no per-inbox template matches.
+    pub default_template: Option<String>,
+    /// Per-inbox template guidelines, keyed by mailbox id / source name.
+    pub templates: std::collections::HashMap<String, String>,
+    /// Timeout for verifying (reproducing) a reported bug, in seconds (default: 1800).
+    pub verify_timeout_secs: u64,
+}
+
+impl Default for ReplyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sound_human: true,
+            default_template: None,
+            templates: std::collections::HashMap::new(),
+            verify_timeout_secs: 1800,
+        }
+    }
+}
+
+impl ReplyConfig {
+    /// Select the template guideline for an inbox, falling back to the default.
+    ///
+    /// Tries the exact `inbox_key` first (e.g. a HelpScout mailbox id), then the
+    /// configured `default_template`. Returns `None` when neither is set.
+    pub fn template_for(&self, inbox_key: Option<&str>) -> Option<&str> {
+        if let Some(key) = inbox_key {
+            if let Some(t) = self.templates.get(key) {
+                return Some(t.as_str());
+            }
+        }
+        self.default_template.as_deref()
     }
 }
 
@@ -1530,6 +1584,63 @@ impl Default for LinearConfig {
             trigger_states: vec!["backlog".to_string(), "todo".to_string()],
             team_id: None,
             project_id: None,
+            webhook_secret: None,
+            max_issues_per_cycle: None,
+            max_concurrent: None,
+            poll_interval_ms: None,
+        }
+    }
+}
+
+/// How a generated reply is posted back to a HelpScout conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplyAs {
+    /// Post as an internal note (not visible to the customer). Safe default.
+    #[default]
+    Note,
+    /// Post as a customer-facing reply on the conversation.
+    Reply,
+}
+
+/// HelpScout source configuration (Mailbox API v2, OAuth2 client-credentials).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HelpScoutConfig {
+    /// Whether this source is enabled.
+    pub enabled: bool,
+    /// OAuth2 client id (HelpScout "App ID").
+    pub app_id: SecretValue,
+    /// OAuth2 client secret (HelpScout "App Secret").
+    pub app_secret: SecretValue,
+    /// Mailbox ids to poll. Each mailbox is treated as a distinct "inbox".
+    pub mailbox_ids: Vec<String>,
+    /// Tags that trigger automation (matched case-insensitively against conversation tags).
+    pub trigger_tags: Vec<String>,
+    /// Conversation status to poll (e.g. "active", "open"). Defaults to "active".
+    pub trigger_status: String,
+    /// How generated replies are posted back (`note` or `reply`).
+    pub reply_as: ReplyAs,
+    /// Webhook signature verification secret (HMAC-SHA1).
+    pub webhook_secret: Option<SecretValue>,
+    /// Maximum issues to process per poll cycle for this source (overrides global).
+    pub max_issues_per_cycle: Option<usize>,
+    /// Maximum concurrent issue processing for this source (overrides global).
+    pub max_concurrent: Option<usize>,
+    /// Polling interval in milliseconds for this source (overrides global).
+    pub poll_interval_ms: Option<u64>,
+}
+
+impl Default for HelpScoutConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            app_id: SecretValue::new(""),
+            app_secret: SecretValue::new(""),
+            mailbox_ids: Vec::new(),
+            trigger_tags: vec!["auto-implement".to_string(), "claude".to_string()],
+            trigger_status: "active".to_string(),
+            reply_as: ReplyAs::Note,
             webhook_secret: None,
             max_issues_per_cycle: None,
             max_concurrent: None,
@@ -2963,6 +3074,11 @@ impl Config {
         self.issues.jira.as_ref()
     }
 
+    /// Accessor: get reference to HelpScoutConfig.
+    pub fn helpscout(&self) -> Option<&HelpScoutConfig> {
+        self.issues.helpscout.as_ref()
+    }
+
     /// Accessor: get reference to EmailConfig.
     pub fn email(&self) -> &EmailConfig {
         &self.notifiers.email
@@ -3152,6 +3268,73 @@ mod tests {
 
     // Mutex to prevent parallel execution of env-modifying tests
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn test_reply_template_for_precedence() {
+        let mut cfg = ReplyConfig {
+            default_template: Some("default".to_string()),
+            ..Default::default()
+        };
+        cfg.templates
+            .insert("123".to_string(), "mailbox-123".to_string());
+
+        // Exact inbox key wins.
+        assert_eq!(cfg.template_for(Some("123")), Some("mailbox-123"));
+        // Unknown key falls back to default.
+        assert_eq!(cfg.template_for(Some("999")), Some("default"));
+        // None falls back to default.
+        assert_eq!(cfg.template_for(None), Some("default"));
+    }
+
+    #[test]
+    fn test_reply_template_for_no_default() {
+        let cfg = ReplyConfig::default();
+        assert_eq!(cfg.template_for(Some("123")), None);
+        assert_eq!(cfg.template_for(None), None);
+    }
+
+    #[test]
+    fn test_helpscout_config_defaults() {
+        let cfg = HelpScoutConfig::default();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.trigger_status, "active");
+        assert_eq!(cfg.reply_as, ReplyAs::Note);
+        assert!(cfg.trigger_tags.contains(&"claude".to_string()));
+    }
+
+    #[test]
+    fn test_reply_config_parses_from_toml() {
+        let toml = r#"
+            [reply]
+            enabled = true
+            default_template = "be nice"
+            [reply.templates]
+            "42" = "warm and apologetic"
+        "#;
+        let cfg: Config = toml::from_str(toml).expect("parse");
+        assert!(cfg.reply.enabled);
+        assert_eq!(
+            cfg.reply.template_for(Some("42")),
+            Some("warm and apologetic")
+        );
+        assert_eq!(cfg.reply.template_for(Some("x")), Some("be nice"));
+    }
+
+    #[test]
+    fn test_helpscout_config_parses_from_toml() {
+        let toml = r#"
+            [issues.helpscout]
+            enabled = true
+            mailbox_ids = ["100", "200"]
+            trigger_tags = ["bug"]
+            reply_as = "reply"
+        "#;
+        let cfg: Config = toml::from_str(toml).expect("parse");
+        let hs = cfg.helpscout().expect("helpscout config");
+        assert!(hs.enabled);
+        assert_eq!(hs.mailbox_ids, vec!["100".to_string(), "200".to_string()]);
+        assert_eq!(hs.reply_as, ReplyAs::Reply);
+    }
 
     // All environment variables that Config reads
     const CONFIG_ENV_VARS: &[&str] = &[

@@ -1483,6 +1483,26 @@ impl ActivityStore for SqliteTracker {
         SqliteTracker::record_activity(self, entry)
     }
 
+    fn record_action_run(
+        &self,
+        source: &str,
+        issue_id: &str,
+        short_id: &str,
+        action_kind: &str,
+        status: &str,
+        detail: &str,
+    ) -> Result<()> {
+        SqliteTracker::record_action_run(
+            self,
+            source,
+            issue_id,
+            short_id,
+            action_kind,
+            status,
+            detail,
+        )
+    }
+
     fn get_recent_activities(&self, limit: usize) -> Result<Vec<ActivityLogEntry>> {
         SqliteTracker::get_recent_activities(self, limit, None)
     }
@@ -4251,6 +4271,27 @@ impl SimilarityStore for SqliteTracker {
 
 impl SqliteTracker {
     /// Record an activity to the activity log.
+    /// Persist a single action-pipeline run.
+    pub fn record_action_run(
+        &self,
+        source: &str,
+        issue_id: &str,
+        short_id: &str,
+        action_kind: &str,
+        status: &str,
+        detail: &str,
+    ) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            INSERT INTO action_runs (source, issue_id, short_id, action_kind, status, detail)
+            VALUES (?, ?, ?, ?, ?, ?)
+            "#,
+            params![source, issue_id, short_id, action_kind, status, detail],
+        )?;
+        Ok(())
+    }
+
     pub fn record_activity(&self, entry: &ActivityLogEntry) -> Result<i64> {
         let conn = self.acquire_lock()?;
         let metadata_json = entry.metadata.as_ref().map(|m| m.to_string());

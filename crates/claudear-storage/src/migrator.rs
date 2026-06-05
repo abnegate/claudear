@@ -26,6 +26,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_session_last_active",
         sql: include_str!("../../../migrations/V2__add_session_last_active.sql"),
     },
+    Migration {
+        version: 3,
+        name: "action_runs",
+        sql: include_str!("../../../migrations/V3__action_runs.sql"),
+    },
 ];
 
 /// Run all pending migrations against the given connection.
@@ -86,7 +91,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
 
         // Verify a table from V1 exists
         let count: u32 = conn
@@ -111,7 +116,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
     }
 
     #[test]
@@ -167,6 +172,7 @@ mod tests {
             "eval_deltas",
             "chat_sessions",
             "chat_messages",
+            "action_runs",
         ];
 
         for table in expected_tables {

@@ -1193,6 +1193,7 @@ mod tests {
             tls: crate::config::TlsConfig::default(),
             embedding: crate::config::EmbeddingModelConfig::default(),
             qa: crate::config::QaConfig::default(),
+            reply: crate::config::ReplyConfig::default(),
         }
     }
 

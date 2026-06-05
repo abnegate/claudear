@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use claudear_core::error::{Error, Result};
 use claudear_core::templates::{TemplateContext, TemplateLoader, TemplateRenderer};
 use claudear_core::types::{
-    ActivityLogEntry, AgentExecution, AgentResult, BlockingQuestion, Issue,
+    ActivityLogEntry, AgentExecution, AgentResult, BlockingQuestion, Issue, ReplyKind, VerifyResult,
 };
 use claudear_storage::FixAttemptTracker;
 use serde::Deserialize;
@@ -588,18 +588,34 @@ The PR title should include the issue ID: {}
             .await
     }
 
-    /// Run the agent in a read-only mode that returns a plain-text answer
-    /// (no structured fix schema, no PR/branch). Used for RAG-grounded Q&A.
-    ///
-    /// Restricts the granted tools to a read-only set and never skips permission
-    /// prompts, so the agent cannot mutate the repository regardless of config.
-    pub async fn run_answer(
+    /// Attempt to reproduce a reported issue, read-only. Returns a structured
+    /// verdict parsed from the agent's output. Conservative: on any parse failure
+    /// the issue is treated as NOT reproduced.
+    pub async fn run_verify(
         &self,
         issue: &Issue,
         context: &str,
         project_dir: &Path,
+    ) -> Result<VerifyResult> {
+        let prompt = build_verify_prompt(issue, context);
+        let (env, _) = self.prepare_env_and_label(Some(issue));
+        let result = self
+            .execute_with_env_and_attempt(&prompt, &issue.short_id, env, None, project_dir, false)
+            .await?;
+        Ok(parse_verify_result(&result.output))
+    }
+
+    /// Generate a grounded, human-sounding reply, read-only. `guideline` is an
+    /// optional per-inbox style guideline; `kind` selects the framing.
+    pub async fn run_reply(
+        &self,
+        issue: &Issue,
+        context: &str,
+        guideline: Option<&str>,
+        kind: ReplyKind,
+        project_dir: &Path,
     ) -> Result<String> {
-        let prompt = build_answer_prompt(issue, context);
+        let prompt = build_reply_prompt(issue, context, guideline, kind);
         let (env, _) = self.prepare_env_and_label(Some(issue));
         let result = self
             .execute_with_env_and_attempt(&prompt, &issue.short_id, env, None, project_dir, false)
@@ -610,7 +626,7 @@ The PR title should include the issue ID: {}
             Err(Error::runner(
                 result
                     .error
-                    .unwrap_or_else(|| "Failed to generate answer".to_string()),
+                    .unwrap_or_else(|| "Failed to generate reply".to_string()),
             ))
         }
     }
@@ -1834,46 +1850,174 @@ impl AgentRunner for ClaudeAgentRunner {
         context: &str,
         project_dir: &Path,
     ) -> Result<String> {
-        self.run_answer(issue, context, project_dir).await
+        self.generate_reply(issue, context, None, ReplyKind::Answer, project_dir)
+            .await
+    }
+
+    async fn verify_issue(
+        &self,
+        issue: &Issue,
+        context: &str,
+        project_dir: &Path,
+    ) -> Result<VerifyResult> {
+        self.run_verify(issue, context, project_dir).await
+    }
+
+    async fn generate_reply(
+        &self,
+        issue: &Issue,
+        context: &str,
+        guideline: Option<&str>,
+        kind: ReplyKind,
+        project_dir: &Path,
+    ) -> Result<String> {
+        self.run_reply(issue, context, guideline, kind, project_dir)
+            .await
     }
 }
 
-/// Build the prompt for a read-only, RAG-grounded answer to a question.
-///
-/// `context` is the formatted code-search context retrieved from the RAG index.
-fn build_answer_prompt(issue: &Issue, context: &str) -> String {
-    let question = issue
+/// The reported text of a payload: its description if present, else the title.
+fn issue_body(issue: &Issue) -> &str {
+    issue
         .description
         .as_deref()
         .filter(|d| !d.trim().is_empty())
-        .unwrap_or(&issue.title);
+        .unwrap_or(&issue.title)
+}
 
+/// Build the prompt for a read-only attempt to reproduce a reported issue.
+///
+/// The agent must NOT fix anything; it inspects the code (read-only) to decide
+/// whether the issue reproduces as described and returns a single JSON verdict.
+fn build_verify_prompt(issue: &Issue, context: &str) -> String {
     format!(
-        r#"You are a senior engineer answering a technical question from {source}.
+        r#"You are a senior engineer triaging a reported issue from {source}.
 
-Answer the question below using the provided code context AND by reading the
-relevant code in this repository. Ground every claim in the actual code: cite
-the file paths (and line numbers where helpful) you relied on.
+Your ONLY job is to determine whether the issue reproduces AS DESCRIBED, by
+reading and tracing the relevant code in this repository. Do NOT fix anything.
 
 STRICT RULES:
-- This is read-only. Do NOT modify any files, do NOT run write commands, and do
-  NOT create branches, commits, or pull requests.
-- If the answer is not determinable from the available code, say so plainly
-  rather than guessing.
-- Be precise and technical. Prefer concrete references over generalities.
+- This is read-only. Do NOT modify files, run write commands, or create branches/PRs.
+- Decide `reproduced=true` ONLY when you find concrete evidence in the code that
+  the described behavior occurs (a clear code path, missing guard, off-by-one,
+  etc.). If you cannot find such evidence, answer `reproduced=false`.
+- Be conservative: when uncertain, answer `reproduced=false`.
 
 Retrieved code context:
 {context}
 
-Question:
-{question}
+Reported issue:
+Title: {title}
+{body}
 
-Write the answer as clear Markdown. End with a short "Sources" list of the files
-you referenced."#,
+Respond with ONLY a single JSON object on its own, no prose:
+{{"reproduced": true|false, "summary": "<one sentence verdict>", "evidence": "<files/line refs and the code path that confirms or refutes the report>"}}"#,
         source = issue.source,
         context = context,
-        question = question,
+        title = issue.title,
+        body = issue_body(issue),
     )
+}
+
+/// Build the prompt for a read-only, RAG-grounded, human-sounding reply.
+///
+/// `guideline` is an optional per-inbox template treated as a soft style
+/// guideline; `kind` selects the framing of the reply.
+fn build_reply_prompt(
+    issue: &Issue,
+    context: &str,
+    guideline: Option<&str>,
+    kind: ReplyKind,
+) -> String {
+    let task = match kind {
+        ReplyKind::Answer => {
+            "Write a helpful reply that answers the customer's question or addresses \
+their request, grounded in the actual code."
+        }
+        ReplyKind::NeedRepro => {
+            "We could not reproduce the reported issue from the description. Write a \
+friendly reply that asks the customer for the specific steps to reproduce, \
+their environment/version, and any error output — without sounding dismissive."
+        }
+        ReplyKind::FixShipped => {
+            "A fix for the reported issue has shipped and is live. Write a reply that \
+lets the customer know it's resolved, briefly describes what was fixed, and \
+invites them to reach out if it persists."
+        }
+    };
+
+    let guideline_block = match guideline {
+        Some(g) if !g.trim().is_empty() => format!(
+            "\nStyle guideline for this inbox (treat as a LOOSE guideline — match the \
+tone and spirit, but vary the wording naturally; do NOT copy it verbatim):\n{g}\n",
+        ),
+        _ => String::new(),
+    };
+
+    format!(
+        r#"You are a member of the support/engineering team replying to a ticket from {source}.
+
+{task}
+
+STRICT RULES:
+- This is read-only. Do NOT modify files, run write commands, or create branches/PRs.
+- Ground any technical claim in the actual code; do not invent behavior.
+- Sound like a real, helpful human — natural, warm, and concise. Avoid robotic
+  boilerplate and obvious AI phrasing. Write in the first person.
+- Do NOT include internal-only notes, chain-of-thought, or a "Sources" section;
+  output only the message text that will be sent to the ticket.
+{guideline_block}
+Retrieved code context:
+{context}
+
+Ticket:
+Title: {title}
+{body}
+
+Write only the reply message."#,
+        source = issue.source,
+        task = task,
+        guideline_block = guideline_block,
+        context = context,
+        title = issue.title,
+        body = issue_body(issue),
+    )
+}
+
+/// Parse a `VerifyResult` from the agent's output. Tolerant of surrounding prose
+/// and code fences. Conservative: any failure yields `reproduced=false`.
+fn parse_verify_result(output: &str) -> VerifyResult {
+    fn from_json(s: &str) -> Option<VerifyResult> {
+        serde_json::from_str::<VerifyResult>(s).ok()
+    }
+
+    let trimmed = output.trim();
+    // Direct parse, then the outermost {...} span.
+    if let Some(v) = from_json(trimmed) {
+        return v;
+    }
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
+        if end > start {
+            if let Some(v) = from_json(&trimmed[start..=end]) {
+                return v;
+            }
+        }
+    }
+
+    // Fallback heuristic when no JSON could be parsed.
+    let lower = trimmed.to_lowercase();
+    let reproduced = lower.contains("\"reproduced\": true")
+        || lower.contains("\"reproduced\":true")
+        || lower.contains("reproduced: true");
+    VerifyResult {
+        reproduced,
+        summary: if reproduced {
+            "Reproduced (parsed heuristically)".to_string()
+        } else {
+            "Could not parse a verdict; treated as not reproduced".to_string()
+        },
+        evidence: trimmed.chars().take(2000).collect(),
+    }
 }
 
 #[cfg(test)]
@@ -1888,6 +2032,66 @@ mod tests {
 
     /// Mutex to serialize tests that manipulate process-global env vars.
     static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn verify_issue() -> Issue {
+        Issue::new("1", "HS-1", "Login crashes on submit", "url", "helpscout")
+    }
+
+    #[test]
+    fn test_parse_verify_result_direct_json() {
+        let v = parse_verify_result(
+            r#"{"reproduced": true, "summary": "found it", "evidence": "src/a.rs:10"}"#,
+        );
+        assert!(v.reproduced);
+        assert_eq!(v.summary, "found it");
+    }
+
+    #[test]
+    fn test_parse_verify_result_json_in_prose() {
+        let v = parse_verify_result(
+            "Here is my verdict:\n{\"reproduced\": false, \"summary\": \"no repro\", \"evidence\": \"\"}\nThanks.",
+        );
+        assert!(!v.reproduced);
+        assert_eq!(v.summary, "no repro");
+    }
+
+    #[test]
+    fn test_parse_verify_result_garbage_is_not_reproduced() {
+        let v = parse_verify_result("I could not determine anything useful");
+        assert!(!v.reproduced);
+    }
+
+    #[test]
+    fn test_build_verify_prompt_is_read_only_and_asks_json() {
+        let prompt = build_verify_prompt(&verify_issue(), "ctx");
+        assert!(prompt.contains("Login crashes on submit"));
+        assert!(prompt.contains("read-only"));
+        assert!(prompt.contains("Do NOT fix"));
+        assert!(prompt.contains("\"reproduced\""));
+    }
+
+    #[test]
+    fn test_build_reply_prompt_guideline_is_soft() {
+        let prompt = build_reply_prompt(
+            &verify_issue(),
+            "ctx",
+            Some("Warm and apologetic; sign off as Support."),
+            ReplyKind::NeedRepro,
+        );
+        // Guideline is injected but explicitly framed as loose.
+        assert!(prompt.contains("Warm and apologetic"));
+        assert!(prompt.contains("LOOSE guideline"));
+        // NeedRepro framing asks for reproduction steps.
+        assert!(prompt.to_lowercase().contains("reproduce"));
+    }
+
+    #[test]
+    fn test_build_reply_prompt_fix_shipped_framing() {
+        let prompt = build_reply_prompt(&verify_issue(), "", None, ReplyKind::FixShipped);
+        assert!(
+            prompt.to_lowercase().contains("shipped") || prompt.to_lowercase().contains("resolved")
+        );
+    }
 
     #[test]
     fn test_parse_cli_assistant_text_event() {

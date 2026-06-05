@@ -3,6 +3,7 @@
 mod discord;
 mod github;
 mod gitlab;
+mod helpscout;
 mod jira;
 mod linear;
 pub mod sentry;
@@ -14,6 +15,7 @@ pub use discord::DiscordSource;
 pub use github::GitHubSource;
 pub use gitlab::GitLabSource;
 pub(crate) use gitlab::{format_gitlab_context, gitlab_matches_criteria};
+pub use helpscout::HelpScoutSource;
 pub use jira::JiraSource;
 pub use linear::LinearSource;
 pub use sentry::SentrySource;

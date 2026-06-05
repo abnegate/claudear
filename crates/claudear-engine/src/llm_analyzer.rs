@@ -25,14 +25,26 @@ const MAX_COMMENT_CHARS: usize = 800;
 /// Maximum log text length (prioritize end of log).
 const MAX_LOG_CHARS: usize = 8192;
 
-/// Whether an incoming chat-source message is a pure question or a request
-/// that should be routed to the issue-resolution (fix/feature) pipeline.
+/// Classification of an incoming payload, used to route it into the action
+/// pipeline. `Bug`/`Security` start the verify -> resolve chain; `Question`/`Fix`
+/// start a reply. `Bug` is the safe default on any doubt about a code problem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Intent {
+    /// Reports something broken: an error, crash, incorrect behavior, or regression.
+    Bug,
+    /// Reports a security vulnerability, exploit, data leak, or auth problem.
+    Security,
     /// The user is only asking for information/explanation; no code change wanted.
     Question,
-    /// The user wants something fixed/changed/built (the safe default on any doubt).
-    FixRequest,
+    /// Requests a feature/change/improvement that is not itself a bug or security issue.
+    Fix,
+}
+
+impl Intent {
+    /// Whether this category is a bug or security report (routes to Verify).
+    pub fn is_bug_or_security(&self) -> bool {
+        matches!(self, Intent::Bug | Intent::Security)
+    }
 }
 
 /// Maximum description length included in the intent-classification prompt.
@@ -47,11 +59,11 @@ impl LlmAnalyzerImpl {
         Self { engine }
     }
 
-    /// Classify an incoming message as a pure question vs a fix/feature request.
+    /// Classify an incoming message into one of `bug | security | question | fix`.
     ///
     /// Returns `None` when the model is unavailable or the response cannot be
-    /// parsed. Callers MUST treat `None` (and any ambiguity) as a fix request,
-    /// preserving the default issue-resolution behaviour.
+    /// parsed. Callers should fall back to a heuristic (e.g. `FixAttempt::is_bug`)
+    /// when `None`, preserving the default issue-resolution behaviour.
     pub fn classify_intent(&self, issue: &Issue) -> Option<Intent> {
         let prompt = build_intent_prompt(issue);
         let response = self.complete(&prompt, 8)?;
@@ -311,10 +323,11 @@ fn build_correlation_prompt(
     )
 }
 
-/// Build the question-vs-fix intent classification prompt.
+/// Build the payload classification prompt.
 ///
-/// The prompt is biased toward `fix`: only an unambiguous, information-seeking
-/// message that wants no code change should be classified as a question.
+/// Classifies into `bug | security | question | fix`. The prompt is biased
+/// toward `bug` on any doubt about a code problem, preserving the
+/// issue-resolution default.
 fn build_intent_prompt(issue: &Issue) -> String {
     let mut body = String::new();
     if let Some(desc) = issue.description.as_deref() {
@@ -327,12 +340,12 @@ fn build_intent_prompt(issue: &Issue) -> String {
     format!(
         "<|system|>\n\
          You classify an incoming developer-support message into exactly one of:\n\
-         - \"question\": the user is ONLY asking for information, an explanation, or how \
-         something works, and does NOT want any code changed.\n\
-         - \"fix\": the user wants something fixed, changed, added, built, or implemented, \
-         OR the message reports a bug, OR it is ambiguous / could require a code change.\n\
-         When in doubt, answer \"fix\".\n\
-         Respond with ONLY the single word: question or fix.\n\
+         - \"bug\": reports something broken — an error, crash, incorrect behavior, or regression.\n\
+         - \"security\": reports a security vulnerability, exploit, data leak, or authentication problem.\n\
+         - \"question\": ONLY asks for information, an explanation, or how something works, and does NOT want any code changed.\n\
+         - \"fix\": requests a feature, change, or improvement that is NOT itself a bug or security issue.\n\
+         When in doubt about a code problem, answer \"bug\".\n\
+         Respond with ONLY one word: bug, security, question, or fix.\n\
          <|end|>\n\
          <|user|>\n\
          Title: {}\n\
@@ -344,27 +357,38 @@ fn build_intent_prompt(issue: &Issue) -> String {
     )
 }
 
-/// Parse the intent classification response. Biased toward `FixRequest`:
-/// only a clear "question" answer yields `Intent::Question`.
+/// Parse the classification response into an `Intent`. The first clean token
+/// among `bug | security | question | fix` wins; otherwise a contains-fallback
+/// is applied (biased toward `bug` for code problems). Returns `None` when no
+/// category can be determined.
 fn parse_intent(s: &str) -> Option<Intent> {
     let lower = s.trim().to_lowercase();
+
+    // First clean alphanumeric token decides when it is an exact category.
     let first = lower
         .split(|c: char| !c.is_alphanumeric())
         .find(|t| !t.is_empty())
         .unwrap_or("");
-
     match first {
-        "question" => Some(Intent::Question),
-        "fix" => Some(Intent::FixRequest),
-        _ => {
-            if lower.contains("question") && !lower.contains("fix") {
-                Some(Intent::Question)
-            } else if lower.contains("fix") {
-                Some(Intent::FixRequest)
-            } else {
-                None
-            }
-        }
+        "bug" => return Some(Intent::Bug),
+        "security" => return Some(Intent::Security),
+        "question" => return Some(Intent::Question),
+        "fix" => return Some(Intent::Fix),
+        _ => {}
+    }
+
+    // Contains-fallback for noisy output. Order matters: a mentioned bug/security
+    // problem dominates a generic "fix" verb that often co-occurs with it.
+    if lower.contains("security") {
+        Some(Intent::Security)
+    } else if lower.contains("bug") {
+        Some(Intent::Bug)
+    } else if lower.contains("question") && !lower.contains("fix") {
+        Some(Intent::Question)
+    } else if lower.contains("fix") {
+        Some(Intent::Fix)
+    } else {
+        None
     }
 }
 
@@ -815,23 +839,56 @@ mod tests {
 
     #[test]
     fn test_parse_intent_fix() {
-        assert_eq!(parse_intent("fix"), Some(Intent::FixRequest));
-        assert_eq!(parse_intent("FIX"), Some(Intent::FixRequest));
-        assert_eq!(parse_intent("fix request"), Some(Intent::FixRequest));
+        assert_eq!(parse_intent("fix"), Some(Intent::Fix));
+        assert_eq!(parse_intent("FIX"), Some(Intent::Fix));
+        assert_eq!(parse_intent("fix request"), Some(Intent::Fix));
     }
 
     #[test]
-    fn test_parse_intent_biases_to_fix_when_both_present() {
-        // If the model hedges and mentions both, prefer fix.
+    fn test_parse_intent_bug_and_security() {
+        assert_eq!(parse_intent("bug"), Some(Intent::Bug));
+        assert_eq!(parse_intent("BUG\n"), Some(Intent::Bug));
+        assert_eq!(parse_intent("security"), Some(Intent::Security));
+        assert_eq!(parse_intent("Security."), Some(Intent::Security));
+        assert!(Intent::Bug.is_bug_or_security());
+        assert!(Intent::Security.is_bug_or_security());
+        assert!(!Intent::Question.is_bug_or_security());
+        assert!(!Intent::Fix.is_bug_or_security());
+    }
+
+    #[test]
+    fn test_parse_intent_first_clean_token_decides() {
+        // A clean leading verdict wins even if other category words follow.
         assert_eq!(
-            parse_intent("this is a question but might need a fix"),
-            Some(Intent::FixRequest)
+            parse_intent("bug, though it could be a question"),
+            Some(Intent::Bug)
+        );
+        assert_eq!(parse_intent("- security issue"), Some(Intent::Security));
+        assert_eq!(parse_intent("Answer: question"), Some(Intent::Question));
+    }
+
+    #[test]
+    fn test_parse_intent_contains_fallback_prefers_problem() {
+        // No clean leading token: a mentioned security/bug problem dominates a
+        // generic "fix" verb that often co-occurs with it.
+        assert_eq!(
+            parse_intent("this looks like a security vulnerability we should fix"),
+            Some(Intent::Security)
+        );
+        assert_eq!(
+            parse_intent("seems to be a bug that needs a fix"),
+            Some(Intent::Bug)
+        );
+        // Question only when no bug/security/fix signal is present.
+        assert_eq!(
+            parse_intent("just a quick question about usage"),
+            Some(Intent::Question)
         );
     }
 
     #[test]
     fn test_parse_intent_unparseable_is_none() {
-        // None must be treated as fix by the caller.
+        // None must be handled by the caller (heuristic fallback).
         assert_eq!(parse_intent("i am not sure"), None);
         assert_eq!(parse_intent(""), None);
     }

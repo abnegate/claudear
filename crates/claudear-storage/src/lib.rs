@@ -150,6 +150,20 @@ pub trait ActivityStore: Send + Sync {
         Ok(0)
     }
 
+    /// Record an action-pipeline run (verify verdict, reply post, etc.) for
+    /// queryability/analytics. Default no-op; the SQLite tracker persists it.
+    fn record_action_run(
+        &self,
+        _source: &str,
+        _issue_id: &str,
+        _short_id: &str,
+        _action_kind: &str,
+        _status: &str,
+        _detail: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Get recent activity entries.
     fn get_recent_activities(&self, _limit: usize) -> Result<Vec<ActivityLogEntry>> {
         Ok(Vec::new())

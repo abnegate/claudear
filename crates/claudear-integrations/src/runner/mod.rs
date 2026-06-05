@@ -11,7 +11,7 @@ pub mod orchestrator;
 
 use async_trait::async_trait;
 use claudear_core::error::Result;
-use claudear_core::types::{AgentResult, Issue};
+use claudear_core::types::{AgentResult, Issue, ReplyKind, VerifyResult};
 use std::path::Path;
 
 // Re-export concrete implementations and key types.
@@ -68,6 +68,42 @@ pub trait AgentRunner: Send + Sync {
     ) -> Result<String> {
         Err(claudear_core::error::Error::runner(
             "answer_question is not supported by this provider",
+        ))
+    }
+
+    /// Attempt to reproduce a reported bug/security issue as described, grounded
+    /// in `context` and the repository at `project_dir`. Read-only — no fix, no
+    /// PR. Returns a structured verdict.
+    ///
+    /// Default: not supported. Providers that can run read-only (e.g. Claude)
+    /// override this.
+    async fn verify_issue(
+        &self,
+        _issue: &Issue,
+        _context: &str,
+        _project_dir: &Path,
+    ) -> Result<VerifyResult> {
+        Err(claudear_core::error::Error::runner(
+            "verify_issue is not supported by this provider",
+        ))
+    }
+
+    /// Generate a grounded, human-sounding reply to a ticket. `guideline` is an
+    /// optional per-inbox template treated as a soft style guideline (not
+    /// reproduced verbatim); `kind` selects the framing. Read-only.
+    ///
+    /// Default: not supported. Providers that can run read-only (e.g. Claude)
+    /// override this.
+    async fn generate_reply(
+        &self,
+        _issue: &Issue,
+        _context: &str,
+        _guideline: Option<&str>,
+        _kind: ReplyKind,
+        _project_dir: &Path,
+    ) -> Result<String> {
+        Err(claudear_core::error::Error::runner(
+            "generate_reply is not supported by this provider",
         ))
     }
 }

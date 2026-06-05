@@ -24,20 +24,21 @@ use claudear::{
     runner::{AgentRunner, ClaudeAgentRunner, ClaudeRunnerConfig},
     scm::{PrMonitor, PrStatus, ReviewWatcher, ScmProvider},
     source::{
-        DiscordSource, IssueSource, JiraSource, LinearSource, SentrySource, SlackSource,
-        TelegramSource, WhatsAppSource,
+        DiscordSource, HelpScoutSource, IssueSource, JiraSource, LinearSource, SentrySource,
+        SlackSource, TelegramSource, WhatsAppSource,
     },
     storage::{
         ActivityStore, EmbeddingStore, FixAttemptTracker, RepoStore, SqliteTracker, UserStore,
     },
     telemetry::{InstrumentedNotifier, InstrumentedRunner, InstrumentedScm, InstrumentedSource},
-    types::{ActivityLogEntry, FixAttemptStatus, Issue},
+    types::{ActionKind, ActivityLogEntry, FixAttemptStatus, Issue},
     users::UserRegistry,
     watcher::{Watcher, WatcherOptions},
     webhook::{
-        print_setup_result, GitHubWebhookHandler, GitLabIssueWebhookHandler, JiraWebhookHandler,
-        LinearWebhookHandler, SentryWebhookHandler, SlackWebhookHandler, TelegramWebhookHandler,
-        WebhookConfigurator, WebhookHandlerRegistry, WebhookServer, WhatsAppWebhookHandler,
+        print_setup_result, GitHubWebhookHandler, GitLabIssueWebhookHandler,
+        HelpScoutWebhookHandler, JiraWebhookHandler, LinearWebhookHandler, SentryWebhookHandler,
+        SlackWebhookHandler, TelegramWebhookHandler, WebhookConfigurator, WebhookHandlerRegistry,
+        WebhookServer, WhatsAppWebhookHandler,
     },
 };
 use serde_json::json;
@@ -163,6 +164,16 @@ enum Commands {
     /// Manually trigger a fix for an issue
     Trigger {
         /// Source name (linear, sentry)
+        source: String,
+        /// Issue ID
+        issue_id: String,
+    },
+
+    /// Run a single action (reply, verify, or resolve) against an issue
+    Action {
+        /// Action to run: reply | verify | resolve
+        action: String,
+        /// Source name (helpscout, linear, sentry, ...)
         source: String,
         /// Issue ID
         issue_id: String,
@@ -1038,6 +1049,22 @@ fn create_sources(config: &Config) -> Vec<Arc<dyn IssueSource>> {
         }
     }
 
+    if let Some(helpscout_config) = config.helpscout() {
+        if helpscout_config.enabled {
+            if !helpscout_config.app_id.expose().is_empty()
+                && !helpscout_config.app_secret.expose().is_empty()
+                && !helpscout_config.mailbox_ids.is_empty()
+            {
+                sources.push(Arc::new(HelpScoutSource::new(helpscout_config.clone())));
+                tracing::info!("HelpScout source initialized");
+            } else {
+                tracing::warn!(
+                    "HelpScout enabled but missing app_id/app_secret/mailbox_ids; skipping"
+                );
+            }
+        }
+    }
+
     let discord = config.discord_merged();
     if discord.source_enabled {
         if discord.bot_token.is_some()
@@ -1105,6 +1132,15 @@ fn create_webhook_handlers(config: &Config) -> WebhookHandlerRegistry {
         if sentry_config.enabled {
             registry.register(Arc::new(SentryWebhookHandler::new(sentry_config.clone())));
             tracing::info!("Sentry webhook handler registered");
+        }
+    }
+
+    if let Some(helpscout_config) = config.helpscout() {
+        if helpscout_config.enabled && helpscout_config.webhook_secret.is_some() {
+            registry.register(Arc::new(HelpScoutWebhookHandler::new(
+                helpscout_config.clone(),
+            )));
+            tracing::info!("HelpScout webhook handler registered");
         }
     }
 
@@ -4333,6 +4369,31 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
                 Commands::Trigger { source, issue_id } => {
                     watcher.trigger_issue(&source, &issue_id).await?;
+                }
+
+                Commands::Action {
+                    action,
+                    source,
+                    issue_id,
+                } => {
+                    let kind: ActionKind =
+                        action.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+                    let outcome = watcher.run_action(kind, &source, &issue_id).await?;
+                    use claudear::processing::ProcessingOutcome;
+                    match outcome {
+                        ProcessingOutcome::Success { pr_url } => {
+                            println!("✓ {action}: PR {pr_url}");
+                        }
+                        ProcessingOutcome::CompletedNoPr { reason } => {
+                            println!("✓ {action}: {reason}");
+                        }
+                        ProcessingOutcome::Failed { error } => {
+                            println!("✗ {action} failed: {error}");
+                        }
+                        ProcessingOutcome::WrongRepo { suggested_repo, .. } => {
+                            println!("✗ {action}: wrong repo (suggested: {suggested_repo:?})");
+                        }
+                    }
                 }
 
                 Commands::Reset { source, issue_id } => {

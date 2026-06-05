@@ -3,6 +3,7 @@
 mod configurator;
 mod github;
 mod gitlab;
+mod helpscout;
 mod jira;
 mod linear;
 mod linear_api;
@@ -15,6 +16,7 @@ mod whatsapp;
 pub use configurator::{print_setup_result, WebhookConfigurator, WebhookSetupResult};
 pub use github::{GitHubWebhookHandler, WebhookAction};
 pub use gitlab::{GitLabIssueWebhookHandler, GitLabMrWebhookHandler};
+pub use helpscout::HelpScoutWebhookHandler;
 pub use jira::JiraWebhookHandler;
 pub use linear::LinearWebhookHandler;
 pub use linear_api::{LinearApiClient, WebhookRegistration};

@@ -463,6 +463,82 @@ impl FixAttempt {
     }
 }
 
+/// A first-class action that can be run against a payload (issue/conversation).
+///
+/// Actions chain: classification routes a bug/security report into `Verify`,
+/// which on success starts `Resolve` (the fix pipeline); non-bug messages and
+/// terminal states start `Reply`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionKind {
+    /// Generate and post a grounded, human-sounding reply to the ticket.
+    Reply,
+    /// Attempt to reproduce a reported bug/security issue.
+    Verify,
+    /// Run the bug-resolution pipeline to create/watch/merge a PR.
+    Resolve,
+}
+
+impl std::fmt::Display for ActionKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            ActionKind::Reply => "reply",
+            ActionKind::Verify => "verify",
+            ActionKind::Resolve => "resolve",
+        };
+        f.write_str(s)
+    }
+}
+
+impl std::str::FromStr for ActionKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "reply" => Ok(ActionKind::Reply),
+            "verify" => Ok(ActionKind::Verify),
+            "resolve" => Ok(ActionKind::Resolve),
+            other => Err(format!("unknown action: {other}")),
+        }
+    }
+}
+
+/// What kind of reply is being generated, which selects the framing the agent uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplyKind {
+    /// General grounded answer to a non-bug message (question / feature request).
+    Answer,
+    /// The reported bug could not be reproduced; ask the reporter for repro steps.
+    NeedRepro,
+    /// A fix shipped and is live; let the reporter know.
+    FixShipped,
+}
+
+impl ReplyKind {
+    /// Stable lowercase identifier (for logging / persistence).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReplyKind::Answer => "answer",
+            ReplyKind::NeedRepro => "need_repro",
+            ReplyKind::FixShipped => "fix_shipped",
+        }
+    }
+}
+
+/// Outcome of a `Verify` action: whether the agent reproduced the reported issue.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifyResult {
+    /// Whether the issue was reproduced as described.
+    pub reproduced: bool,
+    /// One-line summary of the verification verdict.
+    #[serde(default)]
+    pub summary: String,
+    /// Evidence supporting the verdict (repro steps, failing output, etc.).
+    #[serde(default)]
+    pub evidence: String,
+}
+
 /// Statistics about fix attempts.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FixAttemptStats {

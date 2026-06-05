@@ -502,6 +502,36 @@ app_config_token = ""
 # Polling interval in milliseconds (overrides global)
 poll_interval_ms = 300000
 
+[issues.helpscout]
+# HelpScout customer-support help desk as an issue source. Each conversation
+# becomes a "payload" that runs through the action pipeline
+# (classify -> verify -> resolve -> reply). Each mailbox is treated as an "inbox".
+enabled = false
+
+# OAuth2 client credentials (HelpScout Mailbox API v2 "App ID" / "App Secret").
+# Set via env vars for security.
+app_id = ""
+app_secret = ""
+
+# Mailbox ids to poll (each is a distinct inbox for reply templating).
+mailbox_ids = ["123456"]
+
+# Conversation tags that trigger automation (case-insensitive).
+trigger_tags = ["auto-implement", "claude"]
+
+# Conversation status to poll.
+trigger_status = "active"
+
+# How generated replies are posted back: "note" (internal, safe default) or
+# "reply" (customer-facing).
+reply_as = "note"
+
+# Webhook signature secret (HMAC-SHA1, X-HelpScout-Signature header).
+webhook_secret = ""
+
+# Polling interval in milliseconds (overrides global)
+poll_interval_ms = 300000
+
 # ============================================
 # Notifiers
 # ============================================
@@ -856,6 +886,31 @@ max_context_chunks = 8
 
 # Timeout for generating an answer, in seconds (default: 600)
 answer_timeout_secs = 600
+
+# ============================================
+# Reply Action
+# ============================================
+# The reply action generates a grounded, human-sounding response to a ticket.
+# Templates are keyed by "inbox" (a HelpScout mailbox id, or a source name) and
+# are treated as SOFT GUIDELINES — the agent follows the tone/structure loosely
+# and varies naturally, it does not reproduce them verbatim.
+
+[reply]
+# Enable the reply action (default: false)
+enabled = false
+
+# Instruct the agent to sound as human as possible (default: true)
+sound_human = true
+
+# Fallback guideline used when no per-inbox template matches.
+default_template = "Friendly, concise, first-person. Acknowledge the report, give a clear answer, and offer a next step."
+
+# Timeout for verifying (reproducing) a reported bug, in seconds (default: 1800)
+verify_timeout_secs = 1800
+
+# Per-inbox guidelines, keyed by HelpScout mailbox id (or source name).
+[reply.templates]
+# "123456" = "Warm and apologetic for the inconvenience; sign off as the Support team."
 
 # ============================================
 # Code Indexing

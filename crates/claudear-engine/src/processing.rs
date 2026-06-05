@@ -16,7 +16,8 @@ use claudear_config::config::Config;
 use claudear_config::users::UserRegistry;
 use claudear_core::error::Result;
 use claudear_core::types::{
-    ActivityLogEntry, AskRequest, ErrorPattern, Issue, ProcessingMetric, QaKnowledgeEntry,
+    ActionKind, ActivityLogEntry, AskRequest, ErrorPattern, Issue, ProcessingMetric,
+    QaKnowledgeEntry, ReplyKind, VerifyResult,
 };
 use claudear_integrations::github::GitHubClient;
 use claudear_integrations::notifier::{send_to_all_and_wait_first_reply, Notifier};
@@ -30,12 +31,24 @@ use std::sync::Arc;
 #[async_trait]
 pub trait ContextProvider: Send + Sync {
     async fn build_issue_context(&self, issue: &Issue) -> Result<String>;
+
+    /// Post a reply/comment back to the originating ticket. Default: not
+    /// supported — webhook contexts return this so callers fall back to a notifier.
+    async fn post_reply(&self, _issue_id: &str, _body: &str) -> Result<()> {
+        Err(claudear_core::error::Error::Other(
+            "post_reply is not supported by this context".to_string(),
+        ))
+    }
 }
 
 #[async_trait]
 impl<T: claudear_integrations::source::IssueSource + ?Sized> ContextProvider for T {
     async fn build_issue_context(&self, issue: &Issue) -> Result<String> {
         claudear_integrations::source::IssueSource::build_issue_context(self, issue).await
+    }
+
+    async fn post_reply(&self, issue_id: &str, body: &str) -> Result<()> {
+        claudear_integrations::source::IssueSource::add_comment(self, issue_id, body).await
     }
 }
 
@@ -47,6 +60,10 @@ pub struct SourceContext<'a>(pub &'a dyn claudear_integrations::source::IssueSou
 impl ContextProvider for SourceContext<'_> {
     async fn build_issue_context(&self, issue: &Issue) -> Result<String> {
         self.0.build_issue_context(issue).await
+    }
+
+    async fn post_reply(&self, issue_id: &str, body: &str) -> Result<()> {
+        self.0.add_comment(issue_id, body).await
     }
 }
 
@@ -64,6 +81,36 @@ impl ContextProvider for WebhookContext<'_> {
 /// handling. Tracker-style sources (Sentry, Linear, GitHub, etc.) are not.
 fn qa_eligible_source(source: &str) -> bool {
     matches!(source, "discord" | "slack" | "telegram" | "whatsapp")
+}
+
+/// Heuristic bug/security detection used as a fallback when the LLM classifier is
+/// unavailable. Mirrors `FixAttempt::is_bug`: Sentry issues are always bugs, and
+/// any label containing a known bug word counts.
+fn heuristic_is_bug(issue: &Issue) -> bool {
+    if issue.source == "sentry" {
+        return true;
+    }
+    const BUG_LABELS: &[&str] = &[
+        "bug",
+        "defect",
+        "error",
+        "fix",
+        "hotfix",
+        "regression",
+        "issue",
+        "problem",
+        "incident",
+        "crash",
+        "broken",
+        "security",
+        "vulnerability",
+        "exploit",
+    ];
+    let labels: Vec<String> = issue.get_metadata("labels").unwrap_or_default();
+    labels.iter().any(|label| {
+        let lower = label.to_lowercase();
+        BUG_LABELS.iter().any(|b| lower.contains(b))
+    })
 }
 
 /// Holds shared services needed to process an issue.
@@ -123,6 +170,14 @@ impl IssueProcessor {
         input: ProcessingInput,
         context_provider: &dyn ContextProvider,
     ) -> ProcessingOutcome {
+        // Action pipeline (opt-in via [reply]): classify the payload, then chain
+        //   bug/security -> verify -> resolve -> reply
+        //   otherwise     -> reply
+        // When disabled, fall through to the legacy routing below.
+        if self.config.reply.enabled {
+            return self.run_action_pipeline(input, context_provider).await;
+        }
+
         // Q&A short-circuit: pure questions are answered with RAG-grounded context
         // (read-only, no PR) instead of being routed to the fix pipeline. This runs
         // before any repo fetch / worktree setup since the answer path reads the
@@ -1464,6 +1519,317 @@ impl IssueProcessor {
                 ProcessingOutcome::Failed { error }
             }
         }
+    }
+
+    /// Run a single, explicitly-chosen action against a payload (for the manual
+    /// `claudear action ...` CLI). Unlike `run`, this does not classify or chain.
+    pub async fn run_single_action(
+        &self,
+        action: ActionKind,
+        input: ProcessingInput,
+        context_provider: &dyn ContextProvider,
+    ) -> ProcessingOutcome {
+        match action {
+            ActionKind::Verify => {
+                let verdict = self
+                    .run_verify(&input.issue, &input.resolution, &input.source_name)
+                    .await;
+                ProcessingOutcome::CompletedNoPr {
+                    reason: format!(
+                        "verify: {} — {}",
+                        if verdict.reproduced {
+                            "reproduced"
+                        } else {
+                            "not reproduced"
+                        },
+                        verdict.summary
+                    ),
+                }
+            }
+            ActionKind::Reply => {
+                self.run_reply(
+                    &input.issue,
+                    ReplyKind::Answer,
+                    &input.resolution,
+                    &input.source_name,
+                    context_provider,
+                )
+                .await
+            }
+            ActionKind::Resolve => match self.run_inner(input, context_provider).await {
+                Ok(ProcessingOutcome::WrongRepo {
+                    original_repo,
+                    suggested_repo,
+                }) => ProcessingOutcome::Failed {
+                    error: format!(
+                        "Wrong repo detected (was: {}, suggested: {:?}), not retried",
+                        original_repo, suggested_repo
+                    ),
+                },
+                Ok(outcome) => outcome,
+                Err(e) => ProcessingOutcome::Failed {
+                    error: e.to_string(),
+                },
+            },
+        }
+    }
+
+    // ---- Action pipeline (classify -> verify -> resolve -> reply) ----
+
+    /// Run the action pipeline for a payload: classify it, then chain the
+    /// appropriate actions. Bug/security reports are verified (reproduced) and,
+    /// if confirmed, resolved via the fix pipeline; everything else gets a reply.
+    async fn run_action_pipeline(
+        &self,
+        input: ProcessingInput,
+        context_provider: &dyn ContextProvider,
+    ) -> ProcessingOutcome {
+        if self.classify_is_bug_or_security(&input.issue) {
+            // Verify before spending an expensive fix run.
+            let verdict = self
+                .run_verify(&input.issue, &input.resolution, &input.source_name)
+                .await;
+            if verdict.reproduced {
+                return match self.run_inner(input, context_provider).await {
+                    Ok(ProcessingOutcome::WrongRepo {
+                        original_repo,
+                        suggested_repo,
+                    }) => ProcessingOutcome::Failed {
+                        error: format!(
+                            "Wrong repo detected (was: {}, suggested: {:?}), not retried",
+                            original_repo, suggested_repo
+                        ),
+                    },
+                    Ok(outcome) => outcome,
+                    Err(e) => ProcessingOutcome::Failed {
+                        error: e.to_string(),
+                    },
+                };
+            }
+            // Could not reproduce: ask the reporter for repro steps instead of fixing.
+            self.run_reply(
+                &input.issue,
+                ReplyKind::NeedRepro,
+                &input.resolution,
+                &input.source_name,
+                context_provider,
+            )
+            .await
+        } else {
+            self.run_reply(
+                &input.issue,
+                ReplyKind::Answer,
+                &input.resolution,
+                &input.source_name,
+                context_provider,
+            )
+            .await
+        }
+    }
+
+    /// Classify a payload as a bug/security report (routes to Verify) vs anything
+    /// else (routes to Reply). Uses the LLM classifier when available, falling
+    /// back to the label/source heuristic (matching `FixAttempt::is_bug`).
+    fn classify_is_bug_or_security(&self, issue: &Issue) -> bool {
+        if let Some(analyzer) = self.llm_analyzer.as_ref() {
+            if let Some(intent) = analyzer.classify_intent(issue) {
+                return intent.is_bug_or_security();
+            }
+        }
+        heuristic_is_bug(issue)
+    }
+
+    /// Attempt to reproduce a reported issue (read-only). On any failure, timeout,
+    /// or lack of agent support, conservatively treats the issue as reproduced so
+    /// the fix pipeline still runs (preserving the default issue-resolution path).
+    async fn run_verify(
+        &self,
+        issue: &Issue,
+        resolution: &RepoResolution,
+        source_name: &str,
+    ) -> VerifyResult {
+        let project_dir = self.action_project_dir(resolution);
+        let context = self.build_rag_context(issue).await;
+
+        self.record_issue_decision(
+            issue,
+            "verify_started",
+            format!("Verifying (reproducing) {}", issue.short_id),
+            json!({ "context_chars": context.len() }),
+        );
+
+        let timeout = std::time::Duration::from_secs(self.config.reply.verify_timeout_secs.max(1));
+        let result = tokio::time::timeout(
+            timeout,
+            self.agent.verify_issue(issue, &context, &project_dir),
+        )
+        .await;
+
+        let verdict = match result {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => VerifyResult {
+                reproduced: true,
+                summary: "Verification unsupported/failed; proceeding to resolve".to_string(),
+                evidence: e.to_string(),
+            },
+            Err(_) => VerifyResult {
+                reproduced: true,
+                summary: format!(
+                    "Verification timed out after {}s; proceeding to resolve",
+                    self.config.reply.verify_timeout_secs
+                ),
+                evidence: String::new(),
+            },
+        };
+
+        let _ = self.tracker.record_action_run(
+            source_name,
+            &issue.id,
+            &issue.short_id,
+            "verify",
+            if verdict.reproduced {
+                "reproduced"
+            } else {
+                "not_reproduced"
+            },
+            &verdict.summary,
+        );
+        self.record_issue_decision(
+            issue,
+            "verify_result",
+            format!(
+                "Verify {}: {}",
+                issue.short_id,
+                if verdict.reproduced {
+                    "reproduced"
+                } else {
+                    "not reproduced"
+                }
+            ),
+            json!({ "reproduced": verdict.reproduced, "summary": verdict.summary }),
+        );
+        verdict
+    }
+
+    /// Generate a grounded, human-sounding reply and post it back to the ticket.
+    /// Conversational sources receive the reply via the notifier; tracker-style
+    /// sources (HelpScout, Linear, ...) receive it as a comment on the ticket.
+    async fn run_reply(
+        &self,
+        issue: &Issue,
+        kind: ReplyKind,
+        resolution: &RepoResolution,
+        source_name: &str,
+        context_provider: &dyn ContextProvider,
+    ) -> ProcessingOutcome {
+        let project_dir = self.action_project_dir(resolution);
+        let context = self.build_rag_context(issue).await;
+
+        // The inbox key is the HelpScout mailbox id when present, else the source.
+        let inbox_key = issue
+            .get_metadata::<String>("mailbox_id")
+            .unwrap_or_else(|| source_name.to_string());
+        let guideline = self.config.reply.template_for(Some(&inbox_key));
+
+        self.record_issue_decision(
+            issue,
+            "reply_started",
+            format!("Generating {} reply for {}", kind.as_str(), issue.short_id),
+            json!({ "kind": kind.as_str(), "inbox": inbox_key, "context_chars": context.len() }),
+        );
+
+        let timeout = std::time::Duration::from_secs(self.config.qa.answer_timeout_secs.max(1));
+        let result = tokio::time::timeout(
+            timeout,
+            self.agent
+                .generate_reply(issue, &context, guideline, kind, &project_dir),
+        )
+        .await;
+
+        match result {
+            Ok(Ok(reply)) => {
+                // Deliver: conversational sources go via the notifier; tracker
+                // sources post a comment on the ticket (falling back to notifier).
+                let delivered = if qa_eligible_source(source_name) {
+                    self.notifier.notify_answer(issue, &reply).await
+                } else {
+                    match context_provider.post_reply(&issue.id, &reply).await {
+                        Ok(()) => Ok(()),
+                        Err(e) => {
+                            tracing::warn!(short_id = %issue.short_id, error = %e, "post_reply failed; falling back to notifier");
+                            self.notifier.notify_answer(issue, &reply).await
+                        }
+                    }
+                };
+                if let Err(e) = delivered {
+                    tracing::warn!(short_id = %issue.short_id, error = %e, "Failed to deliver reply");
+                }
+
+                let summary: String = reply.chars().take(500).collect();
+                let _ = self.tracker.mark_answered(source_name, &issue.id, &summary);
+                let _ = self.tracker.record_action_run(
+                    source_name,
+                    &issue.id,
+                    &issue.short_id,
+                    "reply",
+                    kind.as_str(),
+                    &summary,
+                );
+                self.record_issue_decision(
+                    issue,
+                    "reply_sent",
+                    format!("Sent {} reply for {}", kind.as_str(), issue.short_id),
+                    json!({ "kind": kind.as_str(), "reply_chars": reply.len() }),
+                );
+                ProcessingOutcome::CompletedNoPr {
+                    reason: format!("replied ({})", kind.as_str()),
+                }
+            }
+            Ok(Err(e)) => {
+                let error = e.to_string();
+                let _ = self.tracker.mark_failed(source_name, &issue.id, &error);
+                ProcessingOutcome::Failed { error }
+            }
+            Err(_) => {
+                let error = format!(
+                    "Reply generation timed out after {}s",
+                    self.config.qa.answer_timeout_secs
+                );
+                let _ = self.tracker.mark_failed(source_name, &issue.id, &error);
+                ProcessingOutcome::Failed { error }
+            }
+        }
+    }
+
+    /// Resolve the working directory for a read-only action: the resolved repo
+    /// clone when available, otherwise a shared scratch directory.
+    fn action_project_dir(&self, resolution: &RepoResolution) -> std::path::PathBuf {
+        match resolution {
+            RepoResolution::Resolved { project_dir, .. } => project_dir.clone(),
+            RepoResolution::Skip { .. } => {
+                let dir = std::env::temp_dir().join("claudear-qa");
+                let _ = std::fs::create_dir_all(&dir);
+                dir
+            }
+        }
+    }
+
+    /// Retrieve RAG grounding context for an issue from the code index.
+    async fn build_rag_context(&self, issue: &Issue) -> String {
+        if let Some(ref code_search) = self.code_search_service {
+            let query = claudear_analysis::repo::code_index::build_code_search_query(issue);
+            if let Ok(results) = code_search
+                .search(&query, None, self.config.qa.max_context_chunks)
+                .await
+            {
+                if !results.is_empty() {
+                    return claudear_analysis::repo::code_index::format_code_search_context(
+                        &results,
+                    );
+                }
+            }
+        }
+        String::new()
     }
 
     /// Record an issue-level decision as a "decision" activity entry.
