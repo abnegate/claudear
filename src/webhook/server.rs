@@ -996,6 +996,9 @@ async fn process_issue(
         attempt_id,
         review_feedback: None,
         existing_pr_branch: None,
+        // Webhook path builds its IssueProcessor with `llm_analyzer: None`, so it never took
+        // the QA branch; `None` keeps it on the fix pipeline (behaviour-preserving).
+        intent: None,
     };
 
     let context_provider = WebhookContext(handler.as_ref());

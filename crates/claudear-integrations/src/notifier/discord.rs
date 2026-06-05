@@ -2,7 +2,7 @@
 
 use super::Notifier;
 use crate::ask_reply_inbox;
-use crate::discord::{CreateMessageParams, DiscordClient, MessageEmbed};
+use crate::discord::{CreateMessageParams, DiscordClient, DiscordMessageReference, MessageEmbed};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use claudear_config::config::DiscordConfig;
@@ -227,19 +227,27 @@ impl<H: DiscordWebhookClient> DiscordNotifier<H> {
     /// Send a message, preferring the channel the issue originated from.
     ///
     /// When a bot client is available and the issue carries an originating
-    /// `channel_id` (e.g. a Discord question), the reply is posted there.
-    /// Otherwise it falls back to the default delivery path (webhook / configured
-    /// channel).
+    /// `channel_id` (e.g. a Discord question), the message is posted there.
+    /// When `reply_to_origin` is true, it is sent as a native Discord reply to
+    /// the originating message (`issue.id`), so the answer is threaded under the
+    /// question. Replies require the bot path; the webhook fallback ignores the
+    /// reply and posts a standalone message.
     async fn send_to_issue_channel(
         &self,
         issue: &Issue,
         message: DiscordMessage,
+        reply_to_origin: bool,
     ) -> Result<Option<SentMessageInfo>> {
         let origin_channel = issue
             .get_metadata::<String>("channel_id")
             .filter(|c| !c.is_empty());
         if let (Some(client), Some(channel_id)) = (self.bot_client.as_ref(), origin_channel) {
-            let params = Self::to_create_message_params(&message);
+            let mut params = Self::to_create_message_params(&message);
+            if reply_to_origin {
+                // Reply to the original Discord message so the answer is
+                // visibly threaded to the question it addresses.
+                params.message_reference = origin_reply_reference(issue, &channel_id);
+            }
             let sent = client.send_message(&channel_id, params).await?;
             return Ok(Some(SentMessageInfo {
                 message_id: sent.id,
@@ -493,6 +501,27 @@ pub(crate) fn chunk_text(text: &str, max_len: usize, max_chunks: usize) -> Vec<S
 
 /// Build the Discord message(s) carrying a RAG-grounded answer. Long answers are
 /// split across multiple embeds/messages.
+/// Build a native-reply reference targeting the message that originated `issue`,
+/// so a reply is threaded under the original question.
+///
+/// Returns `None` when the issue carries no usable message id (nothing to reply
+/// to), in which case the caller posts a standalone message instead.
+pub(crate) fn origin_reply_reference(
+    issue: &Issue,
+    channel_id: &str,
+) -> Option<DiscordMessageReference> {
+    if issue.id.is_empty() {
+        return None;
+    }
+    Some(DiscordMessageReference {
+        message_id: Some(issue.id.clone()),
+        channel_id: Some(channel_id.to_string()),
+        guild_id: None,
+        // Deliver even if the original question was deleted in the meantime.
+        fail_if_not_exists: Some(false),
+    })
+}
+
 pub(crate) fn build_answer_messages(
     issue: &Issue,
     answer: &str,
@@ -1272,8 +1301,13 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
             ));
         }
         let mention = self.get_user_mention_for_issue(issue);
-        for message in build_answer_messages(issue, answer, mention) {
-            let _ = self.send_to_issue_channel(issue, message).await?;
+        // Reply to the original question with the first message so the answer is
+        // threaded to it; any continuation chunks follow as normal messages.
+        for (i, message) in build_answer_messages(issue, answer, mention)
+            .into_iter()
+            .enumerate()
+        {
+            let _ = self.send_to_issue_channel(issue, message, i == 0).await?;
         }
         Ok(())
     }
@@ -1519,6 +1553,45 @@ mod tests {
         assert!(msgs[1].content.is_none());
         // Continuation embeds carry no title.
         assert!(msgs[1].embeds.as_ref().unwrap()[0].title.is_none());
+    }
+
+    // --- Native reply reference (threading answers to the question) ---
+
+    #[test]
+    fn test_origin_reply_reference_targets_original_message() {
+        let issue = Issue::new(
+            "1511974915572502629",
+            "DISCORD-15119749",
+            "what is query not equal syntax?",
+            "https://discord/x",
+            "discord",
+        );
+        let r = origin_reply_reference(&issue, "1471462861338312775")
+            .expect("reference should be built for a non-empty message id");
+
+        // Replies to the originating Discord message, in its channel.
+        assert_eq!(r.message_id.as_deref(), Some("1511974915572502629"));
+        assert_eq!(r.channel_id.as_deref(), Some("1471462861338312775"));
+        // Must not fail delivery if the question was deleted meanwhile.
+        assert_eq!(r.fail_if_not_exists, Some(false));
+    }
+
+    #[test]
+    fn test_origin_reply_reference_none_without_message_id() {
+        let mut issue = Issue::new("", "DISCORD-1", "q", "u", "discord");
+        issue.id.clear();
+        assert!(origin_reply_reference(&issue, "chan").is_none());
+    }
+
+    #[test]
+    fn test_reply_reference_serializes_required_fields() {
+        let issue = Issue::new("99", "DISCORD-9", "q", "u", "discord");
+        let r = origin_reply_reference(&issue, "chan").unwrap();
+        let json = serde_json::to_string(&r).unwrap();
+        // The reply target and graceful-degrade flag must reach Discord.
+        assert!(json.contains("\"message_id\":\"99\""));
+        assert!(json.contains("\"channel_id\":\"chan\""));
+        assert!(json.contains("\"fail_if_not_exists\":false"));
     }
 
     #[test]

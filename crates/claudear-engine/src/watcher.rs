@@ -1,5 +1,6 @@
 //! Main watcher that coordinates sources, Claude, and notifications.
 
+use crate::llm_analyzer::Intent;
 use crate::llm_classifier::LlmRepoClassifier;
 use crate::repo_index::build_repo_index_with_fallback;
 use crate::retry::RetryManager;
@@ -2935,9 +2936,13 @@ Create a PR with your changes.{custom_instructions}"#,
 
         // Apply per-source max issues per cycle limit (falls back to global)
         let source_max_issues = self.config.max_issues_per_cycle_for(source.name());
+        // QA gets its own per-cycle budget so questions (answered read-only, fast) are not
+        // starved by a burst of fix requests.
+        let source_max_qa = self.config.qa.max_qa_per_cycle;
 
-        // Sort and select: use prioritisation engine when enabled, else legacy sort.
-        let to_process: Vec<(Issue, MatchResult)> = if self.config.prioritisation.enabled {
+        // Order candidates first (prioritisation engine or legacy sort), WITHOUT capping yet —
+        // the cap(s) are applied after the QA/fix partition below.
+        let ordered: Vec<(Issue, MatchResult)> = if self.config.prioritisation.enabled {
             let (prioritised, suppressed) = claudear_analysis::prioritisation::prioritise(
                 &self.config.prioritisation,
                 candidates,
@@ -2976,21 +2981,84 @@ Create a PR with your changes.{custom_instructions}"#,
                 }
             }
 
-            // Convert back and take top N
             prioritised
                 .into_iter()
-                .take(source_max_issues)
                 .map(|pi| (pi.issue, pi.match_result))
                 .collect()
         } else {
             self.sort_by_priority(&mut candidates);
-            candidates.into_iter().take(source_max_issues).collect()
+            candidates
+        };
+
+        // Decide each issue's type (QA vs fix) at poll time for QA-eligible chat sources, then
+        // apply two independent caps: questions up to `source_max_qa`, fixes up to
+        // `source_max_issues`. The decided `Intent` rides along so `IssueProcessor` dispatches
+        // directly without re-running the classifier. Non-chat / QA-disabled sources keep the
+        // single-cap behaviour with no carried type.
+        let qa_split_enabled = self.config.qa.enabled
+            && crate::processing::qa_eligible_source(source.name())
+            && self.llm_analyzer.is_some();
+
+        let to_process: Vec<(Issue, MatchResult, Option<Intent>)> = if qa_split_enabled {
+            // Classify all ordered issues in a single blocking task (the analyzer call is
+            // synchronous, CPU-bound local inference). Fix-bias on ambiguity / errors, matching
+            // `classify_intent`'s contract.
+            let analyzer = self
+                .llm_analyzer
+                .clone()
+                .expect("llm_analyzer present (checked by qa_split_enabled)");
+            let issues_for_intent: Vec<Issue> =
+                ordered.iter().map(|(issue, _)| issue.clone()).collect();
+            let ordered_len = ordered.len();
+            let intents: Vec<Intent> = tokio::task::spawn_blocking(move || {
+                issues_for_intent
+                    .iter()
+                    .map(|issue| match analyzer.classify_intent(issue) {
+                        Some(Intent::Question) => Intent::Question,
+                        _ => Intent::FixRequest,
+                    })
+                    .collect()
+            })
+            .await
+            .unwrap_or_else(|_| vec![Intent::FixRequest; ordered_len]);
+
+            // Partition preserving prioritisation order within each bucket.
+            let mut questions: Vec<(Issue, MatchResult, Option<Intent>)> = Vec::new();
+            let mut fixes: Vec<(Issue, MatchResult, Option<Intent>)> = Vec::new();
+            for ((issue, match_result), intent) in ordered.into_iter().zip(intents) {
+                match intent {
+                    Intent::Question => {
+                        questions.push((issue, match_result, Some(Intent::Question)))
+                    }
+                    Intent::FixRequest => {
+                        fixes.push((issue, match_result, Some(Intent::FixRequest)))
+                    }
+                }
+            }
+            questions.truncate(source_max_qa);
+            fixes.truncate(source_max_issues);
+            tracing::info!(
+                source = source.name(),
+                questions = questions.len(),
+                fixes = fixes.len(),
+                max_qa = source_max_qa,
+                max_issues = source_max_issues,
+                "QA/fix split applied"
+            );
+            // Questions first so they grab concurrency slots ahead of slow fix runs.
+            questions.into_iter().chain(fixes).collect()
+        } else {
+            ordered
+                .into_iter()
+                .take(source_max_issues)
+                .map(|(issue, match_result)| (issue, match_result, None))
+                .collect()
         };
 
         let to_process_count = to_process.len();
         let queued_short_ids: Vec<String> = to_process
             .iter()
-            .map(|(issue, _)| issue.short_id.clone())
+            .map(|(issue, _, _)| issue.short_id.clone())
             .collect();
         let queued_metric = ProcessingMetric::new("issues_queued", to_process_count as f64)
             .with_source(source.name().to_string());
@@ -3005,7 +3073,7 @@ Create a PR with your changes.{custom_instructions}"#,
                 "fetched": candidates_count + duplicate_skipped + attempted_skipped + inflight_skipped + unmatched_skipped + semantic_duplicate_skipped,
                 "matched": candidates_count,
                 "queued": to_process_count,
-                "deferred": candidates_count.saturating_sub(source_max_issues),
+                "deferred": candidates_count.saturating_sub(to_process_count),
                 "skipped": {
                     "duplicate": duplicate_skipped,
                     "already_attempted": attempted_skipped,
@@ -3015,6 +3083,7 @@ Create a PR with your changes.{custom_instructions}"#,
                 },
                 "queued_short_ids": queued_short_ids,
                 "source_max_issues": source_max_issues,
+                "source_max_qa": source_max_qa,
             }),
         );
         if to_process.is_empty() {
@@ -3022,7 +3091,7 @@ Create a PR with your changes.{custom_instructions}"#,
             return Ok(());
         }
 
-        let skipped = candidates_count.saturating_sub(source_max_issues);
+        let skipped = candidates_count.saturating_sub(to_process_count);
         if skipped > 0 {
             tracing::info!(
                 source = source.name(),
@@ -3044,7 +3113,7 @@ Create a PR with your changes.{custom_instructions}"#,
 
             tracing::info!("");
             tracing::info!("[DRY RUN] Would process the following issues:");
-            for (issue, match_result) in &to_process {
+            for (issue, match_result, _intent) in &to_process {
                 tracing::info!("  - [{}] {}", issue.short_id, issue.title);
                 tracing::info!(
                     "    Priority: {:?}, Reason: {}",
@@ -3093,8 +3162,8 @@ Create a PR with your changes.{custom_instructions}"#,
         // Notify about urgent issues
         let urgent_issues: Vec<Issue> = to_process
             .iter()
-            .filter(|(_, m)| m.priority == MatchPriority::Urgent)
-            .map(|(i, _)| i.clone())
+            .filter(|(_, m, _)| m.priority == MatchPriority::Urgent)
+            .map(|(i, _, _)| i.clone())
             .collect();
 
         if !urgent_issues.is_empty() {
@@ -3124,7 +3193,7 @@ Create a PR with your changes.{custom_instructions}"#,
                 "max_concurrent_for source evaluated to 0, clamping to 1"
             );
         }
-        for (i, (issue, match_result)) in to_process.into_iter().enumerate() {
+        for (i, (issue, match_result, intent)) in to_process.into_iter().enumerate() {
             if !self.is_running.load(Ordering::SeqCst) {
                 break;
             }
@@ -3158,7 +3227,7 @@ Create a PR with your changes.{custom_instructions}"#,
             let source_clone = Arc::clone(source);
             let handle = tokio::spawn(async move {
                 watcher
-                    .process_issue(source_clone, issue, match_result, None, None)
+                    .process_issue(source_clone, issue, match_result, None, None, intent)
                     .await;
             });
             self.spawn_handles.lock().await.push(handle);
@@ -3354,6 +3423,7 @@ Create a PR with your changes.{custom_instructions}"#,
         match_result: MatchResult,
         review_feedback: Option<String>,
         existing_pr_branch: Option<String>,
+        intent: Option<Intent>,
     ) -> bool {
         use crate::processing::{IssueProcessor, ProcessingInput, ProcessingOutcome};
 
@@ -3381,8 +3451,18 @@ Create a PR with your changes.{custom_instructions}"#,
         }
         self.active_processing.fetch_add(1, Ordering::SeqCst);
 
+        let intent_label = match intent {
+            Some(Intent::Question) => "question",
+            Some(Intent::FixRequest) => "fix",
+            None => "unclassified",
+        };
         tracing::info!("");
-        tracing::info!(short_id = %issue.short_id, title = %issue.title, "Processing issue");
+        tracing::info!(
+            short_id = %issue.short_id,
+            title = %issue.title,
+            intent = intent_label,
+            "Processing issue"
+        );
         tracing::info!(short_id = %issue.short_id, reason = %match_result.reason, "Match reason");
         tracing::info!(short_id = %issue.short_id, priority = ?match_result.priority, "Match priority");
         self.record_issue_decision(
@@ -3514,6 +3594,7 @@ Create a PR with your changes.{custom_instructions}"#,
             attempt_id,
             review_feedback,
             existing_pr_branch,
+            intent,
         };
 
         let context_provider = crate::processing::SourceContext(source.as_ref());
@@ -4140,6 +4221,7 @@ Create a PR with your changes.{custom_instructions}"#,
                 match_result,
                 review_feedback,
                 existing_pr_branch,
+                None,
             )
             .await;
         if !started {
@@ -8017,7 +8099,7 @@ mod tests {
         let match_result = MatchResult::matched("Test", MatchPriority::Normal);
 
         let result = watcher
-            .process_issue(source, issue, match_result, None, None)
+            .process_issue(source, issue, match_result, None, None, None)
             .await;
         assert!(
             !result,
@@ -9185,7 +9267,7 @@ mod tests {
 
         let match_result = MatchResult::matched("Test", MatchPriority::Normal);
         let started = watcher
-            .process_issue(source, issue, match_result, None, None)
+            .process_issue(source, issue, match_result, None, None, None)
             .await;
         assert!(started); // true because it processed (even though it failed)
 
@@ -9673,7 +9755,7 @@ mod tests {
 
         let match_result = MatchResult::matched("Test", MatchPriority::Normal);
         watcher
-            .process_issue(source, issue, match_result, None, None)
+            .process_issue(source, issue, match_result, None, None, None)
             .await;
 
         // Verify the attempt was recorded
@@ -11976,7 +12058,7 @@ mod tests {
 
         let match_result = MatchResult::matched("Test", MatchPriority::Normal);
         let result = watcher
-            .process_issue(source, issue, match_result, None, None)
+            .process_issue(source, issue, match_result, None, None, None)
             .await;
         assert!(
             !result,

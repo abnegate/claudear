@@ -622,6 +622,8 @@ pub struct QaConfig {
     pub max_context_chunks: usize,
     /// Timeout for generating an answer, in seconds (default: 600).
     pub answer_timeout_secs: u64,
+    /// Maximum qa to process per poll cycle (independent from issue limits).
+    pub max_qa_per_cycle: usize,
 }
 
 impl Default for QaConfig {
@@ -630,6 +632,7 @@ impl Default for QaConfig {
             enabled: false,
             max_context_chunks: 8,
             answer_timeout_secs: 600,
+            max_qa_per_cycle: 20,
         }
     }
 }
@@ -8514,5 +8517,38 @@ workspace = "/tmp/repos"
         }
         let wrapper: Wrapper = toml::from_str(toml_str).unwrap();
         assert!(wrapper.agent.use_llm);
+    }
+
+    #[test]
+    fn test_qa_max_qa_per_cycle_from_toml() {
+        let toml_str = r#"
+            [qa]
+            enabled = true
+            max_qa_per_cycle = 30
+        "#;
+        #[derive(Deserialize)]
+        struct Wrapper {
+            qa: QaConfig,
+        }
+        let wrapper: Wrapper = toml::from_str(toml_str).unwrap();
+        assert_eq!(wrapper.qa.max_qa_per_cycle, 30);
+    }
+
+    #[test]
+    fn test_qa_max_qa_per_cycle_defaults_when_omitted() {
+        // `[qa]` present but key omitted falls back to the QaConfig default.
+        let toml_str = r#"
+            [qa]
+            enabled = true
+        "#;
+        #[derive(Deserialize)]
+        struct Wrapper {
+            qa: QaConfig,
+        }
+        let wrapper: Wrapper = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            wrapper.qa.max_qa_per_cycle,
+            QaConfig::default().max_qa_per_cycle
+        );
     }
 }

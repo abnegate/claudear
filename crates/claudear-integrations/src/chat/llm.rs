@@ -62,7 +62,39 @@ pub struct LlmEngine {
     timeout: Option<Duration>,
 }
 
+/// Extra tokens added on top of (prompt + max_tokens) when sizing a per-call
+/// context window, to leave a small margin for sampler/decoder bookkeeping.
+const CONTEXT_SLACK_TOKENS: u32 = 16;
+
+/// Context window to allocate for a *single* completion call.
+///
+/// Every completion builds a fresh llama context whose KV cache and compute
+/// buffers are sized to `n_ctx`. Allocating the full configured window
+/// (e.g. 16384) on every call is very expensive and, for short prompts with
+/// small generations (e.g. an 8-token intent classification), dominates
+/// latency. Size the context to what the call actually needs, clamped to
+/// `[prompt + 1, context_length]`.
+///
+/// Callers verify `prompt_tokens < context_length` before invoking, so the
+/// clamp range is always valid (min <= max).
+fn effective_context_len(prompt_tokens: usize, max_tokens: u32, context_length: u32) -> u32 {
+    let prompt = prompt_tokens as u32;
+    let needed = prompt
+        .saturating_add(max_tokens)
+        .saturating_add(CONTEXT_SLACK_TOKENS);
+    // `min` is capped at `context_length` so the clamp range stays valid even
+    // for an over-long prompt (callers reject those earlier; this just avoids a
+    // panic on degenerate input).
+    let min = prompt.saturating_add(1).min(context_length);
+    needed.clamp(min, context_length)
+}
+
 impl LlmEngine {
+    /// Per-call context window (see [`effective_context_len`]).
+    fn effective_context_len(&self, prompt_tokens: usize, max_tokens: u32) -> u32 {
+        effective_context_len(prompt_tokens, max_tokens, self.context_length)
+    }
+
     /// Load a GGUF model from disk.
     pub fn load(config: &LlmConfig) -> Result<Self> {
         tracing::info!(
@@ -132,9 +164,11 @@ impl LlmEngine {
             .unwrap_or(4)
             .max(1);
 
+        let n_ctx = self.effective_context_len(tokens.len(), params.max_tokens);
+
         let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(std::num::NonZeroU32::new(self.context_length))
-            .with_n_batch(self.context_length)
+            .with_n_ctx(std::num::NonZeroU32::new(n_ctx))
+            .with_n_batch(n_ctx)
             .with_n_threads(threads as i32)
             .with_n_threads_batch(threads as i32);
 
@@ -144,7 +178,7 @@ impl LlmEngine {
             .map_err(|e| Error::Other(format!("Failed to create context: {e}")))?;
 
         // Create batch and fill with prompt tokens
-        let mut batch = LlamaBatch::new(self.context_length as usize, 1);
+        let mut batch = LlamaBatch::new(n_ctx as usize, 1);
 
         for (i, &token) in tokens.iter().enumerate() {
             let is_last = i == tokens.len() - 1;
@@ -173,7 +207,7 @@ impl LlmEngine {
         let prompt_len = tokens.len() as i32;
         let max_gen = params
             .max_tokens
-            .min(self.context_length - tokens.len() as u32);
+            .min(n_ctx.saturating_sub(tokens.len() as u32));
         let mut accumulated = String::new();
         let start = Instant::now();
 
@@ -270,9 +304,11 @@ impl LlmEngine {
             .unwrap_or(4)
             .max(1);
 
+        let n_ctx = self.effective_context_len(tokens.len(), params.max_tokens);
+
         let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(std::num::NonZeroU32::new(self.context_length))
-            .with_n_batch(self.context_length)
+            .with_n_ctx(std::num::NonZeroU32::new(n_ctx))
+            .with_n_batch(n_ctx)
             .with_n_threads(threads as i32)
             .with_n_threads_batch(threads as i32);
 
@@ -281,7 +317,7 @@ impl LlmEngine {
             .new_context(&self._backend, ctx_params)
             .map_err(|e| Error::Other(format!("Failed to create context: {e}")))?;
 
-        let mut batch = LlamaBatch::new(self.context_length as usize, 1);
+        let mut batch = LlamaBatch::new(n_ctx as usize, 1);
 
         for (i, &token) in tokens.iter().enumerate() {
             let is_last = i == tokens.len() - 1;
@@ -305,7 +341,7 @@ impl LlmEngine {
         let prompt_len = tokens.len() as i32;
         let max_gen = params
             .max_tokens
-            .min(self.context_length - tokens.len() as u32);
+            .min(n_ctx.saturating_sub(tokens.len() as u32));
         let mut accumulated = String::new();
         let start = Instant::now();
 
@@ -417,6 +453,38 @@ mod tests {
         let params = GenerationParams::default();
         assert_eq!(params.max_tokens, 2048);
         assert!((params.temperature - 0.7).abs() < f32::EPSILON);
+    }
+
+    // --- Per-call context sizing ---
+
+    #[test]
+    fn test_effective_context_len_short_prompt_is_tiny() {
+        // An intent classification: ~40-token prompt, 8 output tokens. We should
+        // allocate a few dozen tokens, NOT the full 16384 window.
+        let n = effective_context_len(40, 8, 16384);
+        assert_eq!(n, 40 + 8 + CONTEXT_SLACK_TOKENS);
+        assert!(n < 100, "expected a tiny context, got {n}");
+    }
+
+    #[test]
+    fn test_effective_context_len_clamped_to_max() {
+        // Large generation request must never exceed the configured window.
+        let n = effective_context_len(1000, 100_000, 16384);
+        assert_eq!(n, 16384);
+    }
+
+    #[test]
+    fn test_effective_context_len_at_least_prompt_plus_one() {
+        // With zero generation tokens we still need room for the prompt itself.
+        let n = effective_context_len(500, 0, 16384);
+        assert!(n >= 501, "context must hold the prompt, got {n}");
+    }
+
+    #[test]
+    fn test_effective_context_len_no_overflow_on_huge_inputs() {
+        // Saturating arithmetic: pathological inputs clamp instead of wrapping.
+        let n = effective_context_len(usize::MAX, u32::MAX, 16384);
+        assert_eq!(n, 16384);
     }
 
     #[test]
