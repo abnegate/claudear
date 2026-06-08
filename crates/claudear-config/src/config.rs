@@ -238,6 +238,10 @@ pub struct NotifiersConfig {
     pub whatsapp: WhatsAppConfig,
     /// Telegram Bot notification channel.
     pub telegram: TelegramConfig,
+    /// HelpScout reply channel — drives the reply action pipeline
+    /// (classify → verify → resolve → reply) and per-inbox reply templates.
+    /// Replaces the former top-level `[reply]` block; read via `Config::reply()`.
+    pub helpscout: ReplyConfig,
 }
 
 /// Discord source-only configuration (for issue ingestion).
@@ -408,9 +412,6 @@ pub struct Config {
     /// RAG-grounded question answering configuration.
     #[serde(default)]
     pub qa: QaConfig,
-    /// Reply-action configuration (per-inbox templates used as soft guidelines).
-    #[serde(default)]
-    pub reply: ReplyConfig,
 }
 
 fn default_storage_dir() -> PathBuf {
@@ -601,7 +602,6 @@ impl Default for Config {
             tls: TlsConfig::default(),
             embedding: EmbeddingModelConfig::default(),
             qa: QaConfig::default(),
-            reply: ReplyConfig::default(),
         }
     }
 }
@@ -3082,6 +3082,11 @@ impl Config {
         self.issues.helpscout.as_ref()
     }
 
+    /// Accessor: reply-action configuration, sourced from `[notifiers.helpscout]`.
+    pub fn reply(&self) -> &ReplyConfig {
+        &self.notifiers.helpscout
+    }
+
     /// Accessor: get reference to EmailConfig.
     pub fn email(&self) -> &EmailConfig {
         &self.notifiers.email
@@ -3308,19 +3313,19 @@ mod tests {
     #[test]
     fn test_reply_config_parses_from_toml() {
         let toml = r#"
-            [reply]
+            [notifiers.helpscout]
             enabled = true
             default_template = "be nice"
-            [reply.templates]
+            [notifiers.helpscout.templates]
             "42" = "warm and apologetic"
         "#;
         let cfg: Config = toml::from_str(toml).expect("parse");
-        assert!(cfg.reply.enabled);
+        assert!(cfg.reply().enabled);
         assert_eq!(
-            cfg.reply.template_for(Some("42")),
+            cfg.reply().template_for(Some("42")),
             Some("warm and apologetic")
         );
-        assert_eq!(cfg.reply.template_for(Some("x")), Some("be nice"));
+        assert_eq!(cfg.reply().template_for(Some("x")), Some("be nice"));
     }
 
     #[test]

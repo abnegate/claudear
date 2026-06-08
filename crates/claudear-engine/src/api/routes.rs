@@ -2693,7 +2693,6 @@ mod tests {
             tls: claudear_config::config::TlsConfig::default(),
             embedding: claudear_config::config::EmbeddingModelConfig::default(),
             qa: claudear_config::config::QaConfig::default(),
-            reply: claudear_config::config::ReplyConfig::default(),
         }
     }
 

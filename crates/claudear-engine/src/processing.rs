@@ -177,7 +177,7 @@ impl IssueProcessor {
         //   bug/security -> verify -> resolve -> reply
         //   otherwise     -> reply
         // When disabled, fall through to the legacy routing below.
-        if self.config.reply.enabled {
+        if self.config.reply().enabled {
             return self.run_action_pipeline(input, context_provider).await;
         }
 
@@ -1663,7 +1663,8 @@ impl IssueProcessor {
             json!({ "context_chars": context.len() }),
         );
 
-        let timeout = std::time::Duration::from_secs(self.config.reply.verify_timeout_secs.max(1));
+        let timeout =
+            std::time::Duration::from_secs(self.config.reply().verify_timeout_secs.max(1));
         let result = tokio::time::timeout(
             timeout,
             self.agent.verify_issue(issue, &context, &project_dir),
@@ -1681,7 +1682,7 @@ impl IssueProcessor {
                 reproduced: true,
                 summary: format!(
                     "Verification timed out after {}s; proceeding to resolve",
-                    self.config.reply.verify_timeout_secs
+                    self.config.reply().verify_timeout_secs
                 ),
                 evidence: String::new(),
             },
@@ -1734,7 +1735,7 @@ impl IssueProcessor {
         let inbox_key = issue
             .get_metadata::<String>("mailbox_id")
             .unwrap_or_else(|| source_name.to_string());
-        let guideline = self.config.reply.template_for(Some(&inbox_key));
+        let guideline = self.config.reply().template_for(Some(&inbox_key));
 
         self.record_issue_decision(
             issue,

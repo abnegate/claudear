@@ -1711,7 +1711,6 @@ mod tests {
             llm: claudear_config::config::LlmModelConfig::default(),
             embedding: claudear_config::config::EmbeddingModelConfig::default(),
             qa: claudear_config::config::QaConfig::default(),
-            reply: claudear_config::config::ReplyConfig::default(),
         }
     }
 

@@ -900,7 +900,7 @@ max_qa_per_cycle = 20
 # are treated as SOFT GUIDELINES — the agent follows the tone/structure loosely
 # and varies naturally, it does not reproduce them verbatim.
 
-[reply]
+[notifiers.helpscout]
 # Enable the reply action (default: false)
 enabled = false
 
@@ -914,7 +914,7 @@ default_template = "Friendly, concise, first-person. Acknowledge the report, giv
 verify_timeout_secs = 1800
 
 # Per-inbox guidelines, keyed by HelpScout mailbox id (or source name).
-[reply.templates]
+[notifiers.helpscout.templates]
 # "123456" = "Warm and apologetic for the inconvenience; sign off as the Support team."
 
 # ============================================
