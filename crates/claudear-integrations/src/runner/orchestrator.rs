@@ -6,7 +6,7 @@
 use super::{AgentRunner, ProviderCapabilities};
 use async_trait::async_trait;
 use claudear_core::error::{Error, Result};
-use claudear_core::types::{AgentResult, Issue};
+use claudear_core::types::{AgentResult, Issue, ReplyKind, VerifyResult};
 use rand::RngExt;
 use std::path::Path;
 use std::sync::Arc;
@@ -203,6 +203,40 @@ impl AgentRunner for AgentOrchestrator {
             .map(|p| &p.provider)
             .ok_or_else(|| Error::runner("No providers configured in orchestrator"))?;
         provider.answer_question(issue, context, project_dir).await
+    }
+
+    async fn verify_issue(
+        &self,
+        issue: &Issue,
+        context: &str,
+        project_dir: &Path,
+    ) -> Result<VerifyResult> {
+        // Read-only verification always uses the primary provider.
+        let provider = self
+            .providers
+            .first()
+            .map(|p| &p.provider)
+            .ok_or_else(|| Error::runner("No providers configured in orchestrator"))?;
+        provider.verify_issue(issue, context, project_dir).await
+    }
+
+    async fn generate_reply(
+        &self,
+        issue: &Issue,
+        context: &str,
+        guideline: Option<&str>,
+        kind: ReplyKind,
+        project_dir: &Path,
+    ) -> Result<String> {
+        // Read-only reply generation always uses the primary provider.
+        let provider = self
+            .providers
+            .first()
+            .map(|p| &p.provider)
+            .ok_or_else(|| Error::runner("No providers configured in orchestrator"))?;
+        provider
+            .generate_reply(issue, context, guideline, kind, project_dir)
+            .await
     }
 }
 

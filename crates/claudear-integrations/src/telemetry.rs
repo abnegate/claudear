@@ -15,7 +15,9 @@ use crate::source::IssueSource;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use claudear_core::error::Result;
-use claudear_core::types::{AgentResult, AskDelivery, AskReply, AskRequest, Issue, MatchResult};
+use claudear_core::types::{
+    AgentResult, AskDelivery, AskReply, AskRequest, Issue, MatchResult, ReplyKind, VerifyResult,
+};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -489,6 +491,28 @@ impl AgentRunner for InstrumentedRunner {
     ) -> Result<String> {
         self.inner
             .answer_question(issue, context, project_dir)
+            .await
+    }
+
+    async fn verify_issue(
+        &self,
+        issue: &Issue,
+        context: &str,
+        project_dir: &Path,
+    ) -> Result<VerifyResult> {
+        self.inner.verify_issue(issue, context, project_dir).await
+    }
+
+    async fn generate_reply(
+        &self,
+        issue: &Issue,
+        context: &str,
+        guideline: Option<&str>,
+        kind: ReplyKind,
+        project_dir: &Path,
+    ) -> Result<String> {
+        self.inner
+            .generate_reply(issue, context, guideline, kind, project_dir)
             .await
     }
 }
