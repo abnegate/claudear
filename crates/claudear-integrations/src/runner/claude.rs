@@ -1954,6 +1954,18 @@ tone and spirit, but vary the wording naturally; do NOT copy it verbatim):\n{g}\
         _ => String::new(),
     };
 
+    // HelpScout renders the reply body as HTML, not Markdown, so Markdown syntax
+    // shows up as raw characters. Other sources (Discord, Slack, GitHub, Linear)
+    // render Markdown, so only constrain formatting for HelpScout.
+    let format_rule = if issue.source == "helpscout" {
+        "\n- Write in PLAIN PROSE. This ticket system does NOT render Markdown, so do \
+NOT use Markdown syntax: no `**bold**`, `_italics_`, backticks/code fences, `#` \
+headers, `-`/`*` bullet lists, or `[text](url)` links. Write URLs as bare URLs and \
+use short paragraphs separated by blank lines instead of lists."
+    } else {
+        ""
+    };
+
     format!(
         r#"You are a member of the support/engineering team replying to a ticket from {source}.
 
@@ -1965,7 +1977,7 @@ STRICT RULES:
 - Sound like a real, helpful human — natural, warm, and concise. Avoid robotic
   boilerplate and obvious AI phrasing. Write in the first person.
 - Do NOT include internal-only notes, chain-of-thought, or a "Sources" section;
-  output only the message text that will be sent to the ticket.
+  output only the message text that will be sent to the ticket.{format_rule}
 {guideline_block}
 Retrieved code context:
 {context}
@@ -1977,6 +1989,7 @@ Title: {title}
 Write only the reply message."#,
         source = issue.source,
         task = task,
+        format_rule = format_rule,
         guideline_block = guideline_block,
         context = context,
         title = issue.title,
@@ -2091,6 +2104,25 @@ mod tests {
         assert!(
             prompt.to_lowercase().contains("shipped") || prompt.to_lowercase().contains("resolved")
         );
+    }
+
+    #[test]
+    fn test_build_reply_prompt_plain_prose_only_for_helpscout() {
+        // HelpScout renders HTML, not Markdown — the plain-prose rule applies.
+        let hs = Issue::new("1", "HS-1", "title", "url", "helpscout");
+        let prompt = build_reply_prompt(&hs, "ctx", None, ReplyKind::Answer);
+        assert!(prompt.contains("PLAIN PROSE"));
+        assert!(prompt.contains("does NOT render Markdown"));
+
+        // Markdown-rendering sources keep formatting freedom (no rule injected).
+        for source in ["discord", "slack", "github", "linear"] {
+            let issue = Issue::new("1", "X-1", "title", "url", source);
+            let prompt = build_reply_prompt(&issue, "ctx", None, ReplyKind::Answer);
+            assert!(
+                !prompt.contains("PLAIN PROSE"),
+                "plain-prose rule should not apply for source {source}"
+            );
+        }
     }
 
     #[test]
