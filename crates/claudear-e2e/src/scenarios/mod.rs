@@ -3,6 +3,7 @@
 pub mod s1_lifecycle;
 pub mod s2_ask;
 pub mod s3_cascade;
+pub mod s4_action;
 
 use claudear::scm::ScmProvider;
 use claudear::source::IssueSource;

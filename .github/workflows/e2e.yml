@@ -78,6 +78,14 @@ jobs:
             ask: slack
             scenarios: "1"
 
+          # Run 5: Action pipeline (classify → verify → resolve → reply) over Linear.
+          # Reuses the GitHub + Linear secrets; no new credentials needed.
+          - name: github-linear-action
+            scm: github
+            source: linear
+            ask: discord
+            scenarios: "4"
+
     env:
       # Claude auth
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

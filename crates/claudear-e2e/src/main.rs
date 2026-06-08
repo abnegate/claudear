@@ -327,6 +327,18 @@ async fn main() -> Result<()> {
                 log_result("S3", &result);
                 results.push(("S3", result));
             }
+            4 => {
+                // S4 seeds issues via create_issue, so it needs a label/poll
+                // source (Linear/Jira), not a cursor-based chat source.
+                if matches!(cli.source.as_str(), "discord" | "slack") {
+                    log(">>> Skipping Scenario 4: requires a seedable label source (linear/jira)");
+                    continue;
+                }
+                log(">>> Starting Scenario 4: Action pipeline (classify → verify → resolve → reply)");
+                let result = scenarios::s4_action::run(&ctx).await;
+                log_result("S4", &result);
+                results.push(("S4", result));
+            }
             other => {
                 log(&format!(">>> Unknown scenario {}, skipping", other));
             }

@@ -218,6 +218,27 @@ impl ConfigBuilder {
         self
     }
 
+    /// Enable the reply action pipeline (classify → verify → resolve → reply).
+    ///
+    /// After the reply-config refactor these settings live under
+    /// `[notifiers.helpscout]` and are read via `Config::reply()`. The pipeline
+    /// itself is source-agnostic, so enabling this drives any configured source
+    /// (e.g. Linear) through the action pipeline. `inbox_key` is the per-inbox
+    /// template key (a HelpScout mailbox id, or a source name like "linear").
+    pub fn reply(mut self, inbox_key: &str, template: &str, verify_timeout_secs: u64) -> Self {
+        self.config.notifiers.helpscout = claudear::config::ReplyConfig {
+            enabled: true,
+            sound_human: true,
+            default_template: None,
+            templates: std::collections::HashMap::from([(
+                inbox_key.to_string(),
+                template.to_string(),
+            )]),
+            verify_timeout_secs,
+        };
+        self
+    }
+
     /// Write the config to a TOML file and return the path.
     pub fn write_to(self, dir: &Path, name: &str) -> Result<PathBuf> {
         std::fs::create_dir_all(dir).context("create config dir")?;
