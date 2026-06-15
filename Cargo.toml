@@ -100,7 +100,7 @@ llama-cpp-2 = "0.1"
 encoding_rs = "0.8"
 
 # System info
-sysinfo = { version = "0.38", default-features = false, features = ["system"] }
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 
 # Parallel iteration
 rayon = "1"
