@@ -282,7 +282,7 @@ export default function AttemptsPage() {
                         <p className="text-sm text-destructive">{detail.attempt.error_message}</p>
                       </div>
                     )}
-                    {detail.attempt.issue_labels.length > 0 && (
+                    {detail.attempt.issue_labels && detail.attempt.issue_labels.length > 0 && (
                       <div className="sm:col-span-2 lg:col-span-3">
                         <p className="text-sm text-muted-foreground mb-1">Labels</p>
                         <div className="flex flex-wrap gap-1">

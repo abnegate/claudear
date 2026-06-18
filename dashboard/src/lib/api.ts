@@ -202,7 +202,7 @@ export interface FixAttemptDetail {
   resolved_at: string | null;
   retry_count: number;
   last_retry_at: string | null;
-  issue_labels: string[];
+  issue_labels?: string[];
   parent_attempt_id: number | null;
   cascade_repo: string | null;
 }
