@@ -318,17 +318,22 @@ impl Notifier for CompositeNotifier {
     }
 
     async fn notify_answer(&self, issue: &Issue, answer: &str) -> Result<Vec<String>> {
-        // Deliver to every notifier, tolerating per-notifier failures (matching
-        // `broadcast` semantics), and collect the sent message ids so callers can
+        // Deliver to every notifier concurrently (like `broadcast`), tolerating
+        // per-notifier failures, and collect the sent message ids so callers can
         // map a later reply back to the issue (only reply-capable channels like
-        // Discord contribute ids).
+        // Discord contribute ids). `broadcast` can't be reused here: it requires
+        // `Result<()>` futures and discards their return values.
+        let futures = self.notifiers.iter().map(|n| {
+            let n = Arc::clone(n);
+            let issue = issue.clone();
+            let answer = answer.to_string();
+            async move { n.notify_answer(&issue, &answer).await }
+        });
         let mut ids = Vec::new();
-        for n in &self.notifiers {
-            match n.notify_answer(issue, answer).await {
+        for result in futures::future::join_all(futures).await {
+            match result {
                 Ok(mut sent) => ids.append(&mut sent),
-                Err(e) => {
-                    tracing::warn!(component = n.name(), error = %e, "notify_answer failed");
-                }
+                Err(e) => tracing::warn!(error = %e, "notify_answer failed"),
             }
         }
         Ok(ids)
