@@ -197,6 +197,30 @@ pub trait AttemptTracker: Send + Sync {
         Ok(())
     }
 
+    /// Record the Discord message ids of the answer chunks Claudear sent for an
+    /// issue, so a user's reply to any chunk can be mapped back to the issue.
+    ///
+    /// Default no-op; persistent trackers should store the ids for later lookup
+    /// via [`FixAttemptTracker::lookup_answer_issue`].
+    fn record_answer_message_ids(
+        &self,
+        source: &str,
+        issue_id: &str,
+        message_ids: &[String],
+    ) -> Result<()> {
+        let _ = (source, issue_id, message_ids);
+        Ok(())
+    }
+
+    /// Reverse lookup: given a Discord message id the bot sent as (part of) an
+    /// answer, return the `(source, issue_id)` it belongs to, if known.
+    ///
+    /// Default returns `None`.
+    fn lookup_answer_issue(&self, message_id: &str) -> Result<Option<(String, String)>> {
+        let _ = message_id;
+        Ok(None)
+    }
+
     /// Get issues that are eligible for retry (failed/closed with retry_count < max_retries).
     fn get_retryable_issues(&self, max_retries: u32) -> Result<Vec<FixAttempt>>;
 

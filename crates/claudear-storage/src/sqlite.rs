@@ -1342,6 +1342,52 @@ impl AttemptTracker for SqliteTracker {
         Ok(())
     }
 
+    fn record_answer_message_ids(
+        &self,
+        source: &str,
+        issue_id: &str,
+        message_ids: &[String],
+    ) -> Result<()> {
+        if message_ids.is_empty() {
+            return Ok(());
+        }
+        // Store as ",id1,id2,id3," so reverse lookups can match a whole id with
+        // LIKE '%,<id>,%' and never match a partial id.
+        let packed = format!(",{},", message_ids.join(","));
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            UPDATE fix_attempts
+            SET answer_message_ids = ?
+            WHERE source = ? AND issue_id = ?
+            "#,
+            params![packed, source, issue_id],
+        )?;
+        Ok(())
+    }
+
+    fn lookup_answer_issue(&self, message_id: &str) -> Result<Option<(String, String)>> {
+        if message_id.is_empty() {
+            return Ok(None);
+        }
+        let pattern = format!("%,{},%", message_id);
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare_cached(
+            r#"
+            SELECT source, issue_id
+            FROM fix_attempts
+            WHERE answer_message_ids LIKE ?
+            LIMIT 1
+            "#,
+        )?;
+        let result = stmt
+            .query_row(params![pattern], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .ok();
+        Ok(result)
+    }
+
     fn get_retryable_issues(&self, max_retries: u32) -> Result<Vec<FixAttempt>> {
         let conn = self.acquire_lock()?;
         let mut stmt = conn.prepare_cached(
@@ -9578,6 +9624,39 @@ mod tests {
         assert_eq!(attempt.short_id, "PROJ-123");
         assert_eq!(attempt.source, "linear");
         assert_eq!(attempt.status, FixAttemptStatus::Pending);
+    }
+
+    #[test]
+    fn test_answer_message_ids_round_trip() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_attempt("discord", "999000111", "DISCORD-99900011")
+            .unwrap();
+
+        let chunk_ids = vec!["555111".to_string(), "555222".to_string()];
+        tracker
+            .record_answer_message_ids("discord", "999000111", &chunk_ids)
+            .unwrap();
+
+        // Any chunk id resolves back to the (source, issue_id).
+        assert_eq!(
+            tracker.lookup_answer_issue("555111").unwrap(),
+            Some(("discord".to_string(), "999000111".to_string()))
+        );
+        assert_eq!(
+            tracker.lookup_answer_issue("555222").unwrap(),
+            Some(("discord".to_string(), "999000111".to_string()))
+        );
+
+        // A partial id must NOT match (delimiter guard).
+        assert_eq!(tracker.lookup_answer_issue("5551").unwrap(), None);
+        // An unknown id resolves to nothing.
+        assert_eq!(tracker.lookup_answer_issue("777").unwrap(), None);
+        // Empty input is safe.
+        assert_eq!(tracker.lookup_answer_issue("").unwrap(), None);
+        tracker
+            .record_answer_message_ids("discord", "999000111", &[])
+            .unwrap();
     }
 
     #[test]

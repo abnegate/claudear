@@ -51,6 +51,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "retrieval_usage",
         sql: include_str!("../../../migrations/V7__retrieval_usage.sql"),
     },
+    Migration {
+        version: 8,
+        name: "answer_message_ids",
+        sql: include_str!("../../../migrations/V8__answer_message_ids.sql"),
+    },
 ];
 
 /// Run all pending migrations against the given connection.
@@ -111,7 +116,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
 
         // Verify a table from V1 exists
         let count: u32 = conn
@@ -122,6 +127,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+
+        // Verify the V8 column exists on fix_attempts.
+        let has_col: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('fix_attempts') WHERE name = 'answer_message_ids'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_col, 1);
     }
 
     #[test]
@@ -136,7 +151,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
     }
 
     #[test]
