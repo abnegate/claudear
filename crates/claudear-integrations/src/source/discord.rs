@@ -164,6 +164,22 @@ impl DiscordSource {
         }
         issue.set_metadata("channel_id", &msg.channel_id);
 
+        // When this message is a reply, record the parent it points at so the
+        // engine can reconstruct the reply-chain conversation as grounding
+        // context. Only the parent id is available on the payload; the parent's
+        // content is resolved later (from our DB for Claudear's own answers, or
+        // by fetching from Discord for other users' messages).
+        if let Some(ref reference) = msg.message_reference {
+            if let Some(ref parent_id) = reference.message_id {
+                issue.set_metadata("reply_to_message_id", parent_id);
+                let parent_channel = reference
+                    .channel_id
+                    .clone()
+                    .unwrap_or_else(|| msg.channel_id.clone());
+                issue.set_metadata("reply_to_channel_id", &parent_channel);
+            }
+        }
+
         issue
     }
 }
@@ -516,6 +532,55 @@ mod tests {
             issue.get_metadata::<String>("channel_id"),
             Some("chan-123".to_string())
         );
+    }
+
+    #[test]
+    fn test_message_to_issue_captures_reply_pointer() {
+        let source = DiscordSource::new(make_config());
+        let mut msg = make_message("999", "what about Y?", false);
+        msg.message_reference = Some(crate::discord::DiscordMessageReference {
+            message_id: Some("parent-42".to_string()),
+            channel_id: Some("thread-7".to_string()),
+            guild_id: None,
+            fail_if_not_exists: None,
+        });
+        let issue = source.message_to_issue(&msg);
+        assert_eq!(
+            issue.get_metadata::<String>("reply_to_message_id"),
+            Some("parent-42".to_string())
+        );
+        assert_eq!(
+            issue.get_metadata::<String>("reply_to_channel_id"),
+            Some("thread-7".to_string())
+        );
+    }
+
+    #[test]
+    fn test_message_to_issue_reply_channel_falls_back_to_message_channel() {
+        let source = DiscordSource::new(make_config());
+        let mut msg = make_message("999", "follow up", false);
+        msg.message_reference = Some(crate::discord::DiscordMessageReference {
+            message_id: Some("parent-42".to_string()),
+            channel_id: None,
+            guild_id: None,
+            fail_if_not_exists: None,
+        });
+        let issue = source.message_to_issue(&msg);
+        // No reference channel: falls back to the message's own channel.
+        assert_eq!(
+            issue.get_metadata::<String>("reply_to_channel_id"),
+            Some("chan-123".to_string())
+        );
+    }
+
+    #[test]
+    fn test_message_to_issue_no_reply_pointer_when_not_reply() {
+        let source = DiscordSource::new(make_config());
+        let msg = make_message("999", "not a reply", false);
+        let issue = source.message_to_issue(&msg);
+        assert!(issue
+            .get_metadata::<String>("reply_to_message_id")
+            .is_none());
     }
 
     #[test]
