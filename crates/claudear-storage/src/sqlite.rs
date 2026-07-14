@@ -1351,10 +1351,28 @@ impl AttemptTracker for SqliteTracker {
         if message_ids.is_empty() {
             return Ok(());
         }
-        // Store as ",id1,id2,id3," so reverse lookups can match a whole id with
-        // LIKE '%,<id>,%' and never match a partial id.
-        let packed = format!(",{},", message_ids.join(","));
         let conn = self.acquire_lock()?;
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT answer_message_ids FROM fix_attempts WHERE source = ?1 AND issue_id = ?2",
+                params![source, issue_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten();
+        let mut ids: Vec<String> = existing
+            .as_deref()
+            .unwrap_or("")
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        for id in message_ids {
+            if !ids.iter().any(|existing| existing == id) {
+                ids.push(id.clone());
+            }
+        }
+        let packed = format!(",{},", ids.join(","));
         conn.execute(
             r#"
             UPDATE fix_attempts
@@ -1370,13 +1388,17 @@ impl AttemptTracker for SqliteTracker {
         if message_id.is_empty() {
             return Ok(None);
         }
-        let pattern = format!("%,{},%", message_id);
+        let escaped = message_id
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%,{},%", escaped);
         let conn = self.acquire_lock()?;
         let mut stmt = conn.prepare_cached(
             r#"
             SELECT source, issue_id
             FROM fix_attempts
-            WHERE answer_message_ids LIKE ?
+            WHERE answer_message_ids LIKE ? ESCAPE '\'
             LIMIT 1
             "#,
         )?;
@@ -9657,6 +9679,25 @@ mod tests {
         tracker
             .record_answer_message_ids("discord", "999000111", &[])
             .unwrap();
+
+        // A LIKE wildcard input must not match (wildcards are escaped).
+        assert_eq!(tracker.lookup_answer_issue("%").unwrap(), None);
+
+        // Recording again appends without dropping earlier ids, and re-recording
+        // an existing id does not duplicate it.
+        tracker
+            .record_answer_message_ids("discord", "999000111", &["555333".to_string()])
+            .unwrap();
+        tracker
+            .record_answer_message_ids("discord", "999000111", &["555111".to_string()])
+            .unwrap();
+        for id in ["555111", "555222", "555333"] {
+            assert_eq!(
+                tracker.lookup_answer_issue(id).unwrap(),
+                Some(("discord".to_string(), "999000111".to_string())),
+                "id {id} should still resolve after append"
+            );
+        }
     }
 
     #[test]
