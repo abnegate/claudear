@@ -273,7 +273,12 @@ impl IssueProcessor {
                 "Routing to read-only Q&A answer path"
             );
             return self
-                .answer_question_issue(&input.issue, &input.resolution, &input.source_name)
+                .answer_question_issue(
+                    &input.issue,
+                    &input.resolution,
+                    &input.source_name,
+                    input.attempt_id,
+                )
                 .await;
         }
         tracing::info!(
@@ -850,6 +855,7 @@ impl IssueProcessor {
                                     ));
                                 }
                                 self.tracker.record_retrieval_usage(&rows).ok();
+                                self.log_retrieval_recorded(&rows);
                             }
                             format_similar_issues_context(&similar)
                         }
@@ -903,6 +909,7 @@ impl IssueProcessor {
                                 ));
                             }
                             self.tracker.record_retrieval_usage(&rows).ok();
+                            self.log_retrieval_recorded(&rows);
                         }
                         context = format!(
                             "{}\n{}",
@@ -991,6 +998,7 @@ impl IssueProcessor {
                             ));
                         }
                         self.tracker.record_retrieval_usage(&rows).ok();
+                        self.log_retrieval_recorded(&rows);
                     }
                     used_qa_ids.extend(matches.into_iter().map(|m| m.entry.id));
                 }
@@ -1321,11 +1329,8 @@ impl IssueProcessor {
             });
         }
 
-        // Score retrieval quality for this attempt regardless of outcome — the
-        // chunks were recorded at retrieval time, so failed and no-PR attempts are
-        // just as worth assessing (arguably more).
         if let Some(id) = attempt_id {
-            self.assess_retrieval(id, issue, &retrieved_items).await;
+            self.spawn_retrieval_judge(id, issue, &retrieved_items);
         }
 
         // Handle result
@@ -1794,6 +1799,7 @@ impl IssueProcessor {
         issue: &Issue,
         resolution: &RepoResolution,
         source_name: &str,
+        attempt_id: Option<i64>,
     ) -> ProcessingOutcome {
         // Timeline: QA run started.
         self.record_timeline_event(
@@ -1816,6 +1822,7 @@ impl IssueProcessor {
 
         // Retrieve grounding context from the code index across ALL repos, plus
         // any indexed Discord discussions.
+        let mut retrieved_items: Vec<RetrievedItem> = Vec::new();
         let mut context = if let Some(ref code_search) = self.code_search_service {
             let query = claudear_analysis::repo::code_index::build_code_search_query(issue);
             match code_search
@@ -1823,6 +1830,32 @@ impl IssueProcessor {
                 .await
             {
                 Ok(results) if !results.is_empty() => {
+                    if let Some(id) = attempt_id {
+                        let mut rows: Vec<RetrievalUsageRecord> = Vec::with_capacity(results.len());
+                        for (rank, r) in results.iter().enumerate() {
+                            let chunk_ref = r
+                                .chunk
+                                .id
+                                .map(|i| i.to_string())
+                                .unwrap_or_else(|| r.chunk.file_path.clone());
+                            retrieved_items.push(RetrievedItem {
+                                source_kind: "code_chunk".to_string(),
+                                chunk_ref: chunk_ref.clone(),
+                                text: r.chunk.chunk_text.clone(),
+                            });
+                            rows.push(RetrievalUsageRecord::new(
+                                id,
+                                "code_chunk",
+                                chunk_ref,
+                                Some(r.chunk.file_path.clone()),
+                                rank as i64,
+                                r.score,
+                                Some(r.chunk.chunk_text.chars().count() as i64),
+                            ));
+                        }
+                        self.tracker.record_retrieval_usage(&rows).ok();
+                        self.log_retrieval_recorded(&rows);
+                    }
                     claudear_analysis::repo::code_index::format_code_search_context(&results)
                 }
                 _ => String::new(),
@@ -1830,8 +1863,8 @@ impl IssueProcessor {
         } else {
             String::new()
         };
-        let (discord_ctx, _) = self
-            .discord_grounding_context(issue, self.config.qa.max_context_chunks, None)
+        let (discord_ctx, discord_items) = self
+            .discord_grounding_context(issue, self.config.qa.max_context_chunks, attempt_id)
             .await;
         if !discord_ctx.is_empty() {
             context = if context.is_empty() {
@@ -1839,6 +1872,15 @@ impl IssueProcessor {
             } else {
                 format!("{}\n{}", context, discord_ctx)
             };
+            if attempt_id.is_some() {
+                retrieved_items.extend(discord_items);
+            }
+        }
+
+        // Score retrieval quality for this QA run (opt-in, detached — never blocks
+        // the answer). Mirrors the fix pipeline.
+        if let Some(id) = attempt_id {
+            self.spawn_retrieval_judge(id, issue, &retrieved_items);
         }
 
         // Ground the answer in the reply thread when this question is a reply.
@@ -1943,6 +1985,7 @@ impl IssueProcessor {
                         &input.resolution,
                         &input.source_name,
                         context_provider,
+                        input.attempt_id,
                     )
                     .await;
                 ProcessingOutcome::CompletedNoPr {
@@ -1964,6 +2007,7 @@ impl IssueProcessor {
                     &input.resolution,
                     &input.source_name,
                     context_provider,
+                    input.attempt_id,
                 )
                 .await
             }
@@ -2009,6 +2053,7 @@ impl IssueProcessor {
                     &input.resolution,
                     &input.source_name,
                     context_provider,
+                    input.attempt_id,
                 )
                 .await;
             if verdict.reproduced {
@@ -2035,6 +2080,7 @@ impl IssueProcessor {
                 &input.resolution,
                 &input.source_name,
                 context_provider,
+                input.attempt_id,
             )
             .await
         } else {
@@ -2044,6 +2090,7 @@ impl IssueProcessor {
                 &input.resolution,
                 &input.source_name,
                 context_provider,
+                input.attempt_id,
             )
             .await
         }
@@ -2120,9 +2167,10 @@ impl IssueProcessor {
         resolution: &RepoResolution,
         source_name: &str,
         context_provider: &dyn ContextProvider,
+        attempt_id: Option<i64>,
     ) -> VerifyResult {
         let project_dir = self.action_project_dir(resolution);
-        let context = self.build_rag_context(issue).await;
+        let context = self.build_rag_context(issue, attempt_id).await;
 
         self.record_issue_decision(
             issue,
@@ -2238,9 +2286,10 @@ impl IssueProcessor {
         resolution: &RepoResolution,
         source_name: &str,
         context_provider: &dyn ContextProvider,
+        attempt_id: Option<i64>,
     ) -> ProcessingOutcome {
         let project_dir = self.action_project_dir(resolution);
-        let context = self.build_rag_context(issue).await;
+        let context = self.build_rag_context(issue, attempt_id).await;
 
         // The inbox key is the HelpScout mailbox id when present, else the source.
         let inbox_key = issue
@@ -2372,7 +2421,9 @@ impl IssueProcessor {
 
     /// Retrieve RAG grounding context for an issue from the code index, plus any
     /// indexed Discord discussions.
-    async fn build_rag_context(&self, issue: &Issue) -> String {
+    /// Build the RAG grounding context for the action pipeline (verify/reply).
+    async fn build_rag_context(&self, issue: &Issue, attempt_id: Option<i64>) -> String {
+        let mut retrieved_items: Vec<RetrievedItem> = Vec::new();
         let mut context = String::new();
         if let Some(ref code_search) = self.code_search_service {
             let query = claudear_analysis::repo::code_index::build_code_search_query(issue);
@@ -2381,13 +2432,39 @@ impl IssueProcessor {
                 .await
             {
                 if !results.is_empty() {
+                    if let Some(id) = attempt_id {
+                        let mut rows: Vec<RetrievalUsageRecord> = Vec::with_capacity(results.len());
+                        for (rank, r) in results.iter().enumerate() {
+                            let chunk_ref = r
+                                .chunk
+                                .id
+                                .map(|i| i.to_string())
+                                .unwrap_or_else(|| r.chunk.file_path.clone());
+                            retrieved_items.push(RetrievedItem {
+                                source_kind: "code_chunk".to_string(),
+                                chunk_ref: chunk_ref.clone(),
+                                text: r.chunk.chunk_text.clone(),
+                            });
+                            rows.push(RetrievalUsageRecord::new(
+                                id,
+                                "code_chunk",
+                                chunk_ref,
+                                Some(r.chunk.file_path.clone()),
+                                rank as i64,
+                                r.score,
+                                Some(r.chunk.chunk_text.chars().count() as i64),
+                            ));
+                        }
+                        self.tracker.record_retrieval_usage(&rows).ok();
+                        self.log_retrieval_recorded(&rows);
+                    }
                     context =
                         claudear_analysis::repo::code_index::format_code_search_context(&results);
                 }
             }
         }
-        let (discord_ctx, _) = self
-            .discord_grounding_context(issue, self.config.qa.max_context_chunks, None)
+        let (discord_ctx, discord_items) = self
+            .discord_grounding_context(issue, self.config.qa.max_context_chunks, attempt_id)
             .await;
         if !discord_ctx.is_empty() {
             context = if context.is_empty() {
@@ -2395,17 +2472,36 @@ impl IssueProcessor {
             } else {
                 format!("{}\n{}", context, discord_ctx)
             };
+            if attempt_id.is_some() {
+                retrieved_items.extend(discord_items);
+            }
         }
+
+        // Score retrieval quality for this action run (opt-in, detached — never
+        // blocks the reply/verify). Mirrors the Q&A pipeline.
+        if let Some(id) = attempt_id {
+            self.spawn_retrieval_judge(id, issue, &retrieved_items);
+        }
+
         context
     }
 
-    /// Opt-in retrieval-quality judge: when `retrieval_eval.enabled`, score how
-    /// relevant each retrieved chunk was to the issue and persist a
-    /// `quality_score`. Backend follows the global agent-runner choice
-    /// (`agent.use_llm`): the local LLM when set, otherwise the coding agent via
-    /// schema-constrained structured output. Best-effort — failures are logged
-    /// and swallowed.
-    async fn assess_retrieval(
+    /// Debug-gated confirmation that retrieval rows were persisted. Only emitted
+    /// when `debug_logging` is set, so normal runs stay quiet.
+    fn log_retrieval_recorded(&self, rows: &[RetrievalUsageRecord]) {
+        if !self.config.debug_logging || rows.is_empty() {
+            return;
+        }
+        tracing::info!(
+            attempt_id = rows.first().map(|r| r.attempt_id).unwrap_or(-1),
+            source = rows.first().map(|r| r.source_kind.as_str()).unwrap_or("?"),
+            count = rows.len(),
+            "Recorded retrieval_usage chunks"
+        );
+    }
+
+    /// Opt-in retrieval-quality judge: when `retrieval_eval.enabled`
+    fn spawn_retrieval_judge(
         &self,
         attempt_id: i64,
         issue: &Issue,
@@ -2414,64 +2510,135 @@ impl IssueProcessor {
         if !self.config.retrieval_eval.enabled || retrieved_items.is_empty() {
             return;
         }
+        let use_llm = self.config.agent.use_llm;
+        let backend = if use_llm { "llm" } else { "agent" };
+        let total = retrieved_items.len();
+
+        // Timeline: record that scoring was spawned (synchronously, so it lands
+        // before the detached task's completed/failed event).
+        self.record_timeline_event(
+            issue,
+            TimelineEventStatus::RetrievalScoringStarted,
+            format!("Scoring {total} retrieved chunk(s) for {}", issue.short_id),
+            json!({ "backend": backend, "chunk_count": total }),
+        );
+
         let issue_summary = format!(
             "{}\n{}",
             issue.title,
             issue.description.clone().unwrap_or_default()
         );
+        let items = retrieved_items.to_vec();
+        let tracker = self.tracker.clone();
+        let analyzer = self.llm_analyzer.clone();
+        let agent = self.qa_agent.clone().unwrap_or_else(|| self.agent.clone());
+        // Issue identity captured for the detached task's timeline events.
+        let issue_id = issue.id.clone();
+        let short_id = issue.short_id.clone();
+        let source = issue.source.clone();
 
-        if self.config.agent.use_llm {
-            // Local LLM inference is blocking; run it off the async executor.
-            let Some(analyzer) = self.llm_analyzer.clone() else {
-                return;
-            };
-            let items = retrieved_items.to_vec();
-            let tracker = self.tracker.clone();
-            let handle = tokio::task::spawn_blocking(move || {
-                for item in &items {
-                    if let Some(score) = analyzer.score_chunk_relevance(&issue_summary, &item.text)
-                    {
-                        if let Err(e) = tracker.set_retrieval_quality(
-                            attempt_id,
-                            &item.source_kind,
-                            &item.chunk_ref,
-                            score,
-                        ) {
-                            tracing::warn!(error = %e, "Failed to persist retrieval quality score");
+        tokio::spawn(async move {
+            let scored: usize = if use_llm {
+                // Local LLM inference is blocking; run it off the async executor.
+                let Some(analyzer) = analyzer else {
+                    record_scoring_event(
+                        &tracker,
+                        &source,
+                        &issue_id,
+                        &short_id,
+                        TimelineEventStatus::RetrievalScoringFailed,
+                        format!("Retrieval scoring skipped for {short_id}: local LLM unavailable"),
+                        json!({ "backend": backend, "reason": "llm_unavailable" }),
+                    );
+                    return;
+                };
+                let tracker_s = tracker.clone();
+                match tokio::task::spawn_blocking(move || {
+                    let mut n = 0usize;
+                    for item in &items {
+                        if let Some(score) =
+                            analyzer.score_chunk_relevance(&issue_summary, &item.text)
+                        {
+                            match tracker_s.set_retrieval_quality(
+                                attempt_id,
+                                &item.source_kind,
+                                &item.chunk_ref,
+                                score,
+                            ) {
+                                Ok(()) => n += 1,
+                                Err(e) => tracing::warn!(error = %e, "Failed to persist retrieval quality score"),
+                            }
                         }
+                    }
+                    n
+                })
+                .await
+                {
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Retrieval relevance judge task failed");
+                        record_scoring_event(
+                            &tracker,
+                            &source,
+                            &issue_id,
+                            &short_id,
+                            TimelineEventStatus::RetrievalScoringFailed,
+                            format!("Retrieval scoring failed for {short_id}"),
+                            json!({ "backend": backend, "reason": "join_error" }),
+                        );
+                        return;
                     }
                 }
-            });
-            if let Err(e) = handle.await {
-                tracing::warn!(error = %e, "Retrieval relevance judge task failed");
-            }
-        } else {
-            // Agent-based judge (external provider) via structured output. Each
-            // call spawns an agent process, so score chunks with a bounded
-            // concurrent fan-out rather than sequentially.
-            use futures::StreamExt;
-            let issue_summary = &issue_summary;
-            futures::stream::iter(retrieved_items.iter())
-                .for_each_concurrent(RETRIEVAL_JUDGE_CONCURRENCY, |item| async move {
-                    if let Some(score) = crate::agent_classifier::score_chunk_relevance_via_agent(
-                        self.agent.as_ref(),
-                        issue_summary,
-                        &item.text,
-                    )
-                    .await
-                    {
-                        if let Err(e) = self.tracker.set_retrieval_quality(
-                            attempt_id,
-                            &item.source_kind,
-                            &item.chunk_ref,
-                            score,
-                        ) {
-                            tracing::warn!(error = %e, "Failed to persist retrieval quality score");
-                        }
-                    }
-                })
-                .await;
-        }
+            } else {
+                // Agent-based judge (external provider) via structured output. Each
+                // call spawns an agent process, so score chunks with a bounded
+                // concurrent fan-out rather than sequentially.
+                use futures::StreamExt;
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                let scored = AtomicUsize::new(0);
+                {
+                    let issue_summary = &issue_summary;
+                    let tracker = &tracker;
+                    let agent = agent.as_ref();
+                    let scored = &scored;
+                    futures::stream::iter(items.iter())
+                        .for_each_concurrent(RETRIEVAL_JUDGE_CONCURRENCY, |item| async move {
+                            if let Some(score) =
+                                crate::agent_classifier::score_chunk_relevance_via_agent(
+                                    agent,
+                                    issue_summary,
+                                    &item.text,
+                                )
+                                .await
+                            {
+                                match tracker.set_retrieval_quality(
+                                    attempt_id,
+                                    &item.source_kind,
+                                    &item.chunk_ref,
+                                    score,
+                                ) {
+                                    Ok(()) => {
+                                        scored.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    Err(e) => tracing::warn!(error = %e, "Failed to persist retrieval quality score"),
+                                }
+                            }
+                        })
+                        .await;
+                }
+                scored.into_inner()
+            };
+
+            record_scoring_event(
+                &tracker,
+                &source,
+                &issue_id,
+                &short_id,
+                TimelineEventStatus::RetrievalScoringCompleted,
+                format!("Scored {scored}/{total} retrieved chunk(s) for {short_id}"),
+                json!({ "backend": backend, "scored": scored, "total": total }),
+            );
+        });
     }
 
     /// Retrieve grounding context from the indexed Discord knowledge source.
@@ -2518,6 +2685,7 @@ impl IssueProcessor {
                 }
                 if !rows.is_empty() {
                     self.tracker.record_retrieval_usage(&rows).ok();
+                    self.log_retrieval_recorded(&rows);
                 }
                 let context =
                     claudear_analysis::knowledgebase::format_discord_search_context(&results);
@@ -2692,6 +2860,24 @@ pub fn enhance_prompt_with_learning(
     }
 
     format!("{}\n---\n\n{}", extra_context, base_prompt)
+}
+
+/// Record a retrieval-scoring timeline event from a detached task (where `self`
+/// and the `Issue` are no longer available — only the captured identity fields).
+fn record_scoring_event(
+    tracker: &Arc<dyn FixAttemptTracker>,
+    source: &str,
+    issue_id: &str,
+    short_id: &str,
+    event: TimelineEventStatus,
+    message: String,
+    context: serde_json::Value,
+) {
+    let activity = ActivityLogEntry::new(event.as_str(), message)
+        .with_source(source.to_string())
+        .with_issue(issue_id.to_string(), short_id.to_string())
+        .with_metadata(context);
+    tracker.record_activity(&activity).ok();
 }
 
 /// Record error pattern for analytics.

@@ -3259,6 +3259,18 @@ pub enum TimelineEventStatus {
     #[serde(rename = "qa_failed")]
     QaFailed,
 
+    /// The (opt-in) retrieval-quality relevance judge was spawned for an attempt.
+    #[serde(rename = "retrieval_scoring_started")]
+    RetrievalScoringStarted,
+
+    /// The retrieval-quality judge finished scoring the retrieved chunks.
+    #[serde(rename = "retrieval_scoring_completed")]
+    RetrievalScoringCompleted,
+
+    /// The retrieval-quality judge could not run (e.g. no backend available).
+    #[serde(rename = "retrieval_scoring_failed")]
+    RetrievalScoringFailed,
+
     #[serde(rename = "pr_merged")]
     PrMerged,
 
@@ -3288,6 +3300,9 @@ impl TimelineEventStatus {
             Self::QaStarted => "qa_started",
             Self::QaCompleted => "qa_completed",
             Self::QaFailed => "qa_failed",
+            Self::RetrievalScoringStarted => "retrieval_scoring_started",
+            Self::RetrievalScoringCompleted => "retrieval_scoring_completed",
+            Self::RetrievalScoringFailed => "retrieval_scoring_failed",
             Self::PrMerged => "pr_merged",
             Self::PrClosed => "pr_closed",
             Self::FixAbandoned => "fix_abandoned",

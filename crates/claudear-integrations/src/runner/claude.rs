@@ -658,8 +658,12 @@ The PR title should include the issue ID: {}
         if let Some(mut child_stdin) = child.stdin.take() {
             let prompt_bytes = prompt.to_string();
             tokio::spawn(async move {
-                let _ = child_stdin.write_all(prompt_bytes.as_bytes()).await;
-                let _ = child_stdin.shutdown().await;
+                if let Err(e) = child_stdin.write_all(prompt_bytes.as_bytes()).await {
+                    tracing::warn!(error = %e, "Failed to write prompt to agent stdin");
+                }
+                if let Err(e) = child_stdin.shutdown().await {
+                    tracing::debug!(error = %e, "Failed to close agent stdin");
+                }
             });
         }
 
@@ -928,8 +932,12 @@ The PR title should include the issue ID: {}
         if let Some(mut child_stdin) = child.stdin.take() {
             let prompt_bytes = prompt.to_string();
             tokio::spawn(async move {
-                let _ = child_stdin.write_all(prompt_bytes.as_bytes()).await;
-                let _ = child_stdin.shutdown().await;
+                if let Err(e) = child_stdin.write_all(prompt_bytes.as_bytes()).await {
+                    tracing::warn!(error = %e, "Failed to write prompt to agent stdin");
+                }
+                if let Err(e) = child_stdin.shutdown().await {
+                    tracing::debug!(error = %e, "Failed to close agent stdin");
+                }
             });
         }
 
