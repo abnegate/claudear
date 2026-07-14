@@ -1834,6 +1834,7 @@ impl IssueProcessor {
                         &input.resolution,
                         &input.source_name,
                         context_provider,
+                        input.attempt_id,
                     )
                     .await;
                 ProcessingOutcome::CompletedNoPr {
@@ -1855,6 +1856,7 @@ impl IssueProcessor {
                     &input.resolution,
                     &input.source_name,
                     context_provider,
+                    input.attempt_id,
                 )
                 .await
             }
@@ -1900,6 +1902,7 @@ impl IssueProcessor {
                     &input.resolution,
                     &input.source_name,
                     context_provider,
+                    input.attempt_id,
                 )
                 .await;
             if verdict.reproduced {
@@ -1926,6 +1929,7 @@ impl IssueProcessor {
                 &input.resolution,
                 &input.source_name,
                 context_provider,
+                input.attempt_id,
             )
             .await
         } else {
@@ -1935,6 +1939,7 @@ impl IssueProcessor {
                 &input.resolution,
                 &input.source_name,
                 context_provider,
+                input.attempt_id,
             )
             .await
         }
@@ -2011,9 +2016,10 @@ impl IssueProcessor {
         resolution: &RepoResolution,
         source_name: &str,
         context_provider: &dyn ContextProvider,
+        attempt_id: Option<i64>,
     ) -> VerifyResult {
         let project_dir = self.action_project_dir(resolution);
-        let context = self.build_rag_context(issue).await;
+        let context = self.build_rag_context(issue, attempt_id).await;
 
         self.record_issue_decision(
             issue,
@@ -2129,9 +2135,10 @@ impl IssueProcessor {
         resolution: &RepoResolution,
         source_name: &str,
         context_provider: &dyn ContextProvider,
+        attempt_id: Option<i64>,
     ) -> ProcessingOutcome {
         let project_dir = self.action_project_dir(resolution);
-        let context = self.build_rag_context(issue).await;
+        let context = self.build_rag_context(issue, attempt_id).await;
 
         // The inbox key is the HelpScout mailbox id when present, else the source.
         let inbox_key = issue
@@ -2236,7 +2243,9 @@ impl IssueProcessor {
 
     /// Retrieve RAG grounding context for an issue from the code index, plus any
     /// indexed Discord discussions.
-    async fn build_rag_context(&self, issue: &Issue) -> String {
+    /// Build the RAG grounding context for the action pipeline (verify/reply).
+    async fn build_rag_context(&self, issue: &Issue, attempt_id: Option<i64>) -> String {
+        let mut retrieved_items: Vec<RetrievedItem> = Vec::new();
         let mut context = String::new();
         if let Some(ref code_search) = self.code_search_service {
             let query = claudear_analysis::repo::code_index::build_code_search_query(issue);
@@ -2245,13 +2254,39 @@ impl IssueProcessor {
                 .await
             {
                 if !results.is_empty() {
+                    if let Some(id) = attempt_id {
+                        let mut rows: Vec<RetrievalUsageRecord> = Vec::with_capacity(results.len());
+                        for (rank, r) in results.iter().enumerate() {
+                            let chunk_ref = r
+                                .chunk
+                                .id
+                                .map(|i| i.to_string())
+                                .unwrap_or_else(|| r.chunk.file_path.clone());
+                            retrieved_items.push(RetrievedItem {
+                                source_kind: "code_chunk".to_string(),
+                                chunk_ref: chunk_ref.clone(),
+                                text: r.chunk.chunk_text.clone(),
+                            });
+                            rows.push(RetrievalUsageRecord::new(
+                                id,
+                                "code_chunk",
+                                chunk_ref,
+                                Some(r.chunk.file_path.clone()),
+                                rank as i64,
+                                r.score,
+                                Some(r.chunk.chunk_text.chars().count() as i64),
+                            ));
+                        }
+                        self.tracker.record_retrieval_usage(&rows).ok();
+                        self.log_retrieval_recorded(&rows);
+                    }
                     context =
                         claudear_analysis::repo::code_index::format_code_search_context(&results);
                 }
             }
         }
-        let (discord_ctx, _) = self
-            .discord_grounding_context(issue, self.config.qa.max_context_chunks, None)
+        let (discord_ctx, discord_items) = self
+            .discord_grounding_context(issue, self.config.qa.max_context_chunks, attempt_id)
             .await;
         if !discord_ctx.is_empty() {
             context = if context.is_empty() {
@@ -2259,7 +2294,17 @@ impl IssueProcessor {
             } else {
                 format!("{}\n{}", context, discord_ctx)
             };
+            if attempt_id.is_some() {
+                retrieved_items.extend(discord_items);
+            }
         }
+
+        // Score retrieval quality for this action run (opt-in, detached — never
+        // blocks the reply/verify). Mirrors the Q&A pipeline.
+        if let Some(id) = attempt_id {
+            self.spawn_retrieval_judge(id, issue, &retrieved_items);
+        }
+
         context
     }
 
