@@ -525,7 +525,6 @@ pub(crate) fn origin_reply_reference(
     })
 }
 
-
 /// Build the Discord message for a "PR created" notification.
 pub(crate) fn build_success_message(
     issue: &Issue,

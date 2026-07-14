@@ -5318,15 +5318,26 @@ mod tests {
         let tracker = claudear_storage::SqliteTracker::in_memory().unwrap();
         // Seed the original question issue and Claudear's stored answer, mapped to
         // the answer message id the follow-up will reply to.
-        let mut q_issue =
-            Issue::new("QID", "DISCORD-QID", "how does X work?", "https://d/x", "discord");
+        let mut q_issue = Issue::new(
+            "QID",
+            "DISCORD-QID",
+            "how does X work?",
+            "https://d/x",
+            "discord",
+        );
         q_issue.description = Some("how does X work in detail?".to_string());
         tracker
             .store_issue(&claudear_core::types::IssueEmbedding::from_issue(&q_issue))
             .unwrap();
-        tracker.record_attempt("discord", "QID", "DISCORD-QID").unwrap();
         tracker
-            .mark_answered("discord", "QID", "X works via the frobnicator; long answer.")
+            .record_attempt("discord", "QID", "DISCORD-QID")
+            .unwrap();
+        tracker
+            .mark_answered(
+                "discord",
+                "QID",
+                "X works via the frobnicator; long answer.",
+            )
             .unwrap();
         tracker
             .record_answer_message_ids("discord", "QID", &["ANSMSG1".to_string()])
@@ -5337,8 +5348,13 @@ mod tests {
 
         // Follow-up replying to Claudear's answer (ANSMSG1): resolves purely from
         // the DB, no Discord fetch.
-        let mut follow =
-            Issue::new("FID", "DISCORD-FID", "what about Y?", "https://d/y", "discord");
+        let mut follow = Issue::new(
+            "FID",
+            "DISCORD-FID",
+            "what about Y?",
+            "https://d/y",
+            "discord",
+        );
         follow.set_metadata("reply_to_message_id", "ANSMSG1");
         follow.set_metadata("reply_to_channel_id", "chan");
 

@@ -257,13 +257,8 @@ pub struct NotifiersConfig {
     pub helpscout: ReplyConfig,
 }
 
-/// Default for `reply_chain_enabled`: resolve reply threads into context.
-const DEFAULT_REPLY_CHAIN_ENABLED: bool = true;
-/// Default for `reply_chain_max_depth`: max ancestor messages to walk.
-const DEFAULT_REPLY_CHAIN_MAX_DEPTH: usize = 15;
-
 /// Discord source-only configuration (for issue ingestion).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DiscordSourceConfig {
     /// Discord bot token for reading messages.
@@ -287,27 +282,13 @@ pub struct DiscordSourceConfig {
     pub bot_role_id: Option<String>,
     /// When a message is a reply, resolve its reply thread into conversation
     /// context and feed it to the agent (Claudear's own answers come from the
-    /// DB; other users' messages are fetched from Discord). Defaults to true.
-    pub reply_chain_enabled: bool,
+    /// DB; other users' messages are fetched from Discord). `None` (omitted)
+    /// uses the default: enabled.
+    pub reply_chain_enabled: Option<bool>,
     /// Maximum number of ancestor messages to walk when building reply-chain
-    /// context. Bounds fetches and guards against long threads. Defaults to 15.
-    pub reply_chain_max_depth: usize,
-}
-
-impl Default for DiscordSourceConfig {
-    fn default() -> Self {
-        Self {
-            bot_token: None,
-            channel_id: None,
-            listen_channel_id: None,
-            guild_id: None,
-            poll_interval_ms: None,
-            bot_id: None,
-            bot_role_id: None,
-            reply_chain_enabled: DEFAULT_REPLY_CHAIN_ENABLED,
-            reply_chain_max_depth: DEFAULT_REPLY_CHAIN_MAX_DEPTH,
-        }
-    }
+    /// context. Bounds fetches and guards against long threads. `None` (omitted)
+    /// uses the default: 15.
+    pub reply_chain_max_depth: Option<usize>,
 }
 
 /// Discord notifier-only configuration (for outbound notifications).
@@ -3299,12 +3280,8 @@ impl Config {
             bot_role_id: src.and_then(|s| s.bot_role_id.clone()),
             // Sourced from the global `debug_logging` flag, not per-source.
             debug_logging: self.debug_logging,
-            reply_chain_enabled: src
-                .map(|s| s.reply_chain_enabled)
-                .unwrap_or(DEFAULT_REPLY_CHAIN_ENABLED),
-            reply_chain_max_depth: src
-                .map(|s| s.reply_chain_max_depth)
-                .unwrap_or(DEFAULT_REPLY_CHAIN_MAX_DEPTH),
+            reply_chain_enabled: src.and_then(|s| s.reply_chain_enabled).unwrap_or(true),
+            reply_chain_max_depth: src.and_then(|s| s.reply_chain_max_depth).unwrap_or(15),
         }
     }
 
