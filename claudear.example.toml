@@ -500,6 +500,16 @@ bot_role_id = ""
 # Polling interval in milliseconds (overrides global)
 poll_interval_ms = 300000
 
+# Reply-chain conversation context. When a user replies to a message, resolve
+# the reply thread and feed it to the agent as grounding, so follow-ups continue
+# the conversation without re-quoting. Claudear's own prior answers are read from
+# the DB; other users' messages are fetched from Discord. Defaults to true.
+reply_chain_enabled = true
+
+# Maximum number of ancestor messages to walk when building reply-chain context.
+# Bounds Discord fetches and guards against very long threads. Defaults to 15.
+reply_chain_max_depth = 15
+
 # Slack as an issue source (messages become issues)
 # Shared credentials (bot_token, channel_id) are inherited from notifiers.slack if not set here.
 
