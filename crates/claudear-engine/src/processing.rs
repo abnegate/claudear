@@ -20,12 +20,14 @@ use claudear_core::types::{
     ActionKind, ActivityLogEntry, AskRequest, ErrorPattern, Issue, ProcessingMetric,
     QaKnowledgeEntry, ReplyKind, RetrievalUsageRecord, TimelineEventStatus, VerifyResult,
 };
+use claudear_integrations::discord::DiscordClient;
 use claudear_integrations::github::GitHubClient;
 use claudear_integrations::notifier::{send_to_all_and_wait_first_reply, Notifier};
 use claudear_integrations::runner::{self, AgentRunner};
 use claudear_integrations::scm::{PrReviewState, ReviewWatcher};
 use claudear_storage::{classify_error, compute_error_hash, FixAttemptTracker};
 use serde_json::json;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::intent::{Intent, IntentClassifier};
@@ -33,6 +35,20 @@ use crate::intent::{Intent, IntentClassifier};
 /// Max concurrent agent calls when scoring retrieved chunks with the (opt-in)
 /// relevance judge — each call spawns an agent process, so keep the fan-out small.
 const RETRIEVAL_JUDGE_CONCURRENCY: usize = 4;
+
+/// Strip Discord mention tokens (`<@ID>`, `<@!ID>`, `<@&ID>`) from text and trim.
+/// Used when rendering reply-chain turns so mention noise doesn't reach the agent.
+fn strip_discord_mentions(content: &str) -> String {
+    let mut result = content.to_string();
+    while let Some(start) = result.find("<@") {
+        if let Some(end) = result[start..].find('>') {
+            result.replace_range(start..start + end + 1, "");
+        } else {
+            break;
+        }
+    }
+    result.trim().to_string()
+}
 
 #[derive(Debug, Clone)]
 struct RetrievedItem {
@@ -992,6 +1008,9 @@ impl IssueProcessor {
             json!({}),
         );
 
+        // Ground the fix in the reply thread when this issue is a reply.
+        context = self.with_reply_chain(issue, context).await;
+
         // Claude execution + ask loop
         let mut rounds: u8 = 0;
         let claude_result = loop {
@@ -1654,6 +1673,121 @@ impl IssueProcessor {
         }
     }
 
+    /// Resolve a Discord reply thread into a labelled conversation transcript to
+    /// ground the agent, or `None` when the issue is not a reply, the feature is
+    /// disabled, or nothing could be resolved.
+    ///
+    /// Walks parents newest-first: when a parent is one of Claudear's own answers
+    /// (recognised via `lookup_answer_issue`), the original question and answer
+    /// are pulled from the DB and the walk stops (that answer already
+    /// encapsulates everything upstream). Other users' messages aren't in our DB,
+    /// so they're fetched from Discord and the walk continues to their parent.
+    async fn assemble_reply_chain(&self, issue: &Issue) -> Option<String> {
+        let parent_id = issue.get_metadata::<String>("reply_to_message_id")?;
+        let discord_cfg = self.config.discord_merged();
+        if !discord_cfg.reply_chain_enabled {
+            return None;
+        }
+        let max_depth = discord_cfg.reply_chain_max_depth.max(1);
+        let mut parent_channel = issue
+            .get_metadata::<String>("reply_to_channel_id")
+            .or_else(|| issue.get_metadata::<String>("channel_id"))
+            .unwrap_or_default();
+
+        // Newest-first accumulation; reversed to chronological order at the end.
+        let mut lines_rev: Vec<String> = Vec::new();
+        let mut client: Option<DiscordClient> = None;
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut current_id = Some(parent_id);
+        let mut depth = 0usize;
+
+        while let Some(pid) = current_id.take() {
+            if depth >= max_depth || !seen.insert(pid.clone()) {
+                break;
+            }
+            depth += 1;
+
+            // Claudear's own answer? Pull question + answer from the DB and stop.
+            if let Ok(Some((src, answered_issue_id))) = self.tracker.lookup_answer_issue(&pid) {
+                if let Ok(Some(att)) = self.tracker.get_attempt(&src, &answered_issue_id) {
+                    if let Some(ans) = att.error_message.filter(|a| !a.trim().is_empty()) {
+                        lines_rev.push(format!("[Claudear]: {}", ans.trim()));
+                    }
+                }
+                if let Ok(Some(emb)) = self.tracker.get_embedding(&src, &answered_issue_id) {
+                    let question = emb
+                        .description
+                        .filter(|d| !d.trim().is_empty())
+                        .or(emb.title)
+                        .unwrap_or_default();
+                    let question = strip_discord_mentions(question.trim());
+                    if !question.is_empty() {
+                        lines_rev.push(format!("[User]: {}", question));
+                    }
+                }
+                break;
+            }
+
+            // Otherwise it's another user's message not in our DB: fetch it.
+            let fetch_client = match client.as_ref() {
+                Some(c) => c,
+                None => {
+                    let token = discord_cfg.bot_token.as_ref().map(|s| s.expose())?;
+                    match DiscordClient::new(token) {
+                        Ok(c) => {
+                            client = Some(c);
+                            client.as_ref().unwrap()
+                        }
+                        Err(_) => break,
+                    }
+                }
+            };
+
+            match fetch_client.get_message(&parent_channel, &pid).await {
+                Ok(msg) => {
+                    let name = msg
+                        .author
+                        .as_ref()
+                        .map(|a| a.username.clone())
+                        .unwrap_or_else(|| "user".to_string());
+                    let content = strip_discord_mentions(msg.content.trim());
+                    if !content.is_empty() {
+                        lines_rev.push(format!("[User {}]: {}", name, content));
+                    }
+                    // Continue to this message's own parent, if it is a reply.
+                    match msg.message_reference {
+                        Some(reference) => {
+                            if let Some(ch) = reference.channel_id {
+                                parent_channel = ch;
+                            }
+                            current_id = reference.message_id;
+                        }
+                        None => current_id = None,
+                    }
+                }
+                // Deleted / no permission: stop gracefully with what we have.
+                Err(_) => break,
+            }
+        }
+
+        if lines_rev.is_empty() {
+            return None;
+        }
+        lines_rev.reverse();
+        let mut out = String::from("## Prior conversation (Discord reply thread)\n");
+        out.push_str(&lines_rev.join("\n"));
+        Some(out)
+    }
+
+    /// Prepend the resolved reply-chain transcript (if any) to `context`.
+    async fn with_reply_chain(&self, issue: &Issue, context: String) -> String {
+        match self.assemble_reply_chain(issue).await {
+            Some(chain) if context.is_empty() => chain,
+            Some(chain) => format!("{}\n\n{}", chain, context),
+            None => context,
+        }
+    }
+
     /// Answer a pure question with RAG-grounded context, read-only (no PR).
     async fn answer_question_issue(
         &self,
@@ -1707,6 +1841,9 @@ impl IssueProcessor {
             };
         }
 
+        // Ground the answer in the reply thread when this question is a reply.
+        let context = self.with_reply_chain(issue, context).await;
+
         self.record_issue_decision(
             issue,
             "question_detected",
@@ -1725,11 +1862,25 @@ impl IssueProcessor {
 
         match answer_result {
             Ok(Ok(answer)) => {
-                if let Err(e) = self.notifier.notify_answer(issue, &answer).await {
-                    tracing::warn!(short_id = %issue.short_id, error = %e, "Failed to deliver answer");
+                match self.notifier.notify_answer(issue, &answer).await {
+                    Ok(sent_ids) => {
+                        if !sent_ids.is_empty() {
+                            if let Err(e) = self.tracker.record_answer_message_ids(
+                                source_name,
+                                &issue.id,
+                                &sent_ids,
+                            ) {
+                                tracing::warn!(short_id = %issue.short_id, error = %e, "Failed to record answer message ids");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(short_id = %issue.short_id, error = %e, "Failed to deliver answer");
+                    }
                 }
-                let summary: String = answer.chars().take(500).collect();
-                if let Err(e) = self.tracker.mark_answered(source_name, &issue.id, &summary) {
+                // Store the FULL answer so it can ground a later reply-chain
+                // continuation; truncation is a display/send concern only.
+                if let Err(e) = self.tracker.mark_answered(source_name, &issue.id, &answer) {
                     tracing::warn!(short_id = %issue.short_id, error = %e, "Failed to mark answered");
                 }
                 self.record_issue_decision(
@@ -2097,6 +2248,9 @@ impl IssueProcessor {
             .unwrap_or_else(|| source_name.to_string());
         let guideline = self.config.reply().template_for(Some(&inbox_key));
 
+        // Ground the reply in the reply thread when this issue is a reply.
+        let context = self.with_reply_chain(issue, context).await;
+
         self.record_issue_decision(
             issue,
             "reply_started",
@@ -2122,23 +2276,47 @@ impl IssueProcessor {
             Ok(Ok(reply)) => {
                 // Deliver: conversational sources go via the notifier; tracker
                 // sources post a comment on the ticket (falling back to notifier).
-                let delivered = if qa_eligible_source(source_name) {
-                    self.notifier.notify_answer(issue, &reply).await
+                // Capture any sent message ids so a later reply maps back here.
+                let mut answer_ids: Vec<String> = Vec::new();
+                let delivered: Result<()> = if qa_eligible_source(source_name) {
+                    match self.notifier.notify_answer(issue, &reply).await {
+                        Ok(ids) => {
+                            answer_ids = ids;
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
+                    }
                 } else {
                     match context_provider.post_reply(&issue.id, &reply).await {
                         Ok(()) => Ok(()),
                         Err(e) => {
                             tracing::warn!(short_id = %issue.short_id, error = %e, "post_reply failed; falling back to notifier");
-                            self.notifier.notify_answer(issue, &reply).await
+                            match self.notifier.notify_answer(issue, &reply).await {
+                                Ok(ids) => {
+                                    answer_ids = ids;
+                                    Ok(())
+                                }
+                                Err(e) => Err(e),
+                            }
                         }
                     }
                 };
                 if let Err(e) = delivered {
                     tracing::warn!(short_id = %issue.short_id, error = %e, "Failed to deliver reply");
                 }
+                if !answer_ids.is_empty() {
+                    if let Err(e) =
+                        self.tracker
+                            .record_answer_message_ids(source_name, &issue.id, &answer_ids)
+                    {
+                        tracing::warn!(short_id = %issue.short_id, error = %e, "Failed to record answer message ids");
+                    }
+                }
 
+                // Store the FULL reply for reply-chain grounding; the truncated
+                // `summary` is only for the action-run preview below.
                 let summary: String = reply.chars().take(500).collect();
-                let _ = self.tracker.mark_answered(source_name, &issue.id, &summary);
+                let _ = self.tracker.mark_answered(source_name, &issue.id, &reply);
                 let _ = self.tracker.record_action_run(
                     source_name,
                     &issue.id,
@@ -4904,6 +5082,101 @@ mod tests {
         // Assessment comment would be posted separately, but both should be valid markdown
         assert!(confidence_comment.starts_with("##"));
         assert!(confidence_comment.contains("85/100"));
+    }
+
+    // --- Reply-chain assembly ---
+
+    #[test]
+    fn test_strip_discord_mentions() {
+        assert_eq!(
+            strip_discord_mentions("<@123> hey <@!456> there <@&789>!"),
+            "hey  there !"
+        );
+        assert_eq!(strip_discord_mentions("  no mentions  "), "no mentions");
+        // Unterminated mention is left as-is (no infinite loop).
+        assert_eq!(strip_discord_mentions("<@123 broken"), "<@123 broken");
+    }
+
+    fn make_reply_chain_processor(tracker: Arc<dyn FixAttemptTracker>) -> IssueProcessor {
+        let notifier: Arc<dyn Notifier> =
+            Arc::new(claudear_integrations::notifier::ConsoleNotifier::new());
+        let agent: Arc<dyn claudear_integrations::runner::AgentRunner> = Arc::new(DummyAgent);
+        let feedback_analyzer = Arc::new(tokio::sync::Mutex::new(
+            claudear_analysis::feedback::FeedbackAnalyzer::new(),
+        ));
+        IssueProcessor {
+            config: Config::default(),
+            tracker,
+            notifier,
+            agent,
+            qa_agent: None,
+            inferrer: None,
+            embedding_client: None,
+            issue_embedding_service: None,
+            code_search_service: None,
+            discord_search_service: None,
+            feedback_analyzer,
+            review_watcher: None,
+            user_registry: claudear_config::users::UserRegistry::new(
+                std::collections::HashMap::new(),
+            ),
+            github_client: None,
+            llm_analyzer: None,
+            intent_classifier: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_assemble_reply_chain_claudear_branch_from_db() {
+        use claudear_storage::EmbeddingStore;
+        let tracker = claudear_storage::SqliteTracker::in_memory().unwrap();
+        // Seed the original question issue and Claudear's stored answer, mapped to
+        // the answer message id the follow-up will reply to.
+        let mut q_issue =
+            Issue::new("QID", "DISCORD-QID", "how does X work?", "https://d/x", "discord");
+        q_issue.description = Some("how does X work in detail?".to_string());
+        tracker
+            .store_issue(&claudear_core::types::IssueEmbedding::from_issue(&q_issue))
+            .unwrap();
+        tracker.record_attempt("discord", "QID", "DISCORD-QID").unwrap();
+        tracker
+            .mark_answered("discord", "QID", "X works via the frobnicator; long answer.")
+            .unwrap();
+        tracker
+            .record_answer_message_ids("discord", "QID", &["ANSMSG1".to_string()])
+            .unwrap();
+
+        let tracker: Arc<dyn FixAttemptTracker> = Arc::new(tracker);
+        let processor = make_reply_chain_processor(tracker);
+
+        // Follow-up replying to Claudear's answer (ANSMSG1): resolves purely from
+        // the DB, no Discord fetch.
+        let mut follow =
+            Issue::new("FID", "DISCORD-FID", "what about Y?", "https://d/y", "discord");
+        follow.set_metadata("reply_to_message_id", "ANSMSG1");
+        follow.set_metadata("reply_to_channel_id", "chan");
+
+        let chain = processor
+            .assemble_reply_chain(&follow)
+            .await
+            .expect("reply chain resolved from DB");
+        assert!(chain.contains("## Prior conversation"));
+        assert!(chain.contains("[Claudear]: X works via the frobnicator"));
+        assert!(chain.contains("[User]: how does X work in detail?"));
+        // Chronological order: the question (older) precedes the answer (newer).
+        assert!(chain.find("[User]:").unwrap() < chain.find("[Claudear]:").unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_assemble_reply_chain_non_reply_returns_none() {
+        let tracker: Arc<dyn FixAttemptTracker> =
+            Arc::new(claudear_storage::SqliteTracker::in_memory().unwrap());
+        let processor = make_reply_chain_processor(tracker);
+        // make_test_issue carries no reply_to_message_id metadata.
+        assert!(processor
+            .assemble_reply_chain(&make_test_issue())
+            .await
+            .is_none());
     }
 
     // --- Dummy test helpers ---

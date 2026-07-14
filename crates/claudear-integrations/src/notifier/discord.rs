@@ -130,6 +130,8 @@ const MAX_SHORT_ID_LENGTH: usize = 64;
 const MAX_SOURCE_LENGTH: usize = 32;
 const MAX_URL_LENGTH: usize = 2000;
 const MAX_DESCRIPTION_LENGTH: usize = 2048;
+/// Discord's hard limit on plain message `content` is 2000 characters.
+const MAX_CONTENT_LENGTH: usize = 2000;
 
 /// Truncate a string to the specified maximum length, adding "..." if truncated.
 fn truncate_string(s: &str, max_len: usize) -> String {
@@ -523,48 +525,6 @@ pub(crate) fn origin_reply_reference(
     })
 }
 
-pub(crate) fn build_answer_messages(
-    issue: &Issue,
-    answer: &str,
-    mention: Option<String>,
-) -> Vec<DiscordMessage> {
-    let short_id = truncate_string(&issue.short_id, MAX_SHORT_ID_LENGTH);
-    let chunks = chunk_text(answer, MAX_DESCRIPTION_LENGTH, MAX_ANSWER_CHUNKS);
-    let total = chunks.len();
-
-    chunks
-        .into_iter()
-        .enumerate()
-        .map(|(i, chunk)| {
-            let title = if i == 0 {
-                Some(format!("\u{1F4AC} Answer: {}", short_id))
-            } else {
-                None
-            };
-            let footer_text = if total > 1 {
-                format!("Claudear \u{00B7} {}/{}", i + 1, total)
-            } else {
-                "Claudear".to_string()
-            };
-            DiscordMessage {
-                content: if i == 0 { mention.clone() } else { None },
-                embeds: Some(vec![DiscordEmbed {
-                    title,
-                    description: Some(chunk),
-                    url: if i == 0 {
-                        Some(truncate_string(&issue.url, MAX_URL_LENGTH))
-                    } else {
-                        None
-                    },
-                    color: Some(0x9b59b6), // Purple
-                    fields: None,
-                    footer: Some(DiscordFooter { text: footer_text }),
-                    timestamp: Some(timestamp()),
-                }]),
-            }
-        })
-        .collect()
-}
 
 /// Build the Discord message for a "PR created" notification.
 pub(crate) fn build_success_message(
@@ -1362,23 +1322,34 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
         Ok(())
     }
 
-    async fn notify_answer(&self, issue: &Issue, answer: &str) -> Result<()> {
+    async fn notify_answer(&self, issue: &Issue, answer: &str) -> Result<Vec<String>> {
         if !self.has_delivery_path() {
             return Err(Error::notifier(
                 "discord",
                 "No delivery path configured: need either a webhook URL or a bot token with channel ID",
             ));
         }
-        let mention = self.get_user_mention_for_issue(issue);
-        // Reply to the original question with the first message so the answer is
-        // threaded to it; any continuation chunks follow as normal messages.
-        for (i, message) in build_answer_messages(issue, answer, mention)
+        // Plain-text answer, keeping the historical "Answer for <id>:" prefix,
+        // chunked to fit Discord's message limit. The first chunk is sent as a
+        // native reply to the original question so the answer is threaded under
+        // it (and the asker is pinged by the reply). We return the ids of the
+        // sent messages so a later reply to any chunk maps back to the issue.
+        let short_id = truncate_string(&issue.short_id, MAX_SHORT_ID_LENGTH);
+        let body = format!("Answer for {}:\n{}", short_id, answer);
+        let mut ids = Vec::new();
+        for (i, chunk) in chunk_text(&body, MAX_CONTENT_LENGTH, MAX_ANSWER_CHUNKS)
             .into_iter()
             .enumerate()
         {
-            let _ = self.send_to_issue_channel(issue, message, i == 0).await?;
+            let message = DiscordMessage {
+                content: Some(chunk),
+                embeds: None,
+            };
+            if let Some(info) = self.send_to_issue_channel(issue, message, i == 0).await? {
+                ids.push(info.message_id);
+            }
         }
-        Ok(())
+        Ok(ids)
     }
 
     async fn notify_urgent_issues(&self, issues: &[Issue]) -> Result<()> {
@@ -1607,29 +1578,6 @@ mod tests {
         let chunks = chunk_text(&text, 20, 2);
         assert_eq!(chunks.len(), 2);
         assert!(chunks.last().unwrap().contains("truncated"));
-    }
-
-    #[test]
-    fn test_build_answer_messages_first_has_title_and_mention() {
-        let issue = Issue::new("123", "DISCORD-123", "Q", "https://x/y", "discord");
-        let msgs = build_answer_messages(&issue, "a short answer", Some("<@1>".to_string()));
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].content.as_deref(), Some("<@1>"));
-        let embed = &msgs[0].embeds.as_ref().unwrap()[0];
-        assert!(embed.title.as_ref().unwrap().contains("DISCORD-123"));
-        assert_eq!(embed.description.as_deref(), Some("a short answer"));
-    }
-
-    #[test]
-    fn test_build_answer_messages_multichunk_only_first_has_mention() {
-        let issue = Issue::new("123", "DISCORD-123", "Q", "https://x/y", "discord");
-        let long = "b".repeat(MAX_DESCRIPTION_LENGTH * 2 + 100);
-        let msgs = build_answer_messages(&issue, &long, Some("<@1>".to_string()));
-        assert!(msgs.len() >= 2);
-        assert_eq!(msgs[0].content.as_deref(), Some("<@1>"));
-        assert!(msgs[1].content.is_none());
-        // Continuation embeds carry no title.
-        assert!(msgs[1].embeds.as_ref().unwrap()[0].title.is_none());
     }
 
     // --- Native reply reference (threading answers to the question) ---

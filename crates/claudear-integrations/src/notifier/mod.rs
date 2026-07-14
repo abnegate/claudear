@@ -172,11 +172,14 @@ pub trait Notifier: Send + Sync {
 
     /// Send a RAG-grounded answer to a question back to the originating channel.
     ///
-    /// Default implementation falls back to a plain status message; channels that
-    /// can reply to a specific conversation (e.g. Discord) should override this.
-    async fn notify_answer(&self, issue: &Issue, answer: &str) -> Result<()> {
+    /// Returns the ids of any messages the channel sent for this answer (used to
+    /// map a later reply back to the issue). The default falls back to a plain
+    /// status message and returns no ids; channels that can reply to a specific
+    /// conversation (e.g. Discord) should override this and return their ids.
+    async fn notify_answer(&self, issue: &Issue, answer: &str) -> Result<Vec<String>> {
         self.notify_status(&format!("Answer for {}:\n{}", issue.short_id, answer))
-            .await
+            .await?;
+        Ok(Vec::new())
     }
 
     /// Notify that a repo swap is happening for an issue.
@@ -314,16 +317,21 @@ impl Notifier for CompositeNotifier {
         Ok(())
     }
 
-    async fn notify_answer(&self, issue: &Issue, answer: &str) -> Result<()> {
-        let issue = issue.clone();
-        let answer = answer.to_string();
-        self.broadcast(|n| {
-            let issue = issue.clone();
-            let answer = answer.clone();
-            async move { n.notify_answer(&issue, &answer).await }
-        })
-        .await;
-        Ok(())
+    async fn notify_answer(&self, issue: &Issue, answer: &str) -> Result<Vec<String>> {
+        // Deliver to every notifier, tolerating per-notifier failures (matching
+        // `broadcast` semantics), and collect the sent message ids so callers can
+        // map a later reply back to the issue (only reply-capable channels like
+        // Discord contribute ids).
+        let mut ids = Vec::new();
+        for n in &self.notifiers {
+            match n.notify_answer(issue, answer).await {
+                Ok(mut sent) => ids.append(&mut sent),
+                Err(e) => {
+                    tracing::warn!(component = n.name(), error = %e, "notify_answer failed");
+                }
+            }
+        }
+        Ok(ids)
     }
 
     async fn notify_merged(&self, issue: &Issue, pr_url: &str) -> Result<()> {
