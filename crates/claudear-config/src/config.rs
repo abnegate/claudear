@@ -280,6 +280,15 @@ pub struct DiscordSourceConfig {
     /// alongside `bot_id` so the source ingests the message regardless of which
     /// form the sender picked from autocomplete.
     pub bot_role_id: Option<String>,
+    /// When a message is a reply, resolve its reply thread into conversation
+    /// context and feed it to the agent (Claudear's own answers come from the
+    /// DB; other users' messages are fetched from Discord). `None` (omitted)
+    /// uses the default: enabled.
+    pub reply_chain_enabled: Option<bool>,
+    /// Maximum number of ancestor messages to walk when building reply-chain
+    /// context. Bounds fetches and guards against long threads. `None` (omitted)
+    /// uses the default: 15.
+    pub reply_chain_max_depth: Option<usize>,
 }
 
 /// Discord notifier-only configuration (for outbound notifications).
@@ -1269,6 +1278,11 @@ pub struct DiscordConfig {
     pub bot_role_id: Option<String>,
     /// Verbose per-message polling diagnostics for the Discord source.
     pub debug_logging: bool,
+    /// Resolve reply threads into conversation context (see
+    /// `DiscordSourceConfig::reply_chain_enabled`).
+    pub reply_chain_enabled: bool,
+    /// Maximum ancestor messages to walk when building reply-chain context.
+    pub reply_chain_max_depth: usize,
 }
 
 /// Email (SMTP) notification configuration.
@@ -3266,6 +3280,8 @@ impl Config {
             bot_role_id: src.and_then(|s| s.bot_role_id.clone()),
             // Sourced from the global `debug_logging` flag, not per-source.
             debug_logging: self.debug_logging,
+            reply_chain_enabled: src.and_then(|s| s.reply_chain_enabled).unwrap_or(true),
+            reply_chain_max_depth: src.and_then(|s| s.reply_chain_max_depth).unwrap_or(15),
         }
     }
 

@@ -1342,6 +1342,74 @@ impl AttemptTracker for SqliteTracker {
         Ok(())
     }
 
+    fn record_answer_message_ids(
+        &self,
+        source: &str,
+        issue_id: &str,
+        message_ids: &[String],
+    ) -> Result<()> {
+        if message_ids.is_empty() {
+            return Ok(());
+        }
+        let conn = self.acquire_lock()?;
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT answer_message_ids FROM fix_attempts WHERE source = ?1 AND issue_id = ?2",
+                params![source, issue_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten();
+        let mut ids: Vec<String> = existing
+            .as_deref()
+            .unwrap_or("")
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        for id in message_ids {
+            if !ids.iter().any(|existing| existing == id) {
+                ids.push(id.clone());
+            }
+        }
+        let packed = format!(",{},", ids.join(","));
+        conn.execute(
+            r#"
+            UPDATE fix_attempts
+            SET answer_message_ids = ?
+            WHERE source = ? AND issue_id = ?
+            "#,
+            params![packed, source, issue_id],
+        )?;
+        Ok(())
+    }
+
+    fn lookup_answer_issue(&self, message_id: &str) -> Result<Option<(String, String)>> {
+        if message_id.is_empty() {
+            return Ok(None);
+        }
+        let escaped = message_id
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%,{},%", escaped);
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare_cached(
+            r#"
+            SELECT source, issue_id
+            FROM fix_attempts
+            WHERE answer_message_ids LIKE ? ESCAPE '\'
+            LIMIT 1
+            "#,
+        )?;
+        let result = stmt
+            .query_row(params![pattern], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .ok();
+        Ok(result)
+    }
+
     fn get_retryable_issues(&self, max_retries: u32) -> Result<Vec<FixAttempt>> {
         let conn = self.acquire_lock()?;
         let mut stmt = conn.prepare_cached(
@@ -9578,6 +9646,58 @@ mod tests {
         assert_eq!(attempt.short_id, "PROJ-123");
         assert_eq!(attempt.source, "linear");
         assert_eq!(attempt.status, FixAttemptStatus::Pending);
+    }
+
+    #[test]
+    fn test_answer_message_ids_round_trip() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_attempt("discord", "999000111", "DISCORD-99900011")
+            .unwrap();
+
+        let chunk_ids = vec!["555111".to_string(), "555222".to_string()];
+        tracker
+            .record_answer_message_ids("discord", "999000111", &chunk_ids)
+            .unwrap();
+
+        // Any chunk id resolves back to the (source, issue_id).
+        assert_eq!(
+            tracker.lookup_answer_issue("555111").unwrap(),
+            Some(("discord".to_string(), "999000111".to_string()))
+        );
+        assert_eq!(
+            tracker.lookup_answer_issue("555222").unwrap(),
+            Some(("discord".to_string(), "999000111".to_string()))
+        );
+
+        // A partial id must NOT match (delimiter guard).
+        assert_eq!(tracker.lookup_answer_issue("5551").unwrap(), None);
+        // An unknown id resolves to nothing.
+        assert_eq!(tracker.lookup_answer_issue("777").unwrap(), None);
+        // Empty input is safe.
+        assert_eq!(tracker.lookup_answer_issue("").unwrap(), None);
+        tracker
+            .record_answer_message_ids("discord", "999000111", &[])
+            .unwrap();
+
+        // A LIKE wildcard input must not match (wildcards are escaped).
+        assert_eq!(tracker.lookup_answer_issue("%").unwrap(), None);
+
+        // Recording again appends without dropping earlier ids, and re-recording
+        // an existing id does not duplicate it.
+        tracker
+            .record_answer_message_ids("discord", "999000111", &["555333".to_string()])
+            .unwrap();
+        tracker
+            .record_answer_message_ids("discord", "999000111", &["555111".to_string()])
+            .unwrap();
+        for id in ["555111", "555222", "555333"] {
+            assert_eq!(
+                tracker.lookup_answer_issue(id).unwrap(),
+                Some(("discord".to_string(), "999000111".to_string())),
+                "id {id} should still resolve after append"
+            );
+        }
     }
 
     #[test]

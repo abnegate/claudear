@@ -1362,7 +1362,7 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
         Ok(())
     }
 
-    async fn notify_answer(&self, issue: &Issue, answer: &str) -> Result<()> {
+    async fn notify_answer(&self, issue: &Issue, answer: &str) -> Result<Vec<String>> {
         if !self.has_delivery_path() {
             return Err(Error::notifier(
                 "discord",
@@ -1371,14 +1371,19 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
         }
         let mention = self.get_user_mention_for_issue(issue);
         // Reply to the original question with the first message so the answer is
-        // threaded to it; any continuation chunks follow as normal messages.
+        // threaded to it; any continuation chunks follow as normal messages. We
+        // return the ids of the sent messages so a later reply to any chunk maps
+        // back to the issue for reply-chain context.
+        let mut ids = Vec::new();
         for (i, message) in build_answer_messages(issue, answer, mention)
             .into_iter()
             .enumerate()
         {
-            let _ = self.send_to_issue_channel(issue, message, i == 0).await?;
+            if let Some(info) = self.send_to_issue_channel(issue, message, i == 0).await? {
+                ids.push(info.message_id);
+            }
         }
-        Ok(())
+        Ok(ids)
     }
 
     async fn notify_urgent_issues(&self, issues: &[Issue]) -> Result<()> {
