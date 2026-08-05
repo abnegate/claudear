@@ -543,6 +543,18 @@ impl IssueProcessor {
                     "require_red_green set but no test tool detected; skipping red-green"
                 );
             } else {
+                self.record_timeline_event(
+                    issue,
+                    TimelineEventStatus::RedGreenStarted,
+                    format!("Writing failing test for {}", issue.short_id),
+                    json!({}),
+                );
+                self.record_issue_decision(
+                    issue,
+                    "red_green_started",
+                    format!("Red phase: authoring failing test for {}", issue.short_id),
+                    json!({}),
+                );
                 let context = self.build_rag_context(issue, attempt_id).await;
                 let prompt = build_failing_test_prompt(issue, &context);
                 match self
@@ -564,11 +576,45 @@ impl IssueProcessor {
                         if !is_red {
                             let error = "Red-green: authored test did not fail on the unfixed code; could not confirm reproduction".to_string();
                             tracing::warn!(short_id = %issue.short_id, "{}", error);
+                            let _ = self.tracker.record_action_run(
+                                source_name,
+                                &issue.id,
+                                &issue.short_id,
+                                "red_green",
+                                "not_reproduced",
+                                &error,
+                            );
+                            self.record_issue_decision(
+                                issue,
+                                "red_green_not_reproduced",
+                                error.clone(),
+                                json!({}),
+                            );
                             self.tracker.mark_failed(source_name, &issue.id, &error).ok();
                             self.cleanup_worktree(resolution, issue, &project_dir).await;
                             return Ok(ProcessingOutcome::Failed { error });
                         }
                         tracing::info!(short_id = %issue.short_id, "Red-green: failing test confirmed (red)");
+                        let _ = self.tracker.record_action_run(
+                            source_name,
+                            &issue.id,
+                            &issue.short_id,
+                            "red_green",
+                            "red_confirmed",
+                            "Authored test fails on unfixed code",
+                        );
+                        self.record_timeline_event(
+                            issue,
+                            TimelineEventStatus::RedConfirmed,
+                            format!("Failing test confirmed (red) for {}", issue.short_id),
+                            json!({}),
+                        );
+                        self.record_issue_decision(
+                            issue,
+                            "red_confirmed",
+                            format!("Red confirmed: test fails on unfixed code for {}", issue.short_id),
+                            json!({}),
+                        );
                     }
                     Err(e) => {
                         // Agent infra error: skip the red gate rather than fail the attempt.
@@ -838,13 +884,41 @@ impl IssueProcessor {
                         let gate = self.config.evaluation.fail_on_regression
                             || self.config.evaluation.require_red_green;
                         regression_gate_tripped = gate && eval_result.has_regressions();
-                        if regression_gate_tripped
-                            && self.config.evaluation.require_red_green
-                            && eval_result.has_new_test_failures()
-                        {
-                            regression_reason =
-                                "Red-green: authored test still fails after the fix (not green)"
-                                    .to_string();
+                        if self.config.evaluation.require_red_green {
+                            if regression_gate_tripped && eval_result.has_new_test_failures() {
+                                regression_reason =
+                                    "Red-green: authored test still fails after the fix (not green)"
+                                        .to_string();
+                                let _ = self.tracker.record_action_run(
+                                    source_name,
+                                    &issue.id,
+                                    &issue.short_id,
+                                    "red_green",
+                                    "not_green",
+                                    &regression_reason,
+                                );
+                            } else if !eval_result.has_new_test_failures() {
+                                let _ = self.tracker.record_action_run(
+                                    source_name,
+                                    &issue.id,
+                                    &issue.short_id,
+                                    "red_green",
+                                    "green_confirmed",
+                                    "Authored test passes after the fix",
+                                );
+                                self.record_timeline_event(
+                                    issue,
+                                    TimelineEventStatus::GreenConfirmed,
+                                    format!("Test passes after fix (green) for {}", issue.short_id),
+                                    json!({}),
+                                );
+                                self.record_issue_decision(
+                                    issue,
+                                    "green_confirmed",
+                                    format!("Green confirmed: test passes after fix for {}", issue.short_id),
+                                    json!({}),
+                                );
+                            }
                         }
 
                         // Post evaluation comment on PR
