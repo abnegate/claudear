@@ -168,6 +168,42 @@ pub struct ProviderConfig {
     /// Provider-specific extra configuration.
     #[serde(default)]
     pub extra: std::collections::HashMap<String, serde_json::Value>,
+    /// MCP servers to attach to agent runs, keyed by server name. Gated per-run by sources.
+    #[serde(default)]
+    pub mcp: std::collections::HashMap<String, McpServerConfig>,
+}
+
+/// A single MCP server serialized into the agent's `.mcp.json` at run time.
+/// Reference secrets via `${VAR}` in `env` so they stay out of the config file.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpServerConfig {
+    /// Command for a stdio server, e.g. "uvx" or "npx".
+    pub command: Option<String>,
+    /// Arguments passed to `command`.
+    pub args: Vec<String>,
+    /// Environment for the server process. Values may contain `${VAR}` references.
+    pub env: std::collections::HashMap<String, String>,
+    /// URL for an HTTP/SSE transport server (alternative to `command`).
+    pub url: Option<String>,
+    /// Transport type: "stdio" (default when `command` is set), "http", or "sse".
+    #[serde(rename = "type")]
+    pub transport: Option<String>,
+    /// Headers for an HTTP/SSE transport server.
+    pub headers: std::collections::HashMap<String, String>,
+    /// Issue sources this server attaches for. Empty means all sources.
+    pub sources: Vec<String>,
+}
+
+impl McpServerConfig {
+    /// Whether this server attaches for a run from `source`. Empty sources means all.
+    pub fn matches_source(&self, source: Option<&str>) -> bool {
+        match source {
+            Some(s) => self.sources.is_empty() || self.sources.iter().any(|allowed| allowed == s),
+            // Runs without an issue never attach MCP.
+            None => false,
+        }
+    }
 }
 
 /// Experiment configuration for A/B testing providers.
@@ -3531,6 +3567,45 @@ mod tests {
             Some("warm and apologetic")
         );
         assert_eq!(cfg.reply().template_for(Some("x")), Some("be nice"));
+    }
+
+    #[test]
+    fn test_mcp_config_parses_from_toml() {
+        let toml = r#"
+            [agent.providers.claude.mcp.appwrite]
+            command = "uvx"
+            args = ["mcp-server-appwrite", "--databases"]
+            sources = ["helpscout"]
+            [agent.providers.claude.mcp.appwrite.env]
+            APPWRITE_ENDPOINT = "https://fra.cloud.appwrite.io/v1"
+            APPWRITE_API_KEY = "${APPWRITE_API_KEY}"
+        "#;
+        let cfg: Config = toml::from_str(toml).expect("parse");
+        let provider = cfg.agent.providers.get("claude").expect("provider");
+        let appwrite = provider.mcp.get("appwrite").expect("mcp server");
+        assert_eq!(appwrite.command.as_deref(), Some("uvx"));
+        assert_eq!(appwrite.sources, vec!["helpscout".to_string()]);
+        assert_eq!(
+            appwrite.env.get("APPWRITE_API_KEY").map(String::as_str),
+            Some("${APPWRITE_API_KEY}")
+        );
+    }
+
+    #[test]
+    fn test_mcp_matches_source() {
+        let helpscout_only = McpServerConfig {
+            sources: vec!["helpscout".to_string()],
+            ..Default::default()
+        };
+        assert!(helpscout_only.matches_source(Some("helpscout")));
+        assert!(!helpscout_only.matches_source(Some("discord")));
+        assert!(!helpscout_only.matches_source(None));
+
+        let all_sources = McpServerConfig::default();
+        assert!(all_sources.matches_source(Some("discord")));
+        assert!(all_sources.matches_source(Some("sentry")));
+        // Runs without an issue never attach, even when unrestricted.
+        assert!(!all_sources.matches_source(None));
     }
 
     #[test]

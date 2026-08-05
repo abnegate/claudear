@@ -187,6 +187,7 @@ pub fn build_provider_runner(
                 .and_then(|p| p.binary.clone())
                 .unwrap_or_else(|| "claude".to_string()),
             env: provider.map(|p| p.env.clone()).unwrap_or_default(),
+            mcp: provider.map(|p| p.mcp.clone()).unwrap_or_default(),
         },
         tracker,
     );
