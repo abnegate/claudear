@@ -2,6 +2,7 @@
 
 use super::{AgentRunner, ProviderCapabilities};
 use async_trait::async_trait;
+use claudear_config::McpServerConfig;
 use claudear_core::error::{Error, Result};
 use claudear_core::templates::{TemplateContext, TemplateLoader, TemplateRenderer};
 use claudear_core::types::{
@@ -241,6 +242,9 @@ pub struct ClaudeRunnerConfig {
     pub binary: String,
     /// Extra environment variables to set when spawning the agent process.
     pub env: HashMap<String, String>,
+    /// MCP servers to attach, keyed by server name. Attachment is gated per-run
+    /// by each server's `sources` list against the issue source.
+    pub mcp: HashMap<String, McpServerConfig>,
 }
 
 impl Default for ClaudeRunnerConfig {
@@ -254,6 +258,7 @@ impl Default for ClaudeRunnerConfig {
             skip_permissions: false,
             binary: "claude".to_string(),
             env: HashMap::new(),
+            mcp: HashMap::new(),
         }
     }
 }
@@ -316,6 +321,7 @@ impl ClaudeAgentRunner {
             issue_identifier,
             env,
             project_dir,
+            Some("linear"),
         )
         .await
     }
@@ -581,7 +587,8 @@ The PR title should include the issue ID: {}
         project_dir: &Path,
     ) -> Result<AgentResult> {
         let (env, label) = self.prepare_env_and_label(issue);
-        self.execute_with_env(prompt, label, env, project_dir).await
+        self.execute_with_env(prompt, label, env, project_dir, issue.map(|i| i.source.as_str()))
+            .await
     }
 
     async fn execute_with_env(
@@ -590,8 +597,9 @@ The PR title should include the issue ID: {}
         label: &str,
         env: HashMap<String, String>,
         project_dir: &Path,
+        source: Option<&str>,
     ) -> Result<AgentResult> {
-        self.execute_with_env_and_attempt(prompt, label, env, None, project_dir, true)
+        self.execute_with_env_and_attempt(prompt, label, env, None, project_dir, true, source)
             .await
     }
 
@@ -721,7 +729,15 @@ The PR title should include the issue ID: {}
         let prompt = build_verify_prompt(issue, context);
         let (env, _) = self.prepare_env_and_label(Some(issue));
         let result = self
-            .execute_with_env_and_attempt(&prompt, &issue.short_id, env, None, project_dir, false)
+            .execute_with_env_and_attempt(
+                &prompt,
+                &issue.short_id,
+                env,
+                None,
+                project_dir,
+                false,
+                Some(&issue.source),
+            )
             .await?;
         Ok(parse_verify_result(&result.output))
     }
@@ -739,7 +755,15 @@ The PR title should include the issue ID: {}
         let prompt = build_reply_prompt(issue, context, guideline, kind);
         let (env, _) = self.prepare_env_and_label(Some(issue));
         let result = self
-            .execute_with_env_and_attempt(&prompt, &issue.short_id, env, None, project_dir, false)
+            .execute_with_env_and_attempt(
+                &prompt,
+                &issue.short_id,
+                env,
+                None,
+                project_dir,
+                false,
+                Some(&issue.source),
+            )
             .await?;
         if result.success || !result.output.trim().is_empty() {
             Ok(result.output)
@@ -752,6 +776,49 @@ The PR title should include the issue ID: {}
         }
     }
 
+    /// Render matched MCP servers into a `.mcp.json` in a private temp file (0600),
+    /// deleted when the returned handle drops. `${VAR}` in env is expanded by the CLI.
+    fn render_mcp_config(
+        servers: &[(&String, &McpServerConfig)],
+    ) -> std::io::Result<tempfile::NamedTempFile> {
+        let mut mcp_servers = serde_json::Map::new();
+        for (name, cfg) in servers {
+            let mut entry = serde_json::Map::new();
+            if let Some(ref command) = cfg.command {
+                // stdio transport
+                entry.insert("command".to_string(), json!(command));
+                entry.insert("args".to_string(), json!(cfg.args));
+                if !cfg.env.is_empty() {
+                    entry.insert("env".to_string(), json!(cfg.env));
+                }
+                if let Some(ref transport) = cfg.transport {
+                    entry.insert("type".to_string(), json!(transport));
+                }
+            } else if let Some(ref url) = cfg.url {
+                // http/sse transport
+                entry.insert(
+                    "type".to_string(),
+                    json!(cfg.transport.clone().unwrap_or_else(|| "http".to_string())),
+                );
+                entry.insert("url".to_string(), json!(url));
+                if !cfg.headers.is_empty() {
+                    entry.insert("headers".to_string(), json!(cfg.headers));
+                }
+            }
+            mcp_servers.insert((*name).clone(), serde_json::Value::Object(entry));
+        }
+        let doc = json!({ "mcpServers": serde_json::Value::Object(mcp_servers) });
+
+        let file = tempfile::Builder::new()
+            .prefix("claudear-mcp-")
+            .suffix(".json")
+            .tempfile()?;
+        let bytes = serde_json::to_vec_pretty(&doc).map_err(std::io::Error::other)?;
+        std::fs::write(file.path(), bytes)?;
+        Ok(file)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn execute_with_env_and_attempt(
         &self,
         prompt: &str,
@@ -760,6 +827,7 @@ The PR title should include the issue ID: {}
         attempt_id: Option<i64>,
         project_dir: &Path,
         structured: bool,
+        source: Option<&str>,
     ) -> Result<AgentResult> {
         // Create execution record for analytics
         let mut execution = AgentExecution::new();
@@ -796,11 +864,58 @@ The PR title should include the issue ID: {}
         }));
         self.tracker.record_activity(&activity).ok();
 
+        // Attach MCP servers whose sources match this run; held until return so the
+        // temp file outlives the child, then auto-deleted.
+        let matched_mcp: Vec<(&String, &McpServerConfig)> = self
+            .config
+            .mcp
+            .iter()
+            .filter(|(_, cfg)| cfg.matches_source(source))
+            .collect();
+        let mut mcp_config_file: Option<tempfile::NamedTempFile> = None;
+        if !matched_mcp.is_empty() {
+            match Self::render_mcp_config(&matched_mcp) {
+                Ok(file) => {
+                    tracing::info!(
+                        component = "claude",
+                        label = label,
+                        source = source.unwrap_or("none"),
+                        servers = matched_mcp.len(),
+                        "Attaching MCP servers to run"
+                    );
+                    mcp_config_file = Some(file);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        component = "claude",
+                        label = label,
+                        error = %e,
+                        "Failed to render MCP config; continuing without MCP servers"
+                    );
+                }
+            }
+        }
+        // Tool globs to allowlist for the attached servers (empty when none).
+        let mcp_tool_globs: Vec<String> = if mcp_config_file.is_some() {
+            matched_mcp
+                .iter()
+                .map(|(name, _)| format!("mcp__{}", name))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         let mut args = vec![
             "--verbose".to_string(),
             "--output-format".to_string(),
             "stream-json".to_string(),
         ];
+        // Load only our rendered MCP config, ignoring any repo .mcp.json.
+        if let Some(ref file) = mcp_config_file {
+            args.push("--mcp-config".to_string());
+            args.push(file.path().display().to_string());
+            args.push("--strict-mcp-config".to_string());
+        }
         // Structured (fix) runs enforce the result JSON schema. Read-only Q&A
         // runs return plain assistant text instead.
         if structured {
@@ -834,6 +949,13 @@ The PR title should include the issue ID: {}
             for perm in &self.config.readonly_tools {
                 args.push("--allowedTools".to_string());
                 args.push(perm.clone());
+            }
+        }
+        // Allowlist the attached MCP servers' tools for both fix and Q&A runs.
+        for glob in &mcp_tool_globs {
+            if !args.iter().any(|a| a == glob) {
+                args.push("--allowedTools".to_string());
+                args.push(glob.clone());
             }
         }
         // Prompt is delivered via stdin (see spawn below), not as a CLI argument,
@@ -1981,8 +2103,16 @@ impl AgentRunner for ClaudeAgentRunner {
         project_dir: &Path,
     ) -> Result<AgentResult> {
         let (env, label) = self.prepare_env_and_label(issue);
-        self.execute_with_env_and_attempt(prompt, label, env, attempt_id, project_dir, true)
-            .await
+        self.execute_with_env_and_attempt(
+            prompt,
+            label,
+            env,
+            attempt_id,
+            project_dir,
+            true,
+            issue.map(|i| i.source.as_str()),
+        )
+        .await
     }
 
     async fn answer_question(
@@ -3614,6 +3744,41 @@ mod tests {
         assert!(debug.contains("stdout"));
         assert!(debug.contains("stderr"));
         assert!(debug.contains("events"));
+    }
+
+    #[test]
+    fn test_render_mcp_config_stdio() {
+        let name = "appwrite".to_string();
+        let mut env = HashMap::new();
+        env.insert(
+            "APPWRITE_API_KEY".to_string(),
+            "${APPWRITE_API_KEY}".to_string(),
+        );
+        let cfg = McpServerConfig {
+            command: Some("uvx".to_string()),
+            args: vec!["mcp-server-appwrite".to_string()],
+            env,
+            sources: vec!["helpscout".to_string()],
+            ..Default::default()
+        };
+        let servers = vec![(&name, &cfg)];
+        let file = ClaudeAgentRunner::render_mcp_config(&servers).expect("render");
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(file.path()).unwrap()).unwrap();
+        let server = &doc["mcpServers"]["appwrite"];
+        assert_eq!(server["command"], "uvx");
+        assert_eq!(server["args"][0], "mcp-server-appwrite");
+        assert_eq!(server["env"]["APPWRITE_API_KEY"], "${APPWRITE_API_KEY}");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(file.path())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
     }
 
     #[test]

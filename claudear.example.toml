@@ -143,6 +143,19 @@ api_url = ""
 # Sandbox mode (e.g., "network-off" for Codex)
 sandbox = ""
 
+# MCP servers attached to agent runs, keyed by server name.
+# Gated per-run by `sources` against the issue source. Default here: HelpScout only.
+# Add "discord" to enable there; set sources = [] to enable for all sources.
+# Keep secrets out of this file: reference them via ${VAR} from the daemon/provider env.
+# [agent.providers.claude.mcp.appwrite]
+# command = "uvx"
+# args    = ["mcp-server-appwrite", "--databases", "--users", "--functions"]
+# sources = ["helpscout"]
+# [agent.providers.claude.mcp.appwrite.env]
+# APPWRITE_ENDPOINT   = "https://fra.cloud.appwrite.io/v1"
+# APPWRITE_PROJECT_ID = "monitoring-fra"
+# APPWRITE_API_KEY    = "${APPWRITE_API_KEY}"   # read-only key, set in daemon env
+
 # A/B Experiments (optional)
 # Test different providers or configurations against each other.
 #
