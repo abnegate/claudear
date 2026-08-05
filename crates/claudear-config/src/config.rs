@@ -208,6 +208,20 @@ impl McpServerConfig {
             None => false,
         }
     }
+
+    /// Whether exactly one transport is configured and any explicit `type` agrees
+    /// with it. `command` implies stdio; `url` implies http/sse. Rejects neither,
+    /// both, and contradictions (e.g. `command` with `type = "http"`).
+    pub fn has_valid_transport(&self) -> bool {
+        match (self.command.is_some(), self.url.is_some()) {
+            (true, false) => self.transport.as_deref().is_none_or(|t| t == "stdio"),
+            (false, true) => self
+                .transport
+                .as_deref()
+                .is_none_or(|t| t == "http" || t == "sse"),
+            _ => false,
+        }
+    }
 }
 
 /// Experiment configuration for A/B testing providers.
@@ -3612,6 +3626,46 @@ mod tests {
         assert!(all_sources.matches_source(Some("sentry")));
         // Runs without an issue never attach, even when unrestricted.
         assert!(!all_sources.matches_source(None));
+    }
+
+    #[test]
+    fn test_mcp_has_valid_transport() {
+        let stdio = McpServerConfig {
+            command: Some("uvx".to_string()),
+            ..Default::default()
+        };
+        assert!(stdio.has_valid_transport());
+
+        let http = McpServerConfig {
+            url: Some("https://example/mcp".to_string()),
+            transport: Some("http".to_string()),
+            ..Default::default()
+        };
+        assert!(http.has_valid_transport());
+
+        // Contradictions and ambiguity are rejected.
+        let command_with_http = McpServerConfig {
+            command: Some("uvx".to_string()),
+            transport: Some("http".to_string()),
+            ..Default::default()
+        };
+        assert!(!command_with_http.has_valid_transport());
+
+        let url_with_stdio = McpServerConfig {
+            url: Some("https://example/mcp".to_string()),
+            transport: Some("stdio".to_string()),
+            ..Default::default()
+        };
+        assert!(!url_with_stdio.has_valid_transport());
+
+        let both = McpServerConfig {
+            command: Some("uvx".to_string()),
+            url: Some("https://example/mcp".to_string()),
+            ..Default::default()
+        };
+        assert!(!both.has_valid_transport());
+
+        assert!(!McpServerConfig::default().has_valid_transport());
     }
 
     #[test]

@@ -782,8 +782,9 @@ The PR title should include the issue ID: {}
         }
     }
 
-    /// Render matched MCP servers into a `.mcp.json` in a private temp file (0600),
-    /// deleted when the returned handle drops. `${VAR}` in env is expanded by the CLI.
+    /// Render matched MCP servers into a private temp file (claudear-mcp-*.json,
+    /// 0600 on Unix) passed to the CLI via --mcp-config and deleted when the handle
+    /// drops. `${VAR}` in env is expanded by the CLI.
     fn render_mcp_config(
         servers: &[(&String, &McpServerConfig)],
     ) -> std::io::Result<tempfile::NamedTempFile> {
@@ -882,13 +883,13 @@ The PR title should include the issue ID: {}
             .iter()
             .filter(|(_, cfg)| cfg.matches_source(source))
             .filter(|(name, cfg)| {
-                let valid = cfg.command.is_some() ^ cfg.url.is_some();
+                let valid = cfg.has_valid_transport();
                 if !valid {
                     tracing::warn!(
                         component = "claude",
                         label = label,
                         server = name.as_str(),
-                        "Skipping MCP server: set exactly one of `command` or `url`"
+                        "Skipping MCP server: set exactly one of `command`/`url` with a matching `type`"
                     );
                 }
                 valid
@@ -917,20 +918,29 @@ The PR title should include the issue ID: {}
                 }
             }
         }
-        // Tools to allowlist for the attached servers (empty when none). A server
-        // with an explicit `tools` list is scoped to `mcp__<server>__<tool>`;
-        // otherwise all of its tools are granted via `mcp__<server>`.
+        // Tools to allowlist for the attached servers. An explicit `tools` list is
+        // scoped to `mcp__<server>__<tool>`. With no list, fix runs may use all of a
+        // server's tools (`mcp__<server>`), but read-only runs (Q&A/verify/reply)
+        // get none: granting unscoped tools there could permit prod mutations.
         let mcp_tool_globs: Vec<String> = if mcp_config_file.is_some() {
             matched_mcp
                 .iter()
                 .flat_map(|(name, cfg)| {
-                    if cfg.tools.is_empty() {
-                        vec![format!("mcp__{}", name)]
-                    } else {
+                    if !cfg.tools.is_empty() {
                         cfg.tools
                             .iter()
                             .map(|tool| format!("mcp__{}__{}", name, tool))
                             .collect()
+                    } else if structured {
+                        vec![format!("mcp__{}", name)]
+                    } else {
+                        tracing::warn!(
+                            component = "claude",
+                            label = label,
+                            server = name.as_str(),
+                            "Read-only run: MCP server has no `tools` allowlist; not granting its tools"
+                        );
+                        Vec::new()
                     }
                 })
                 .collect()

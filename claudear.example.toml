@@ -151,8 +151,8 @@ sandbox = ""
 # command = "uvx"
 # args    = ["mcp-server-appwrite", "--databases", "--users", "--functions"]
 # sources = ["helpscout"]
-# Scope to read-only tools so Q&A/verify/reply runs cannot mutate resources.
-# Empty/omitted grants all of the server's tools. Use a read-only API key too.
+# Tools to allowlist. Required for read-only runs (Q&A/verify/reply): without it
+# they attach no MCP tools. Fix runs with no list get all tools. Use a read-only key.
 # tools   = ["databases_list_documents", "databases_get_document"]
 # [agent.providers.claude.mcp.appwrite.env]
 # APPWRITE_ENDPOINT   = "https://fra.cloud.appwrite.io/v1"
