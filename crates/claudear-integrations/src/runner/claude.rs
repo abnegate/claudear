@@ -736,7 +736,7 @@ The PR title should include the issue ID: {}
                 None,
                 project_dir,
                 false,
-                Some(&issue.source),
+                Some(issue.source.as_str()),
             )
             .await?;
         Ok(parse_verify_result(&result.output))
@@ -762,7 +762,7 @@ The PR title should include the issue ID: {}
                 None,
                 project_dir,
                 false,
-                Some(&issue.source),
+                Some(issue.source.as_str()),
             )
             .await?;
         if result.success || !result.output.trim().is_empty() {
@@ -809,12 +809,15 @@ The PR title should include the issue ID: {}
         }
         let doc = json!({ "mcpServers": serde_json::Value::Object(mcp_servers) });
 
-        let file = tempfile::Builder::new()
+        let mut file = tempfile::Builder::new()
             .prefix("claudear-mcp-")
             .suffix(".json")
             .tempfile()?;
         let bytes = serde_json::to_vec_pretty(&doc).map_err(std::io::Error::other)?;
-        std::fs::write(file.path(), bytes)?;
+        // Write to the already-open handle; avoids reopening (fails under Windows locks).
+        use std::io::Write;
+        file.as_file_mut().write_all(&bytes)?;
+        file.as_file_mut().flush()?;
         Ok(file)
     }
 
@@ -865,12 +868,25 @@ The PR title should include the issue ID: {}
         self.tracker.record_activity(&activity).ok();
 
         // Attach MCP servers whose sources match this run; held until return so the
-        // temp file outlives the child, then auto-deleted.
+        // temp file outlives the child, then auto-deleted. Require exactly one of
+        // `command`/`url` so strict MCP loading never rejects an ambiguous server.
         let matched_mcp: Vec<(&String, &McpServerConfig)> = self
             .config
             .mcp
             .iter()
             .filter(|(_, cfg)| cfg.matches_source(source))
+            .filter(|(name, cfg)| {
+                let valid = cfg.command.is_some() ^ cfg.url.is_some();
+                if !valid {
+                    tracing::warn!(
+                        component = "claude",
+                        label = label,
+                        server = name.as_str(),
+                        "Skipping MCP server: set exactly one of `command` or `url`"
+                    );
+                }
+                valid
+            })
             .collect();
         let mut mcp_config_file: Option<tempfile::NamedTempFile> = None;
         if !matched_mcp.is_empty() {
@@ -895,11 +911,22 @@ The PR title should include the issue ID: {}
                 }
             }
         }
-        // Tool globs to allowlist for the attached servers (empty when none).
+        // Tools to allowlist for the attached servers (empty when none). A server
+        // with an explicit `tools` list is scoped to `mcp__<server>__<tool>`;
+        // otherwise all of its tools are granted via `mcp__<server>`.
         let mcp_tool_globs: Vec<String> = if mcp_config_file.is_some() {
             matched_mcp
                 .iter()
-                .map(|(name, _)| format!("mcp__{}", name))
+                .flat_map(|(name, cfg)| {
+                    if cfg.tools.is_empty() {
+                        vec![format!("mcp__{}", name)]
+                    } else {
+                        cfg.tools
+                            .iter()
+                            .map(|tool| format!("mcp__{}__{}", name, tool))
+                            .collect()
+                    }
+                })
                 .collect()
         } else {
             Vec::new()
