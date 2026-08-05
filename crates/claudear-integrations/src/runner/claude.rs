@@ -960,7 +960,8 @@ The PR title should include the issue ID: {}
             "--output-format".to_string(),
             "stream-json".to_string(),
         ];
-        // Load only our rendered MCP config, ignoring any repo .mcp.json.
+        // When we attach a rendered config, load only it (--strict ignores any repo
+        // .mcp.json). With no servers matched, no MCP flags are added at all.
         if let Some(ref file) = mcp_config_file {
             args.push("--mcp-config".to_string());
             args.push(file.path().display().to_string());
@@ -3796,6 +3797,15 @@ mod tests {
         assert!(debug.contains("events"));
     }
 
+    // Read a rendered temp file via the already-open handle (avoids reopening by
+    // path, which can lock on Windows), mirroring render_mcp_config's own approach.
+    fn read_temp(file: &tempfile::NamedTempFile) -> String {
+        use std::io::Read;
+        let mut s = String::new();
+        file.reopen().unwrap().read_to_string(&mut s).unwrap();
+        s
+    }
+
     #[test]
     fn test_render_mcp_config_stdio() {
         let name = "appwrite".to_string();
@@ -3813,8 +3823,7 @@ mod tests {
         };
         let servers = vec![(&name, &cfg)];
         let file = ClaudeAgentRunner::render_mcp_config(&servers).expect("render");
-        let doc: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(file.path()).unwrap()).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&read_temp(&file)).unwrap();
         let server = &doc["mcpServers"]["appwrite"];
         assert_eq!(server["command"], "uvx");
         assert_eq!(server["args"][0], "mcp-server-appwrite");
@@ -3841,8 +3850,7 @@ mod tests {
         };
         let servers = vec![(&name, &cfg)];
         let file = ClaudeAgentRunner::render_mcp_config(&servers).expect("render");
-        let doc: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(file.path()).unwrap()).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&read_temp(&file)).unwrap();
         let server = &doc["mcpServers"]["remote"];
         assert_eq!(server["type"], "http");
         assert_eq!(server["url"], "https://example.com/mcp");
