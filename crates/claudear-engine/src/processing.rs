@@ -155,6 +155,26 @@ fn build_verification_note(
     out
 }
 
+/// Prompt for the red phase: write a failing test only, no fix.
+fn build_failing_test_prompt(issue: &Issue, context: &str) -> String {
+    format!(
+        "You are reproducing a bug from {source} by writing a FAILING test. Do NOT fix it yet.\n\n\
+         {context}\n\n\
+         Issue: {short_id} - {title}\n\n\
+         Instructions:\n\
+         1. Analyze the issue and locate the relevant code.\n\
+         2. Add a single new test that reproduces the bug. It MUST fail against the current, \
+            unfixed code.\n\
+         3. Do NOT modify any application/source code — only add the test.\n\
+         4. Do NOT open a PR, commit, or push.\n\
+         Stop once the failing test is written.",
+        source = issue.source,
+        context = context,
+        short_id = issue.short_id,
+        title = issue.title,
+    )
+}
+
 /// Whether a verify verdict has real findings (the conservative fallbacks don't).
 fn diagnosis_has_details(verdict: &VerifyResult) -> bool {
     !verdict.impact.trim().is_empty()
@@ -512,6 +532,52 @@ impl IssueProcessor {
             Vec::new()
         };
 
+        // Red phase: author a failing test and require it to fail before fixing.
+        if self.config.evaluation.require_red_green {
+            let has_test_baseline = eval_before_snapshots
+                .iter()
+                .any(|s| s.category == claudear_core::types::EvalCategory::Test);
+            if !has_test_baseline {
+                tracing::warn!(
+                    short_id = %issue.short_id,
+                    "require_red_green set but no test tool detected; skipping red-green"
+                );
+            } else {
+                let context = self.build_rag_context(issue, attempt_id).await;
+                let prompt = build_failing_test_prompt(issue, &context);
+                match self
+                    .agent
+                    .execute_with_attempt(&prompt, Some(&*issue), attempt_id, &effective_project_dir)
+                    .await
+                {
+                    Ok(_) => {
+                        let repo = resolution.repo_name().unwrap_or("unknown").to_string();
+                        let red = claudear_analysis::evaluation::CodeQualityEvaluator::run_after_and_compute_deltas(
+                            &effective_project_dir,
+                            &self.config.evaluation,
+                            eval_before_snapshots.clone(),
+                            attempt_id.unwrap_or(0),
+                            &repo,
+                        )
+                        .await;
+                        let is_red = matches!(&red, Ok(r) if r.has_new_test_failures());
+                        if !is_red {
+                            let error = "Red-green: authored test did not fail on the unfixed code; could not confirm reproduction".to_string();
+                            tracing::warn!(short_id = %issue.short_id, "{}", error);
+                            self.tracker.mark_failed(source_name, &issue.id, &error).ok();
+                            self.cleanup_worktree(resolution, issue, &project_dir).await;
+                            return Ok(ProcessingOutcome::Failed { error });
+                        }
+                        tracing::info!(short_id = %issue.short_id, "Red-green: failing test confirmed (red)");
+                    }
+                    Err(e) => {
+                        // Agent infra error: skip the red gate rather than fail the attempt.
+                        tracing::warn!(short_id = %issue.short_id, error = %e, "Red phase agent run failed; skipping red-green");
+                    }
+                }
+            }
+        }
+
         // Resolve issue assignee to a configured user
         if let Some(assignee) = issue.get_metadata::<String>("assignee") {
             if let Some(resolved) = self.user_registry.resolve(&issue.source, &assignee) {
@@ -745,6 +811,7 @@ impl IssueProcessor {
 
         // Run code quality evaluation (AFTER hook)
         let mut regression_gate_tripped = false;
+        let mut regression_reason = String::new();
         if !eval_before_snapshots.is_empty() {
             let eval_attempt_id = attempt_id.unwrap_or(0);
             let eval_repo = current_resolution.repo_name().unwrap_or("unknown");
@@ -766,9 +833,19 @@ impl IssueProcessor {
                             "Evaluation complete"
                         );
 
-                        // Gate the fix on regressions when configured.
-                        regression_gate_tripped = self.config.evaluation.fail_on_regression
-                            && eval_result.has_regressions();
+                        // Gate the fix on regressions (and, in red-green mode, on a
+                        // test that still fails after the fix).
+                        let gate = self.config.evaluation.fail_on_regression
+                            || self.config.evaluation.require_red_green;
+                        regression_gate_tripped = gate && eval_result.has_regressions();
+                        if regression_gate_tripped
+                            && self.config.evaluation.require_red_green
+                            && eval_result.has_new_test_failures()
+                        {
+                            regression_reason =
+                                "Red-green: authored test still fails after the fix (not green)"
+                                    .to_string();
+                        }
 
                         // Post evaluation comment on PR
                         if self.config.evaluation.post_pr_comment {
@@ -809,7 +886,11 @@ impl IssueProcessor {
         // Fail a successful attempt whose fix introduced regressions (triggers retry).
         if regression_gate_tripped {
             if let Ok(ProcessingOutcome::Success { pr_url }) = &result {
-                let error = "Fix introduced quality regressions (fail_on_regression)".to_string();
+                let error = if regression_reason.is_empty() {
+                    "Fix introduced quality regressions (fail_on_regression)".to_string()
+                } else {
+                    regression_reason.clone()
+                };
                 tracing::warn!(short_id = %issue.short_id, pr_url = %pr_url, "{}", error);
                 self.tracker.mark_failed(source_name, &issue.id, &error).ok();
                 result = Ok(ProcessingOutcome::Failed { error });
@@ -1074,6 +1155,16 @@ impl IssueProcessor {
             if diagnosis_has_details(verdict) {
                 context = format!("{}\n{}", build_diagnosis_context(verdict), context);
             }
+        }
+
+        // In red-green mode a failing test is already in the tree from the red phase.
+        if self.config.evaluation.require_red_green {
+            context = format!(
+                "## Failing test already present\n\nA test reproducing this bug has already been \
+                 written to the working tree and currently fails. Implement the minimal fix to make \
+                 it pass. Do not delete or weaken it, and do not add another reproducing test.\n\n{}",
+                context
+            );
         }
 
         // Claude execution + ask loop
