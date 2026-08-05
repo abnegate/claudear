@@ -918,29 +918,36 @@ The PR title should include the issue ID: {}
                 }
             }
         }
-        // Tools to allowlist for the attached servers. An explicit `tools` list is
-        // scoped to `mcp__<server>__<tool>`. With no list, fix runs may use all of a
-        // server's tools (`mcp__<server>`), but read-only runs (Q&A/verify/reply)
-        // get none: granting unscoped tools there could permit prod mutations.
+        // Tools to allowlist for the attached servers. Fix runs draw from `tools`
+        // (empty = all of the server's tools via `mcp__<server>`). Read-only runs
+        // draw only from the operator-declared `readonly_tools`; with none listed
+        // they get no MCP tools, since we cannot verify a tool is non-mutating.
         let mcp_tool_globs: Vec<String> = if mcp_config_file.is_some() {
             matched_mcp
                 .iter()
                 .flat_map(|(name, cfg)| {
-                    if !cfg.tools.is_empty() {
-                        cfg.tools
-                            .iter()
-                            .map(|tool| format!("mcp__{}__{}", name, tool))
-                            .collect()
-                    } else if structured {
-                        vec![format!("mcp__{}", name)]
-                    } else {
+                    if structured {
+                        if cfg.tools.is_empty() {
+                            vec![format!("mcp__{}", name)]
+                        } else {
+                            cfg.tools
+                                .iter()
+                                .map(|tool| format!("mcp__{}__{}", name, tool))
+                                .collect()
+                        }
+                    } else if cfg.readonly_tools.is_empty() {
                         tracing::warn!(
                             component = "claude",
                             label = label,
                             server = name.as_str(),
-                            "Read-only run: MCP server has no `tools` allowlist; not granting its tools"
+                            "Read-only run: MCP server has no `readonly_tools`; not granting its tools"
                         );
                         Vec::new()
+                    } else {
+                        cfg.readonly_tools
+                            .iter()
+                            .map(|tool| format!("mcp__{}__{}", name, tool))
+                            .collect()
                     }
                 })
                 .collect()
