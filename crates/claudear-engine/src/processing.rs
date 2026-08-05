@@ -561,7 +561,7 @@ impl IssueProcessor {
         let mut current_project_dir = project_dir.clone();
         let mut current_effective_dir = effective_project_dir.clone();
 
-        let result = loop {
+        let mut result = loop {
             let pipeline_result = self
                 .execute_pipeline(
                     issue,
@@ -744,6 +744,7 @@ impl IssueProcessor {
         self.tracker.record_metric(&processing_time_metric).ok();
 
         // Run code quality evaluation (AFTER hook)
+        let mut regression_gate_tripped = false;
         if !eval_before_snapshots.is_empty() {
             let eval_attempt_id = attempt_id.unwrap_or(0);
             let eval_repo = current_resolution.repo_name().unwrap_or("unknown");
@@ -764,6 +765,10 @@ impl IssueProcessor {
                             deltas = eval_result.deltas.len(),
                             "Evaluation complete"
                         );
+
+                        // Gate the fix on regressions when configured.
+                        regression_gate_tripped = self.config.evaluation.fail_on_regression
+                            && eval_result.has_regressions();
 
                         // Post evaluation comment on PR
                         if self.config.evaluation.post_pr_comment {
@@ -798,6 +803,16 @@ impl IssueProcessor {
                         "Post-fix evaluation failed"
                     );
                 }
+            }
+        }
+
+        // Fail a successful attempt whose fix introduced regressions (triggers retry).
+        if regression_gate_tripped {
+            if let Ok(ProcessingOutcome::Success { pr_url }) = &result {
+                let error = "Fix introduced quality regressions (fail_on_regression)".to_string();
+                tracing::warn!(short_id = %issue.short_id, pr_url = %pr_url, "{}", error);
+                self.tracker.mark_failed(source_name, &issue.id, &error).ok();
+                result = Ok(ProcessingOutcome::Failed { error });
             }
         }
 
@@ -1512,6 +1527,18 @@ impl IssueProcessor {
                                 );
                             }
                         }
+                    }
+                }
+
+                // Ask the reporter to confirm the fix, when configured.
+                if self.config.reply().request_reporter_verification {
+                    let note = format!(
+                        "A candidate fix for {} is ready: {}\n\nCould you confirm it resolves the \
+                         issue on your end? Reply here to confirm, or let us know what's still broken.",
+                        issue.short_id, pr_url
+                    );
+                    if let Err(e) = context_provider.post_reply(&issue.id, &note).await {
+                        tracing::debug!(short_id = %issue.short_id, error = %e, "Could not post reporter verification request");
                     }
                 }
 
@@ -2237,10 +2264,11 @@ impl IssueProcessor {
         )
         .await;
 
+        let fail_open = self.config.reply().verify_fail_open;
         let verdict = match result {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => VerifyResult {
-                reproduced: true,
+                reproduced: fail_open,
                 summary: "Verification unsupported/failed; proceeding to resolve".to_string(),
                 impact: String::new(),
                 root_cause: String::new(),
@@ -2248,7 +2276,7 @@ impl IssueProcessor {
                 evidence: e.to_string(),
             },
             Err(_) => VerifyResult {
-                reproduced: true,
+                reproduced: fail_open,
                 summary: format!(
                     "Verification timed out after {}s; proceeding to resolve",
                     self.config.reply().verify_timeout_secs
