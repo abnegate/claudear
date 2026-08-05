@@ -808,8 +808,6 @@ pub struct ReplyConfig {
     /// When verify can't run (timeout/error/unsupported), assume reproduced and fix
     /// anyway (default: true). Set false to ask the reporter for repro steps instead.
     pub verify_fail_open: bool,
-    /// After a PR is created, ask the reporter to confirm the fix (default: false).
-    pub request_reporter_verification: bool,
 }
 
 impl Default for ReplyConfig {
@@ -821,7 +819,6 @@ impl Default for ReplyConfig {
             templates: std::collections::HashMap::new(),
             verify_timeout_secs: 1800,
             verify_fail_open: true,
-            request_reporter_verification: false,
         }
     }
 }
