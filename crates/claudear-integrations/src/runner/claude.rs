@@ -3829,6 +3829,31 @@ mod tests {
     }
 
     #[test]
+    fn test_render_mcp_config_http() {
+        let name = "remote".to_string();
+        let mut headers = HashMap::new();
+        headers.insert("Authorization".to_string(), "Bearer ${TOKEN}".to_string());
+        let cfg = McpServerConfig {
+            url: Some("https://example.com/mcp".to_string()),
+            transport: Some("http".to_string()),
+            headers,
+            ..Default::default()
+        };
+        let servers = vec![(&name, &cfg)];
+        let file = ClaudeAgentRunner::render_mcp_config(&servers).expect("render");
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(file.path()).unwrap()).unwrap();
+        let server = &doc["mcpServers"]["remote"];
+        assert_eq!(server["type"], "http");
+        assert_eq!(server["url"], "https://example.com/mcp");
+        assert_eq!(server["headers"]["Authorization"], "Bearer ${TOKEN}");
+        // stdio-only fields must be absent for an http transport.
+        assert!(server.get("command").is_none());
+        assert!(server.get("args").is_none());
+        assert!(server.get("env").is_none());
+    }
+
+    #[test]
     fn test_create_execution_log_files_produces_valid_paths() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("CLAUDEAR_LOG_DIR").ok();
