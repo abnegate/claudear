@@ -3232,6 +3232,18 @@ pub enum TimelineEventStatus {
     #[serde(rename = "verify_completed")]
     VerifyCompleted,
 
+    /// Red-green: the failing-test (red) phase began.
+    #[serde(rename = "red_green_started")]
+    RedGreenStarted,
+
+    /// Red-green: the authored test failed on the unfixed code (red confirmed).
+    #[serde(rename = "red_confirmed")]
+    RedConfirmed,
+
+    /// Red-green: the authored test passed after the fix (green confirmed).
+    #[serde(rename = "green_confirmed")]
+    GreenConfirmed,
+
     #[serde(rename = "reply_started")]
     ReplyStarted,
 
@@ -3292,6 +3304,9 @@ impl TimelineEventStatus {
             Self::FixStarted => "fix_started",
             Self::VerifyStarted => "verify_started",
             Self::VerifyCompleted => "verify_completed",
+            Self::RedGreenStarted => "red_green_started",
+            Self::RedConfirmed => "red_confirmed",
+            Self::GreenConfirmed => "green_confirmed",
             Self::ReplyStarted => "reply_started",
             Self::ReplySent => "reply_sent",
             Self::FixSucceeded => "fix_succeeded",
