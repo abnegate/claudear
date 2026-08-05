@@ -559,7 +559,12 @@ impl IssueProcessor {
                 let prompt = build_failing_test_prompt(issue, &context);
                 match self
                     .agent
-                    .execute_with_attempt(&prompt, Some(&*issue), attempt_id, &effective_project_dir)
+                    .execute_with_attempt(
+                        &prompt,
+                        Some(&*issue),
+                        attempt_id,
+                        &effective_project_dir,
+                    )
                     .await
                 {
                     Ok(_) => {
@@ -590,7 +595,9 @@ impl IssueProcessor {
                                 error.clone(),
                                 json!({}),
                             );
-                            self.tracker.mark_failed(source_name, &issue.id, &error).ok();
+                            self.tracker
+                                .mark_failed(source_name, &issue.id, &error)
+                                .ok();
                             self.cleanup_worktree(resolution, issue, &project_dir).await;
                             return Ok(ProcessingOutcome::Failed { error });
                         }
@@ -612,7 +619,10 @@ impl IssueProcessor {
                         self.record_issue_decision(
                             issue,
                             "red_confirmed",
-                            format!("Red confirmed: test fails on unfixed code for {}", issue.short_id),
+                            format!(
+                                "Red confirmed: test fails on unfixed code for {}",
+                                issue.short_id
+                            ),
                             json!({}),
                         );
                     }
@@ -915,7 +925,10 @@ impl IssueProcessor {
                                 self.record_issue_decision(
                                     issue,
                                     "green_confirmed",
-                                    format!("Green confirmed: test passes after fix for {}", issue.short_id),
+                                    format!(
+                                        "Green confirmed: test passes after fix for {}",
+                                        issue.short_id
+                                    ),
                                     json!({}),
                                 );
                             }
@@ -966,7 +979,9 @@ impl IssueProcessor {
                     regression_reason.clone()
                 };
                 tracing::warn!(short_id = %issue.short_id, pr_url = %pr_url, "{}", error);
-                self.tracker.mark_failed(source_name, &issue.id, &error).ok();
+                self.tracker
+                    .mark_failed(source_name, &issue.id, &error)
+                    .ok();
                 result = Ok(ProcessingOutcome::Failed { error });
             }
         }
