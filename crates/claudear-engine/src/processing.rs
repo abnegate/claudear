@@ -155,6 +155,36 @@ fn build_verification_note(
     out
 }
 
+/// Whether a verify verdict has real findings (the conservative fallbacks don't).
+fn diagnosis_has_details(verdict: &VerifyResult) -> bool {
+    !verdict.impact.trim().is_empty()
+        || !verdict.root_cause.trim().is_empty()
+        || !verdict.suggested_fix.trim().is_empty()
+        || !verdict.evidence.trim().is_empty()
+}
+
+/// Build the diagnosis block prepended to the fix prompt context.
+fn build_diagnosis_context(verdict: &VerifyResult) -> String {
+    let mut out = String::from(
+        "## Verified diagnosis (from the reproduce/verify stage)\n\nThis issue was \
+         independently reproduced before this fix run. Treat the findings below as the \
+         starting point: confirm them in code, then implement the minimal fix. Do not \
+         re-litigate whether the bug exists.\n",
+    );
+    let mut section = |label: &str, body: &str| {
+        let body = body.trim();
+        if !body.is_empty() {
+            out.push_str(&format!("\n{label}: {body}\n"));
+        }
+    };
+    section("Summary", &verdict.summary);
+    section("Why it's an issue", &verdict.impact);
+    section("Root cause", &verdict.root_cause);
+    section("Suggested fix direction", &verdict.suggested_fix);
+    section("Evidence", &verdict.evidence);
+    out
+}
+
 /// Heuristic bug/security detection used as a fallback when the LLM classifier is
 /// unavailable. Mirrors `FixAttempt::is_bug`: Sentry issues are always bugs, and
 /// any label containing a known bug word counts.
@@ -221,6 +251,8 @@ pub struct ProcessingInput {
     pub review_feedback: Option<String>,
     pub existing_pr_branch: Option<String>,
     pub intent: Option<Intent>,
+    /// Diagnosis carried forward from the reproduce/verify stage into the fix run.
+    pub diagnosis: Option<VerifyResult>,
 }
 
 /// What happened during processing.
@@ -317,6 +349,7 @@ impl IssueProcessor {
             attempt_id,
             ref review_feedback,
             ref existing_pr_branch,
+            ref diagnosis,
             ..
         } = input;
 
@@ -537,6 +570,7 @@ impl IssueProcessor {
                     attempt_id,
                     review_feedback.as_deref(),
                     existing_pr_branch.as_deref(),
+                    diagnosis.as_ref(),
                     &current_effective_dir,
                     context_provider,
                 )
@@ -799,6 +833,7 @@ impl IssueProcessor {
         attempt_id: Option<i64>,
         review_feedback: Option<&str>,
         existing_pr_branch: Option<&str>,
+        diagnosis: Option<&VerifyResult>,
         effective_project_dir: &std::path::Path,
         context_provider: &dyn ContextProvider,
     ) -> Result<ProcessingOutcome> {
@@ -1018,6 +1053,13 @@ impl IssueProcessor {
 
         // Ground the fix in the reply thread when this issue is a reply.
         context = self.with_reply_chain(issue, context).await;
+
+        // Start the fix from the verify stage's diagnosis when it has real findings.
+        if let Some(verdict) = diagnosis {
+            if diagnosis_has_details(verdict) {
+                context = format!("{}\n{}", build_diagnosis_context(verdict), context);
+            }
+        }
 
         // Claude execution + ask loop
         let mut rounds: u8 = 0;
@@ -2036,7 +2078,7 @@ impl IssueProcessor {
     /// if confirmed, resolved via the fix pipeline; everything else gets a reply.
     async fn run_action_pipeline(
         &self,
-        input: ProcessingInput,
+        mut input: ProcessingInput,
         context_provider: &dyn ContextProvider,
     ) -> ProcessingOutcome {
         // Prefer the intent decided upstream (carried on the input); only classify
@@ -2057,6 +2099,8 @@ impl IssueProcessor {
                 )
                 .await;
             if verdict.reproduced {
+                // Carry the diagnosis into the fix run.
+                input.diagnosis = Some(verdict);
                 return match self.run_inner(input, context_provider).await {
                     Ok(ProcessingOutcome::WrongRepo {
                         original_repo,
@@ -3244,6 +3288,7 @@ mod tests {
             review_feedback: Some("Fix the tests".to_string()),
             existing_pr_branch: Some("claudear/fix-123".to_string()),
             intent: None,
+            diagnosis: None,
         };
 
         assert_eq!(input.source_name, "linear");
@@ -3271,6 +3316,7 @@ mod tests {
             review_feedback: None,
             existing_pr_branch: None,
             intent: None,
+            diagnosis: None,
         };
 
         assert!(input.attempt_id.is_none());
@@ -4174,6 +4220,7 @@ mod tests {
             review_feedback: None,
             existing_pr_branch: None,
             intent: None,
+            diagnosis: None,
         };
 
         // Use a dummy context provider

@@ -3870,6 +3870,7 @@ Create a PR with your changes.{custom_instructions}"#,
             review_feedback,
             existing_pr_branch,
             intent,
+            diagnosis: None,
         };
 
         let context_provider = crate::processing::SourceContext(source.as_ref());
@@ -4568,6 +4569,7 @@ Create a PR with your changes.{custom_instructions}"#,
             review_feedback: None,
             existing_pr_branch: None,
             intent: None,
+            diagnosis: None,
         };
 
         let context_provider = crate::processing::SourceContext(source.as_ref());
