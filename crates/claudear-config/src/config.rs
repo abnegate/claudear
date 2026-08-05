@@ -193,6 +193,10 @@ pub struct McpServerConfig {
     pub headers: std::collections::HashMap<String, String>,
     /// Issue sources this server attaches for. Empty means all sources.
     pub sources: Vec<String>,
+    /// Specific tool names to allow (allowlisted as `mcp__<server>__<tool>`).
+    /// Empty grants all of the server's tools (`mcp__<server>`). Scope this to
+    /// read-only tools to keep Q&A/verify/reply runs from mutating resources.
+    pub tools: Vec<String>,
 }
 
 impl McpServerConfig {
@@ -3576,6 +3580,7 @@ mod tests {
             command = "uvx"
             args = ["mcp-server-appwrite", "--databases"]
             sources = ["helpscout"]
+            tools = ["databases_get_document"]
             [agent.providers.claude.mcp.appwrite.env]
             APPWRITE_ENDPOINT = "https://fra.cloud.appwrite.io/v1"
             APPWRITE_API_KEY = "${APPWRITE_API_KEY}"
@@ -3585,6 +3590,7 @@ mod tests {
         let appwrite = provider.mcp.get("appwrite").expect("mcp server");
         assert_eq!(appwrite.command.as_deref(), Some("uvx"));
         assert_eq!(appwrite.sources, vec!["helpscout".to_string()]);
+        assert_eq!(appwrite.tools, vec!["databases_get_document".to_string()]);
         assert_eq!(
             appwrite.env.get("APPWRITE_API_KEY").map(String::as_str),
             Some("${APPWRITE_API_KEY}")
