@@ -29,6 +29,13 @@ impl EvaluationResult {
         }
     }
 
+    /// Whether the fix introduced new failures or regressions in any tool.
+    pub fn has_regressions(&self) -> bool {
+        self.deltas
+            .iter()
+            .any(|d| d.new_failures > 0 || !d.regressions.is_empty())
+    }
+
     fn build_summary(deltas: &[EvalDelta]) -> String {
         if deltas.is_empty() {
             return "No evaluation tools ran.".to_string();
