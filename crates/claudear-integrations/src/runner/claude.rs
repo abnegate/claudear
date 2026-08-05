@@ -587,8 +587,14 @@ The PR title should include the issue ID: {}
         project_dir: &Path,
     ) -> Result<AgentResult> {
         let (env, label) = self.prepare_env_and_label(issue);
-        self.execute_with_env(prompt, label, env, project_dir, issue.map(|i| i.source.as_str()))
-            .await
+        self.execute_with_env(
+            prompt,
+            label,
+            env,
+            project_dir,
+            issue.map(|i| i.source.as_str()),
+        )
+        .await
     }
 
     async fn execute_with_env(
@@ -3800,10 +3806,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(file.path())
-                .unwrap()
-                .permissions()
-                .mode();
+            let mode = std::fs::metadata(file.path()).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
     }
