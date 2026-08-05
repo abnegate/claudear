@@ -1530,18 +1530,6 @@ impl IssueProcessor {
                     }
                 }
 
-                // Ask the reporter to confirm the fix, when configured.
-                if self.config.reply().request_reporter_verification {
-                    let note = format!(
-                        "A candidate fix for {} is ready: {}\n\nCould you confirm it resolves the \
-                         issue on your end? Reply here to confirm, or let us know what's still broken.",
-                        issue.short_id, pr_url
-                    );
-                    if let Err(e) = context_provider.post_reply(&issue.id, &note).await {
-                        tracing::debug!(short_id = %issue.short_id, error = %e, "Could not post reporter verification request");
-                    }
-                }
-
                 // Store embedding for future similarity lookups
                 if let Some(ref embedding_service) = self.issue_embedding_service {
                     if embedding_service
