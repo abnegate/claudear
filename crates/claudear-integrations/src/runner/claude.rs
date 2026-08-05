@@ -918,33 +918,17 @@ The PR title should include the issue ID: {}
                 }
             }
         }
-        // Tools to allowlist for the attached servers. Fix runs draw from `tools`
-        // (empty = all of the server's tools via `mcp__<server>`). Read-only runs
-        // draw only from the operator-declared `readonly_tools`; with none listed
-        // they get no MCP tools, since we cannot verify a tool is non-mutating.
+        // Tools to allowlist for the attached servers. An explicit `tools` list is
+        // scoped to `mcp__<server>__<tool>`; empty grants all of the server's tools
+        // via `mcp__<server>`. Applied uniformly to fix and read-only runs.
         let mcp_tool_globs: Vec<String> = if mcp_config_file.is_some() {
             matched_mcp
                 .iter()
                 .flat_map(|(name, cfg)| {
-                    if structured {
-                        if cfg.tools.is_empty() {
-                            vec![format!("mcp__{}", name)]
-                        } else {
-                            cfg.tools
-                                .iter()
-                                .map(|tool| format!("mcp__{}__{}", name, tool))
-                                .collect()
-                        }
-                    } else if cfg.readonly_tools.is_empty() {
-                        tracing::warn!(
-                            component = "claude",
-                            label = label,
-                            server = name.as_str(),
-                            "Read-only run: MCP server has no `readonly_tools`; not granting its tools"
-                        );
-                        Vec::new()
+                    if cfg.tools.is_empty() {
+                        vec![format!("mcp__{}", name)]
                     } else {
-                        cfg.readonly_tools
+                        cfg.tools
                             .iter()
                             .map(|tool| format!("mcp__{}__{}", name, tool))
                             .collect()

@@ -193,14 +193,10 @@ pub struct McpServerConfig {
     pub headers: std::collections::HashMap<String, String>,
     /// Issue sources this server attaches for. Empty means all sources.
     pub sources: Vec<String>,
-    /// Tool names allowed on fix (structured) runs, as `mcp__<server>__<tool>`.
-    /// Empty grants all of the server's tools (`mcp__<server>`).
+    /// Tool names to allow, as `mcp__<server>__<tool>`. Empty grants all of the
+    /// server's tools (`mcp__<server>`). Applies to every run that attaches this
+    /// server.
     pub tools: Vec<String>,
-    /// Tool names allowed on read-only runs (Q&A/verify/reply), as
-    /// `mcp__<server>__<tool>`. Empty grants none: read-only runs never receive
-    /// unscoped tools, so only tools the operator lists here (which must be
-    /// non-mutating) are reachable when investigating without a fix.
-    pub readonly_tools: Vec<String>,
 }
 
 impl McpServerConfig {
@@ -3599,7 +3595,6 @@ mod tests {
             args = ["mcp-server-appwrite", "--databases"]
             sources = ["helpscout"]
             tools = ["databases_get_document"]
-            readonly_tools = ["databases_list_documents"]
             [agent.providers.claude.mcp.appwrite.env]
             APPWRITE_ENDPOINT = "https://fra.cloud.appwrite.io/v1"
             APPWRITE_API_KEY = "${APPWRITE_API_KEY}"
@@ -3610,10 +3605,6 @@ mod tests {
         assert_eq!(appwrite.command.as_deref(), Some("uvx"));
         assert_eq!(appwrite.sources, vec!["helpscout".to_string()]);
         assert_eq!(appwrite.tools, vec!["databases_get_document".to_string()]);
-        assert_eq!(
-            appwrite.readonly_tools,
-            vec!["databases_list_documents".to_string()]
-        );
         assert_eq!(
             appwrite.env.get("APPWRITE_API_KEY").map(String::as_str),
             Some("${APPWRITE_API_KEY}")
