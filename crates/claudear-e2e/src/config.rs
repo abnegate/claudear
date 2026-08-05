@@ -235,6 +235,7 @@ impl ConfigBuilder {
                 template.to_string(),
             )]),
             verify_timeout_secs,
+            verify_fail_open: true,
         };
         self
     }
