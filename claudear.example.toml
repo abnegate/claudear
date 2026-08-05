@@ -151,11 +151,8 @@ sandbox = ""
 # command = "uvx"
 # args    = ["mcp-server-appwrite", "--databases", "--users", "--functions"]
 # sources = ["helpscout"]
-# tools: allowed on fix runs (empty grants all of the server's tools).
-# readonly_tools: allowed on Q&A/verify/reply runs; list only non-mutating tools.
-# Read-only runs get no MCP tools unless listed here. Use a read-only API key too.
-# tools          = ["databases_list_documents", "databases_get_document"]
-# readonly_tools = ["databases_list_documents", "databases_get_document"]
+# tools: tool names to allow (empty/omitted grants all of the server's tools).
+# tools   = ["databases_list_documents", "databases_get_document"]
 # [agent.providers.claude.mcp.appwrite.env]
 # APPWRITE_ENDPOINT   = "https://fra.cloud.appwrite.io/v1"
 # APPWRITE_PROJECT_ID = "monitoring-fra"
