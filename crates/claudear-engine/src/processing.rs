@@ -555,7 +555,7 @@ impl IssueProcessor {
                     format!("Red phase: authoring failing test for {}", issue.short_id),
                     json!({}),
                 );
-                let context = self.build_rag_context(issue, attempt_id).await;
+                let (context, _discord_refs) = self.build_rag_context(issue, attempt_id).await;
                 let prompt = build_failing_test_prompt(issue, &context);
                 match self
                     .agent
@@ -1145,7 +1145,8 @@ impl IssueProcessor {
         }
 
         // Enrich context with indexed Discord discussions (independent of code index).
-        let (discord_ctx, discord_items) =
+        // Reference links are for user-facing notifications, not this agent context.
+        let (discord_ctx, discord_items, _discord_refs) =
             self.discord_grounding_context(issue, 5, attempt_id).await;
         if !discord_ctx.is_empty() {
             let metric = ProcessingMetric::new("discord_search_context_added", 1.0)
@@ -2100,7 +2101,7 @@ impl IssueProcessor {
         } else {
             String::new()
         };
-        let (discord_ctx, discord_items) = self
+        let (discord_ctx, discord_items, discord_refs) = self
             .discord_grounding_context(issue, self.config.qa.max_context_chunks, attempt_id)
             .await;
         if !discord_ctx.is_empty() {
@@ -2141,7 +2142,14 @@ impl IssueProcessor {
 
         match answer_result {
             Ok(Ok(answer)) => {
-                match self.notifier.notify_answer(issue, &answer).await {
+                // Append jump links to the referenced discussions for delivery only;
+                // the stored answer (for reply-chain grounding) stays clean.
+                let answer_to_send = if discord_refs.is_empty() {
+                    answer.clone()
+                } else {
+                    format!("{}{}", answer, discord_refs)
+                };
+                match self.notifier.notify_answer(issue, &answer_to_send).await {
                     Ok(sent_ids) => {
                         if !sent_ids.is_empty() {
                             if let Err(e) = self.tracker.record_answer_message_ids(
@@ -2409,7 +2417,8 @@ impl IssueProcessor {
         attempt_id: Option<i64>,
     ) -> VerifyResult {
         let project_dir = self.action_project_dir(resolution);
-        let context = self.build_rag_context(issue, attempt_id).await;
+        // Verify is read-only and posts no user-facing message, so drop the refs.
+        let (context, _discord_refs) = self.build_rag_context(issue, attempt_id).await;
 
         self.record_issue_decision(
             issue,
@@ -2529,7 +2538,7 @@ impl IssueProcessor {
         attempt_id: Option<i64>,
     ) -> ProcessingOutcome {
         let project_dir = self.action_project_dir(resolution);
-        let context = self.build_rag_context(issue, attempt_id).await;
+        let (context, discord_refs) = self.build_rag_context(issue, attempt_id).await;
 
         // The inbox key is the HelpScout mailbox id when present, else the source.
         let inbox_key = issue
@@ -2566,9 +2575,16 @@ impl IssueProcessor {
                 // Deliver: conversational sources go via the notifier; tracker
                 // sources post a comment on the ticket (falling back to notifier).
                 // Capture any sent message ids so a later reply maps back here.
+                // Referenced-discussion jump links are appended to notifier
+                // deliveries only; ticket comments keep the plain reply.
+                let reply_notify = if discord_refs.is_empty() {
+                    reply.clone()
+                } else {
+                    format!("{}{}", reply, discord_refs)
+                };
                 let mut answer_ids: Vec<String> = Vec::new();
                 let delivered: Result<()> = if qa_eligible_source(source_name) {
-                    match self.notifier.notify_answer(issue, &reply).await {
+                    match self.notifier.notify_answer(issue, &reply_notify).await {
                         Ok(ids) => {
                             answer_ids = ids;
                             Ok(())
@@ -2580,7 +2596,7 @@ impl IssueProcessor {
                         Ok(()) => Ok(()),
                         Err(e) => {
                             tracing::warn!(short_id = %issue.short_id, error = %e, "post_reply failed; falling back to notifier");
-                            match self.notifier.notify_answer(issue, &reply).await {
+                            match self.notifier.notify_answer(issue, &reply_notify).await {
                                 Ok(ids) => {
                                     answer_ids = ids;
                                     Ok(())
@@ -2662,7 +2678,10 @@ impl IssueProcessor {
     /// Retrieve RAG grounding context for an issue from the code index, plus any
     /// indexed Discord discussions.
     /// Build the RAG grounding context for the action pipeline (verify/reply).
-    async fn build_rag_context(&self, issue: &Issue, attempt_id: Option<i64>) -> String {
+    /// Returns the agent-facing context plus a Discord-markdown block of jump
+    /// links to any referenced discussions, for appending to the outgoing
+    /// notification (empty when there are none).
+    async fn build_rag_context(&self, issue: &Issue, attempt_id: Option<i64>) -> (String, String) {
         let mut retrieved_items: Vec<RetrievedItem> = Vec::new();
         let mut context = String::new();
         if let Some(ref code_search) = self.code_search_service {
@@ -2703,7 +2722,7 @@ impl IssueProcessor {
                 }
             }
         }
-        let (discord_ctx, discord_items) = self
+        let (discord_ctx, discord_items, discord_refs) = self
             .discord_grounding_context(issue, self.config.qa.max_context_chunks, attempt_id)
             .await;
         if !discord_ctx.is_empty() {
@@ -2723,7 +2742,7 @@ impl IssueProcessor {
             self.spawn_retrieval_judge(id, issue, &retrieved_items);
         }
 
-        context
+        (context, discord_refs)
     }
 
     /// Debug-gated confirmation that retrieval rows were persisted. Only emitted
@@ -2883,17 +2902,19 @@ impl IssueProcessor {
 
     /// Retrieve grounding context from the indexed Discord knowledge source.
     /// Returns the formatted context (empty when the source is disabled or yields
-    /// no results) plus the retrieved chunks as [`RetrievedItem`]s so the caller
-    /// can feed them to the relevance judge. When `attempt_id` is set, also
-    /// records the retrieved chunks for quality assessment.
+    /// no results), the retrieved chunks as [`RetrievedItem`]s so the caller can
+    /// feed them to the relevance judge, and a Discord-markdown block of jump
+    /// links to the referenced discussions for appending to the outgoing
+    /// notification. When `attempt_id` is set, also records the retrieved chunks
+    /// for quality assessment.
     async fn discord_grounding_context(
         &self,
         issue: &Issue,
         limit: usize,
         attempt_id: Option<i64>,
-    ) -> (String, Vec<RetrievedItem>) {
+    ) -> (String, Vec<RetrievedItem>, String) {
         let Some(ref discord_search) = self.discord_search_service else {
-            return (String::new(), Vec::new());
+            return (String::new(), Vec::new(), String::new());
         };
         let query = claudear_analysis::repo::code_index::build_code_search_query(issue);
         match discord_search.search(&query, None, limit).await {
@@ -2929,9 +2950,11 @@ impl IssueProcessor {
                 }
                 let context =
                     claudear_analysis::knowledgebase::format_discord_search_context(&results);
-                (context, items)
+                let refs =
+                    claudear_analysis::knowledgebase::format_discord_reference_links(&results);
+                (context, items, refs)
             }
-            _ => (String::new(), Vec::new()),
+            _ => (String::new(), Vec::new(), String::new()),
         }
     }
 
