@@ -3822,6 +3822,41 @@ mod tests {
     }
 
     #[test]
+    fn test_render_mcp_config_stdio_json_headers_env() {
+        // A stdio server whose env carries a JSON blob with ${VAR} references
+        // (e.g. Grafana behind Cloudflare Access). The value is written verbatim;
+        // Claude Code expands the ${VAR}s at runtime, including inside the string.
+        let name = "grafana".to_string();
+        let mut env = HashMap::new();
+        env.insert(
+            "GRAFANA_SERVICE_ACCOUNT_TOKEN".to_string(),
+            "${GRAFANA_SERVICE_ACCOUNT_TOKEN}".to_string(),
+        );
+        let headers_json =
+            "{\"CF-Access-Client-Id\": \"${CF_ACCESS_CLIENT_ID}\", \"CF-Access-Client-Secret\": \"${CF_ACCESS_CLIENT_SECRET}\"}";
+        env.insert("GRAFANA_EXTRA_HEADERS".to_string(), headers_json.to_string());
+        let cfg = McpServerConfig {
+            command: Some("uvx".to_string()),
+            args: vec!["mcp-grafana".to_string()],
+            env,
+            sources: vec!["sentry".to_string()],
+            ..Default::default()
+        };
+        let servers = vec![(&name, &cfg)];
+        let file = ClaudeAgentRunner::render_mcp_config(&servers).expect("render");
+        let doc: serde_json::Value = serde_json::from_str(&read_temp(&file)).unwrap();
+        let server = &doc["mcpServers"]["grafana"];
+        assert_eq!(server["command"], "uvx");
+        assert_eq!(server["args"][0], "mcp-grafana");
+        assert_eq!(
+            server["env"]["GRAFANA_SERVICE_ACCOUNT_TOKEN"],
+            "${GRAFANA_SERVICE_ACCOUNT_TOKEN}"
+        );
+        // The JSON blob survives round-trip unescaped and unexpanded.
+        assert_eq!(server["env"]["GRAFANA_EXTRA_HEADERS"], headers_json);
+    }
+
+    #[test]
     fn test_render_mcp_config_http() {
         let name = "remote".to_string();
         let mut headers = HashMap::new();
