@@ -245,6 +245,9 @@ pub struct ClaudeRunnerConfig {
     /// MCP servers to attach, keyed by server name. Attachment is gated per-run
     /// by each server's `sources` list against the issue source.
     pub mcp: HashMap<String, McpServerConfig>,
+    /// Mirrors the global `debug_logging` flag. When true, the rendered MCP
+    /// config is logged (with secret values redacted) on each attach.
+    pub debug_logging: bool,
 }
 
 impl Default for ClaudeRunnerConfig {
@@ -259,6 +262,7 @@ impl Default for ClaudeRunnerConfig {
             binary: "claude".to_string(),
             env: HashMap::new(),
             mcp: HashMap::new(),
+            debug_logging: false,
         }
     }
 }
@@ -828,6 +832,50 @@ The PR title should include the issue ID: {}
         Ok(file)
     }
 
+    /// A redacted JSON view of the matched MCP servers for debug logging.
+    /// Mirrors what `render_mcp_config` writes, but masks every `env`/`headers`
+    /// value that could hold a secret. Pure `${VAR}` references are shown as-is
+    /// (they name a variable, not a secret); anything else becomes "***".
+    fn redact_mcp_for_log(servers: &[(&String, &McpServerConfig)]) -> serde_json::Value {
+        let mask = |v: &str| -> String {
+            let t = v.trim();
+            if t.starts_with("${") && t.ends_with('}') && !t[2..].contains("${") {
+                v.to_string()
+            } else {
+                "***".to_string()
+            }
+        };
+        let redact_map = |m: &std::collections::HashMap<String, String>| -> serde_json::Value {
+            json!(m
+                .iter()
+                .map(|(k, v)| (k.clone(), mask(v)))
+                .collect::<std::collections::HashMap<_, _>>())
+        };
+        let mut out = serde_json::Map::new();
+        for (name, cfg) in servers {
+            let mut entry = serde_json::Map::new();
+            if let Some(ref command) = cfg.command {
+                entry.insert("command".to_string(), json!(command));
+                entry.insert("args".to_string(), json!(cfg.args));
+                if !cfg.env.is_empty() {
+                    entry.insert("env".to_string(), redact_map(&cfg.env));
+                }
+            } else if let Some(ref url) = cfg.url {
+                entry.insert("url".to_string(), json!(url));
+                if !cfg.headers.is_empty() {
+                    entry.insert("headers".to_string(), redact_map(&cfg.headers));
+                }
+            }
+            if let Some(ref transport) = cfg.transport {
+                entry.insert("type".to_string(), json!(transport));
+            }
+            entry.insert("sources".to_string(), json!(cfg.sources));
+            entry.insert("tools".to_string(), json!(cfg.tools));
+            out.insert((*name).clone(), serde_json::Value::Object(entry));
+        }
+        json!({ "mcpServers": serde_json::Value::Object(out) })
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn execute_with_env_and_attempt(
         &self,
@@ -906,6 +954,16 @@ The PR title should include the issue ID: {}
                         servers = matched_mcp.len(),
                         "Attaching MCP servers to run"
                     );
+                    if self.config.debug_logging {
+                        let redacted = Self::redact_mcp_for_log(&matched_mcp);
+                        tracing::info!(
+                            component = "claude",
+                            label = label,
+                            path = %file.path().display(),
+                            config = %redacted,
+                            "Rendered MCP config (secret values redacted)"
+                        );
+                    }
                     mcp_config_file = Some(file);
                 }
                 Err(e) => {
@@ -3822,6 +3880,56 @@ mod tests {
     }
 
     #[test]
+    fn test_redact_mcp_for_log_masks_secrets() {
+        let name = "grafana".to_string();
+        let mut env = HashMap::new();
+        // Pure ${VAR} ref -> shown; literal secret and JSON blob -> masked.
+        env.insert(
+            "GRAFANA_URL".to_string(),
+            "https://tel.example.com/".to_string(),
+        );
+        env.insert(
+            "GRAFANA_SERVICE_ACCOUNT_TOKEN".to_string(),
+            "${GRAFANA_SERVICE_ACCOUNT_TOKEN}".to_string(),
+        );
+        env.insert(
+            "GRAFANA_TOKEN_LITERAL".to_string(),
+            "glsa_realsecret".to_string(),
+        );
+        env.insert(
+            "GRAFANA_EXTRA_HEADERS".to_string(),
+            "{\"CF-Access-Client-Id\": \"${CF_ID}\"}".to_string(),
+        );
+        let cfg = McpServerConfig {
+            command: Some("uvx".to_string()),
+            args: vec!["mcp-grafana".to_string()],
+            env,
+            sources: vec!["sentry".to_string()],
+            tools: vec!["list_datasources".to_string()],
+            ..Default::default()
+        };
+        let servers = vec![(&name, &cfg)];
+        let doc = ClaudeAgentRunner::redact_mcp_for_log(&servers);
+        let env_out = &doc["mcpServers"]["grafana"]["env"];
+        // Non-secret-looking URL is still masked (we mask all non-${VAR} values).
+        assert_eq!(env_out["GRAFANA_URL"], "***");
+        // Pure var reference passes through unmasked.
+        assert_eq!(
+            env_out["GRAFANA_SERVICE_ACCOUNT_TOKEN"],
+            "${GRAFANA_SERVICE_ACCOUNT_TOKEN}"
+        );
+        // Literal secret is masked.
+        assert_eq!(env_out["GRAFANA_TOKEN_LITERAL"], "***");
+        // JSON blob with an embedded ${VAR} is not a pure ref -> masked.
+        assert_eq!(env_out["GRAFANA_EXTRA_HEADERS"], "***");
+        // Non-secret structure is preserved.
+        assert_eq!(doc["mcpServers"]["grafana"]["command"], "uvx");
+        assert_eq!(doc["mcpServers"]["grafana"]["args"][0], "mcp-grafana");
+        assert_eq!(doc["mcpServers"]["grafana"]["sources"][0], "sentry");
+        assert_eq!(doc["mcpServers"]["grafana"]["tools"][0], "list_datasources");
+    }
+
+    #[test]
     fn test_render_mcp_config_stdio_json_headers_env() {
         // A stdio server whose env carries a JSON blob with ${VAR} references
         // (e.g. Grafana behind Cloudflare Access). The value is written verbatim;
@@ -3834,7 +3942,10 @@ mod tests {
         );
         let headers_json =
             "{\"CF-Access-Client-Id\": \"${CF_ACCESS_CLIENT_ID}\", \"CF-Access-Client-Secret\": \"${CF_ACCESS_CLIENT_SECRET}\"}";
-        env.insert("GRAFANA_EXTRA_HEADERS".to_string(), headers_json.to_string());
+        env.insert(
+            "GRAFANA_EXTRA_HEADERS".to_string(),
+            headers_json.to_string(),
+        );
         let cfg = McpServerConfig {
             command: Some("uvx".to_string()),
             args: vec!["mcp-grafana".to_string()],

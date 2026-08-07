@@ -3805,6 +3805,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         .default_provider_config()
                         .map(|p| p.mcp.clone())
                         .unwrap_or_default(),
+                    debug_logging: config.debug_logging,
                 },
                 tracker.clone(),
             )));
