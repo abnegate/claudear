@@ -171,7 +171,9 @@ jobs:
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
-          git clone https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/${{ github.repository_owner }}/homebrew-tap.git
+          # The tap is hosted under abnegate, not this repo's owner, so it
+          # cannot be derived from github.repository_owner.
+          git clone https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/abnegate/homebrew-tap.git
           mkdir -p homebrew-tap/Formula
           cp claudear.rb homebrew-tap/Formula/
           cd homebrew-tap
@@ -272,7 +274,9 @@ jobs:
         env:
           APT_REPO_TOKEN: ${{ secrets.APT_REPO_TOKEN }}
         run: |
-          git clone https://x-access-token:${APT_REPO_TOKEN}@github.com/${{ github.repository_owner }}/apt-repo.git
+          # The APT repo is hosted under abnegate, not this repo's owner, so it
+          # cannot be derived from github.repository_owner.
+          git clone https://x-access-token:${APT_REPO_TOKEN}@github.com/abnegate/apt-repo.git
 
       - name: Update APT repository
         env:
