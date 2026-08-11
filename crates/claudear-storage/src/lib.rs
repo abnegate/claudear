@@ -665,16 +665,32 @@ pub trait ActivityStore: Send + Sync {
     }
 
     /// Mark every not-yet-handled review comment on a PR as durably handled.
-    /// Called once the PR's review feedback has been successfully acted upon.
+    /// Use only when the whole PR is done (merged/closed); to acknowledge a
+    /// processed batch, prefer [`mark_pr_review_comments_handled_by_ids`] so a
+    /// concurrently-recorded comment isn't marked without being processed.
     fn mark_pr_review_comments_handled(&self, _pr_url: &str) -> Result<()> {
         Ok(())
     }
 
-    /// Record a failed attempt to act on a PR's unhandled review comments: bumps
-    /// each unhandled comment's attempt count and gives up (marks it handled) once
-    /// the count reaches `max_attempts`, so a poison comment does not re-run the
-    /// fix agent forever.
-    fn note_pr_review_comment_failure(&self, _pr_url: &str, _max_attempts: i64) -> Result<()> {
+    /// Mark only the given comment ids on a PR as durably handled. Called once the
+    /// batch that carried exactly these comments has been successfully acted upon.
+    fn mark_pr_review_comments_handled_by_ids(
+        &self,
+        _pr_url: &str,
+        _comment_ids: &[i64],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Record a failed attempt to act on the given comment ids: bumps each one's
+    /// attempt count and gives up (marks it handled) once the count reaches
+    /// `max_attempts`, so a poison comment does not re-run the fix agent forever.
+    fn note_pr_review_comment_failure_by_ids(
+        &self,
+        _pr_url: &str,
+        _comment_ids: &[i64],
+        _max_attempts: i64,
+    ) -> Result<()> {
         Ok(())
     }
 

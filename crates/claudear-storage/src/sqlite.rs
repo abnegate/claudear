@@ -2014,20 +2014,82 @@ impl ActivityStore for SqliteTracker {
         Ok(())
     }
 
-    fn note_pr_review_comment_failure(&self, pr_url: &str, max_attempts: i64) -> Result<()> {
+    fn mark_pr_review_comments_handled_by_ids(
+        &self,
+        pr_url: &str,
+        comment_ids: &[i64],
+    ) -> Result<()> {
+        if comment_ids.is_empty() {
+            return Ok(());
+        }
         let conn = self.acquire_lock()?;
-        // Count this failed cycle against every still-unhandled comment on the PR.
-        conn.execute(
+        let placeholders = vec!["?"; comment_ids.len()].join(", ");
+        let sql = format!(
+            "UPDATE pr_review_comments SET handled_at = datetime('now') \
+             WHERE pr_url = ?1 AND handled_at IS NULL AND scm_comment_id IN ({})",
+            placeholders
+        );
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(comment_ids.len() + 1);
+        binds.push(Box::new(pr_url.to_string()));
+        for id in comment_ids {
+            binds.push(Box::new(*id));
+        }
+        conn.execute(&sql, rusqlite::params_from_iter(binds.iter().map(|b| &**b)))?;
+        Ok(())
+    }
+
+    fn note_pr_review_comment_failure_by_ids(
+        &self,
+        pr_url: &str,
+        comment_ids: &[i64],
+        max_attempts: i64,
+    ) -> Result<()> {
+        if comment_ids.is_empty() {
+            return Ok(());
+        }
+        let conn = self.acquire_lock()?;
+        let placeholders = vec!["?"; comment_ids.len()].join(", ");
+
+        // Count this failed cycle against exactly the comments we tried.
+        let bump_sql = format!(
             "UPDATE pr_review_comments SET attempts = attempts + 1 \
-             WHERE pr_url = ? AND handled_at IS NULL",
-            params![pr_url],
-        )?;
+             WHERE pr_url = ?1 AND handled_at IS NULL AND scm_comment_id IN ({})",
+            placeholders
+        );
         // Give up on comments that have failed too many times so a poison comment
         // does not re-trigger the fix agent forever.
-        conn.execute(
+        let giveup_sql = format!(
             "UPDATE pr_review_comments SET handled_at = datetime('now') \
-             WHERE pr_url = ? AND handled_at IS NULL AND attempts >= ?",
-            params![pr_url, max_attempts],
+             WHERE pr_url = ?1 AND handled_at IS NULL AND attempts >= ?2 \
+             AND scm_comment_id IN ({})",
+            // ids start at bind position 3 for the give-up query
+            (0..comment_ids.len())
+                .map(|i| format!("?{}", i + 3))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
+        let mut bump_binds: Vec<Box<dyn rusqlite::ToSql>> =
+            Vec::with_capacity(comment_ids.len() + 1);
+        bump_binds.push(Box::new(pr_url.to_string()));
+        for id in comment_ids {
+            bump_binds.push(Box::new(*id));
+        }
+        conn.execute(
+            &bump_sql,
+            rusqlite::params_from_iter(bump_binds.iter().map(|b| &**b)),
+        )?;
+
+        let mut giveup_binds: Vec<Box<dyn rusqlite::ToSql>> =
+            Vec::with_capacity(comment_ids.len() + 2);
+        giveup_binds.push(Box::new(pr_url.to_string()));
+        giveup_binds.push(Box::new(max_attempts));
+        for id in comment_ids {
+            giveup_binds.push(Box::new(*id));
+        }
+        conn.execute(
+            &giveup_sql,
+            rusqlite::params_from_iter(giveup_binds.iter().map(|b| &**b)),
         )?;
         Ok(())
     }
@@ -11332,14 +11394,20 @@ mod tests {
         // A new comment fails repeatedly and is given up on at the cap.
         tracker.record_pr_review_comment(pr_url, &mk(3)).unwrap();
         assert_eq!(tracker.get_unhandled_pr_review_comments(pr_url).unwrap().len(), 1);
-        tracker.note_pr_review_comment_failure(pr_url, 3).unwrap(); // attempts=1
-        tracker.note_pr_review_comment_failure(pr_url, 3).unwrap(); // attempts=2
+        tracker
+            .note_pr_review_comment_failure_by_ids(pr_url, &[3], 3)
+            .unwrap(); // attempts=1
+        tracker
+            .note_pr_review_comment_failure_by_ids(pr_url, &[3], 3)
+            .unwrap(); // attempts=2
         assert_eq!(
             tracker.get_unhandled_pr_review_comments(pr_url).unwrap().len(),
             1,
             "should still retry below the cap"
         );
-        tracker.note_pr_review_comment_failure(pr_url, 3).unwrap(); // attempts=3 -> give up
+        tracker
+            .note_pr_review_comment_failure_by_ids(pr_url, &[3], 3)
+            .unwrap(); // attempts=3 -> give up
         assert!(
             tracker
                 .get_unhandled_pr_review_comments(pr_url)
@@ -11347,6 +11415,42 @@ mod tests {
                 .is_empty(),
             "should stop retrying once the attempt cap is reached"
         );
+    }
+
+    #[test]
+    fn test_mark_handled_by_ids_targets_only_given_comments() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let pr_url = "https://github.com/owner/repo/pull/9";
+
+        let mk = |id: i64| claudear_core::types::ReviewComment {
+            id,
+            path: String::new(),
+            position: None,
+            original_position: None,
+            body: "@claudear fix".to_string(),
+            user: claudear_core::types::ReviewUser {
+                id: 1,
+                login: "reviewer".to_string(),
+                user_type: None,
+            },
+            created_at: "2024-01-15T10:00:00Z".to_string(),
+            updated_at: "2024-01-15T10:00:00Z".to_string(),
+            html_url: format!("h{}", id),
+            pull_request_review_id: None,
+            start_line: None,
+            line: None,
+            side: None,
+        };
+        tracker.record_pr_review_comment(pr_url, &mk(1)).unwrap();
+        tracker.record_pr_review_comment(pr_url, &mk(2)).unwrap();
+
+        // Acknowledge only comment 1; comment 2 (recorded concurrently) survives.
+        tracker
+            .mark_pr_review_comments_handled_by_ids(pr_url, &[1])
+            .unwrap();
+        let unhandled = tracker.get_unhandled_pr_review_comments(pr_url).unwrap();
+        assert_eq!(unhandled.len(), 1);
+        assert_eq!(unhandled[0].id, 2);
     }
 
     #[test]
