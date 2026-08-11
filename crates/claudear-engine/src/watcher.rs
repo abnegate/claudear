@@ -1238,7 +1238,8 @@ impl Watcher {
 
         // Check for new reviews
         let events = review_watcher.check_for_reviews().await?;
-        for (pr_url, feedback_summary, feedback_count) in Self::group_review_feedback_by_pr(events)
+        for (pr_url, feedback_summary, feedback_count, comment_ids) in
+            Self::group_review_feedback_by_pr(events)
         {
             tracing::info!(
                 pr_url = %pr_url,
@@ -1266,10 +1267,13 @@ impl Watcher {
                 }
                 match self.process_review_action(&attempt, &feedback_summary).await {
                     Ok(()) => {
-                        // Durably handled: mark the PR's comments so they aren't
-                        // re-surfaced next cycle (at-least-once, exactly the success
-                        // path marks completion).
-                        if let Err(e) = self.tracker.mark_pr_review_comments_handled(&pr_url) {
+                        // Durably handled: acknowledge exactly the comments in this
+                        // batch so they aren't re-surfaced, without touching any
+                        // comment recorded concurrently while we were processing.
+                        if let Err(e) = self
+                            .tracker
+                            .mark_pr_review_comments_handled_by_ids(&pr_url, &comment_ids)
+                        {
                             tracing::warn!(pr_url = %pr_url, error = %e, "Failed to mark review comments handled");
                         }
                     }
@@ -1279,12 +1283,13 @@ impl Watcher {
                             error = %e,
                             "Failed to process review feedback; will retry next cycle"
                         );
-                        // Leave comments unhandled so they retry, but count the
-                        // failure so a poison comment eventually gives up.
-                        if let Err(e) = self
-                            .tracker
-                            .note_pr_review_comment_failure(&pr_url, MAX_REVIEW_COMMENT_ATTEMPTS)
-                        {
+                        // Leave the batch's comments unhandled so they retry, but
+                        // count the failure so a poison comment eventually gives up.
+                        if let Err(e) = self.tracker.note_pr_review_comment_failure_by_ids(
+                            &pr_url,
+                            &comment_ids,
+                            MAX_REVIEW_COMMENT_ATTEMPTS,
+                        ) {
                             tracing::warn!(pr_url = %pr_url, error = %e, "Failed to record review-comment failure");
                         }
                     }
@@ -1294,12 +1299,13 @@ impl Watcher {
                     pr_url = %pr_url,
                     "Received review for unknown PR, skipping"
                 );
-                // No attempt to act on; count it as a failure so unhandled ledger
-                // comments for an uncorrelated PR don't re-surface forever.
-                if let Err(e) = self
-                    .tracker
-                    .note_pr_review_comment_failure(&pr_url, MAX_REVIEW_COMMENT_ATTEMPTS)
-                {
+                // No attempt to act on; count it as a failure so this batch's
+                // uncorrelated comments don't re-surface forever.
+                if let Err(e) = self.tracker.note_pr_review_comment_failure_by_ids(
+                    &pr_url,
+                    &comment_ids,
+                    MAX_REVIEW_COMMENT_ATTEMPTS,
+                ) {
                     tracing::warn!(pr_url = %pr_url, error = %e, "Failed to record review-comment failure");
                 }
             }
@@ -1315,8 +1321,16 @@ impl Watcher {
         )
     }
 
-    fn group_review_feedback_by_pr(events: Vec<ReviewEvent>) -> Vec<(String, String, usize)> {
+    /// Group actionable review events per PR into (pr_url, feedback_summary,
+    /// feedback_count, comment_ids). `comment_ids` are exactly the ledger comments
+    /// carried by the batch, so acknowledgement can target them rather than the
+    /// whole PR (which would wrongly mark a concurrently-recorded comment handled).
+    fn group_review_feedback_by_pr(
+        events: Vec<ReviewEvent>,
+    ) -> Vec<(String, String, usize, Vec<i64>)> {
         let mut feedback_by_pr: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        let mut ids_by_pr: std::collections::HashMap<String, Vec<i64>> =
             std::collections::HashMap::new();
         let mut pr_order: Vec<String> = Vec::new();
 
@@ -1329,6 +1343,10 @@ impl Watcher {
             if !feedback_by_pr.contains_key(&pr_url) {
                 pr_order.push(pr_url.clone());
             }
+            ids_by_pr
+                .entry(pr_url.clone())
+                .or_default()
+                .extend(event.comment_ids());
             feedback_by_pr
                 .entry(pr_url)
                 .or_default()
@@ -1338,9 +1356,10 @@ impl Watcher {
         pr_order
             .into_iter()
             .filter_map(|pr_url| {
+                let ids = ids_by_pr.remove(&pr_url).unwrap_or_default();
                 feedback_by_pr.remove(&pr_url).map(|feedbacks| {
                     let count = feedbacks.len();
-                    (pr_url, feedbacks.join("\n\n---\n\n"), count)
+                    (pr_url, feedbacks.join("\n\n---\n\n"), count, ids)
                 })
             })
             .collect()
@@ -6323,6 +6342,53 @@ mod tests {
         assert!(grouped[0].1.contains("first"));
         assert!(grouped[0].1.contains("second"));
         assert!(grouped[0].1.contains("---"));
+        // Reviews carry no ledger comment ids.
+        assert!(grouped[0].3.is_empty());
+    }
+
+    #[test]
+    fn test_group_review_feedback_collects_comment_ids() {
+        // CommentsAdded events contribute their comment ids so acknowledgement can
+        // target exactly the batch, not the whole PR.
+        let mk = |id: i64| claudear_integrations::scm::ReviewComment {
+            id,
+            path: String::new(),
+            position: None,
+            original_position: None,
+            body: "@claudear fix".to_string(),
+            user: claudear_integrations::scm::ReviewUser {
+                id: 1,
+                login: "reviewer".to_string(),
+                user_type: None,
+            },
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+            html_url: format!("h{}", id),
+            pull_request_review_id: None,
+            start_line: None,
+            line: None,
+            side: None,
+        };
+        let events = vec![
+            claudear_integrations::scm::ReviewEvent::CommentsAdded {
+                pr_url: "https://github.com/org/repo/pull/1".to_string(),
+                repo: "org/repo".to_string(),
+                pr_number: 1,
+                comments: vec![mk(101), mk(102)],
+            },
+            claudear_integrations::scm::ReviewEvent::CommentsAdded {
+                pr_url: "https://github.com/org/repo/pull/1".to_string(),
+                repo: "org/repo".to_string(),
+                pr_number: 1,
+                comments: vec![mk(103)],
+            },
+        ];
+
+        let grouped = Watcher::group_review_feedback_by_pr(events);
+        assert_eq!(grouped.len(), 1);
+        let mut ids = grouped[0].3.clone();
+        ids.sort();
+        assert_eq!(ids, vec![101, 102, 103]);
     }
 
     #[tokio::test]
