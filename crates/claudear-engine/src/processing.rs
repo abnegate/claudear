@@ -1926,102 +1926,116 @@ impl IssueProcessor {
     /// encapsulates everything upstream). Other users' messages aren't in our DB,
     /// so they're fetched from Discord and the walk continues to their parent.
     async fn assemble_reply_chain(&self, issue: &Issue) -> Option<String> {
-        let parent_id = issue.get_metadata::<String>("reply_to_message_id")?;
-        let discord_cfg = self.config.discord_merged();
-        if !discord_cfg.reply_chain_enabled {
-            return None;
+        assemble_reply_chain(&self.config, self.tracker.as_ref(), issue).await
+    }
+}
+
+/// Free-function form of [`IssueProcessor::assemble_reply_chain`], callable
+/// wherever a `Config` and tracker are available (e.g. the watcher's intent
+/// classification loop, which runs before an `IssueProcessor` exists). See that
+/// method for the newest-first walk semantics.
+pub(crate) async fn assemble_reply_chain(
+    config: &Config,
+    tracker: &dyn FixAttemptTracker,
+    issue: &Issue,
+) -> Option<String> {
+    let parent_id = issue.get_metadata::<String>("reply_to_message_id")?;
+    let discord_cfg = config.discord_merged();
+    if !discord_cfg.reply_chain_enabled {
+        return None;
+    }
+    let max_depth = discord_cfg.reply_chain_max_depth.max(1);
+    let mut parent_channel = issue
+        .get_metadata::<String>("reply_to_channel_id")
+        .or_else(|| issue.get_metadata::<String>("channel_id"))
+        .unwrap_or_default();
+
+    // Newest-first accumulation; reversed to chronological order at the end.
+    let mut lines_rev: Vec<String> = Vec::new();
+    let mut client: Option<DiscordClient> = None;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut current_id = Some(parent_id);
+    let mut depth = 0usize;
+
+    while let Some(pid) = current_id.take() {
+        if depth >= max_depth || !seen.insert(pid.clone()) {
+            break;
         }
-        let max_depth = discord_cfg.reply_chain_max_depth.max(1);
-        let mut parent_channel = issue
-            .get_metadata::<String>("reply_to_channel_id")
-            .or_else(|| issue.get_metadata::<String>("channel_id"))
-            .unwrap_or_default();
+        depth += 1;
 
-        // Newest-first accumulation; reversed to chronological order at the end.
-        let mut lines_rev: Vec<String> = Vec::new();
-        let mut client: Option<DiscordClient> = None;
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut current_id = Some(parent_id);
-        let mut depth = 0usize;
-
-        while let Some(pid) = current_id.take() {
-            if depth >= max_depth || !seen.insert(pid.clone()) {
-                break;
-            }
-            depth += 1;
-
-            // Claudear's own answer? Pull question + answer from the DB and stop.
-            if let Ok(Some((src, answered_issue_id))) = self.tracker.lookup_answer_issue(&pid) {
-                if let Ok(Some(att)) = self.tracker.get_attempt(&src, &answered_issue_id) {
-                    if let Some(ans) = att.error_message.filter(|a| !a.trim().is_empty()) {
-                        lines_rev.push(format!("[Claudear]: {}", ans.trim()));
-                    }
+        // Claudear's own answer? Pull question + answer from the DB and stop.
+        if let Ok(Some((src, answered_issue_id))) = tracker.lookup_answer_issue(&pid) {
+            if let Ok(Some(att)) = tracker.get_attempt(&src, &answered_issue_id) {
+                if let Some(ans) = att.error_message.filter(|a| !a.trim().is_empty()) {
+                    lines_rev.push(format!("[Claudear]: {}", ans.trim()));
                 }
-                if let Ok(Some(emb)) = self.tracker.get_embedding(&src, &answered_issue_id) {
-                    let question = emb
-                        .description
-                        .filter(|d| !d.trim().is_empty())
-                        .or(emb.title)
-                        .unwrap_or_default();
-                    let question = strip_discord_mentions(question.trim());
-                    if !question.is_empty() {
-                        lines_rev.push(format!("[User]: {}", question));
-                    }
-                }
-                break;
             }
+            if let Ok(Some(emb)) = tracker.get_embedding(&src, &answered_issue_id) {
+                let question = emb
+                    .description
+                    .filter(|d| !d.trim().is_empty())
+                    .or(emb.title)
+                    .unwrap_or_default();
+                let question = strip_discord_mentions(question.trim());
+                if !question.is_empty() {
+                    lines_rev.push(format!("[User]: {}", question));
+                }
+            }
+            break;
+        }
 
-            // Otherwise it's another user's message not in our DB: fetch it.
-            let fetch_client = match client.as_ref() {
-                Some(c) => c,
-                None => {
-                    let token = discord_cfg.bot_token.as_ref().map(|s| s.expose())?;
-                    match DiscordClient::new(token) {
-                        Ok(c) => {
-                            client = Some(c);
-                            client.as_ref().unwrap()
+        // Otherwise it's another user's message not in our DB: fetch it.
+        let fetch_client = match client.as_ref() {
+            Some(c) => c,
+            None => {
+                let token = discord_cfg.bot_token.as_ref().map(|s| s.expose())?;
+                match DiscordClient::new(token) {
+                    Ok(c) => {
+                        client = Some(c);
+                        client.as_ref().unwrap()
+                    }
+                    Err(_) => break,
+                }
+            }
+        };
+
+        match fetch_client.get_message(&parent_channel, &pid).await {
+            Ok(msg) => {
+                let name = msg
+                    .author
+                    .as_ref()
+                    .map(|a| a.username.clone())
+                    .unwrap_or_else(|| "user".to_string());
+                let content = strip_discord_mentions(msg.content.trim());
+                if !content.is_empty() {
+                    lines_rev.push(format!("[User {}]: {}", name, content));
+                }
+                // Continue to this message's own parent, if it is a reply.
+                match msg.message_reference {
+                    Some(reference) => {
+                        if let Some(ch) = reference.channel_id {
+                            parent_channel = ch;
                         }
-                        Err(_) => break,
+                        current_id = reference.message_id;
                     }
+                    None => current_id = None,
                 }
-            };
-
-            match fetch_client.get_message(&parent_channel, &pid).await {
-                Ok(msg) => {
-                    let name = msg
-                        .author
-                        .as_ref()
-                        .map(|a| a.username.clone())
-                        .unwrap_or_else(|| "user".to_string());
-                    let content = strip_discord_mentions(msg.content.trim());
-                    if !content.is_empty() {
-                        lines_rev.push(format!("[User {}]: {}", name, content));
-                    }
-                    // Continue to this message's own parent, if it is a reply.
-                    match msg.message_reference {
-                        Some(reference) => {
-                            if let Some(ch) = reference.channel_id {
-                                parent_channel = ch;
-                            }
-                            current_id = reference.message_id;
-                        }
-                        None => current_id = None,
-                    }
-                }
-                // Deleted / no permission: stop gracefully with what we have.
-                Err(_) => break,
             }
+            // Deleted / no permission: stop gracefully with what we have.
+            Err(_) => break,
         }
-
-        if lines_rev.is_empty() {
-            return None;
-        }
-        lines_rev.reverse();
-        let mut out = String::from("## Prior conversation (Discord reply thread)\n");
-        out.push_str(&lines_rev.join("\n"));
-        Some(out)
     }
 
+    if lines_rev.is_empty() {
+        return None;
+    }
+    lines_rev.reverse();
+    let mut out = String::from("## Prior conversation (Discord reply thread)\n");
+    out.push_str(&lines_rev.join("\n"));
+    Some(out)
+}
+
+impl IssueProcessor {
     /// Prepend the resolved reply-chain transcript (if any) to `context`.
     async fn with_reply_chain(&self, issue: &Issue, context: String) -> String {
         match self.assemble_reply_chain(issue).await {
