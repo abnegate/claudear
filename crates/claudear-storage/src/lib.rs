@@ -3384,6 +3384,8 @@ mod tests {
                 last_review_time: None,
                 last_comment_id: None,
                 last_comment_time: None,
+                last_issue_comment_id: None,
+                last_issue_comment_time: None,
                 is_active: true,
             };
             assert!(t.save_pr_review_state(&state).is_ok());

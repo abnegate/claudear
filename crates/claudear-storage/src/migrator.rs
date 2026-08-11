@@ -56,6 +56,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "answer_message_ids",
         sql: include_str!("../../../migrations/V8__answer_message_ids.sql"),
     },
+    Migration {
+        version: 9,
+        name: "pr_review_states_issue_comments",
+        sql: include_str!("../../../migrations/V9__pr_review_states_issue_comments.sql"),
+    },
 ];
 
 /// Run all pending migrations against the given connection.
@@ -116,7 +121,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
 
         // Verify a table from V1 exists
         let count: u32 = conn
@@ -137,6 +142,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_col, 1);
+
+        // Verify the V9 column exists on pr_review_states.
+        let has_issue_comment_col: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('pr_review_states') WHERE name = 'last_issue_comment_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_issue_comment_col, 1);
     }
 
     #[test]
@@ -151,7 +166,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
     }
 
     #[test]
