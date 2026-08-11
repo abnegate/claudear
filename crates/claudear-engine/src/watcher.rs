@@ -1265,7 +1265,10 @@ impl Watcher {
                     review_watcher.unwatch_pr(&pr_url);
                     continue;
                 }
-                match self.process_review_action(&attempt, &feedback_summary).await {
+                match self
+                    .process_review_action(&attempt, &feedback_summary)
+                    .await
+                {
                     Ok(()) => {
                         // Durably handled: acknowledge exactly the comments in this
                         // batch so they aren't re-surfaced, without touching any
