@@ -11413,7 +11413,13 @@ mod tests {
 
         // A new comment fails repeatedly and is given up on at the cap.
         tracker.record_pr_review_comment(pr_url, &mk(3)).unwrap();
-        assert_eq!(tracker.get_unhandled_pr_review_comments(pr_url).unwrap().len(), 1);
+        assert_eq!(
+            tracker
+                .get_unhandled_pr_review_comments(pr_url)
+                .unwrap()
+                .len(),
+            1
+        );
         tracker
             .note_pr_review_comment_failure_by_ids(pr_url, &[3], 3)
             .unwrap(); // attempts=1
@@ -11421,7 +11427,10 @@ mod tests {
             .note_pr_review_comment_failure_by_ids(pr_url, &[3], 3)
             .unwrap(); // attempts=2
         assert_eq!(
-            tracker.get_unhandled_pr_review_comments(pr_url).unwrap().len(),
+            tracker
+                .get_unhandled_pr_review_comments(pr_url)
+                .unwrap()
+                .len(),
             1,
             "should still retry below the cap"
         );
@@ -11512,7 +11521,10 @@ mod tests {
         let comments = tracker.get_comments_for_pr(pr_url).unwrap();
         assert_eq!(comments.len(), 2, "colliding id overwrote a row");
         assert_eq!(
-            tracker.get_unhandled_pr_review_comments(pr_url).unwrap().len(),
+            tracker
+                .get_unhandled_pr_review_comments(pr_url)
+                .unwrap()
+                .len(),
             2
         );
     }

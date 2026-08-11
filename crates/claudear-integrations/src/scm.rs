@@ -403,9 +403,7 @@ impl ReviewEvent {
             ReviewEvent::ReviewSubmitted {
                 inline_comments, ..
             } => inline_comments.iter().map(|c| c.id).collect(),
-            ReviewEvent::CommentsAdded { comments, .. } => {
-                comments.iter().map(|c| c.id).collect()
-            }
+            ReviewEvent::CommentsAdded { comments, .. } => comments.iter().map(|c| c.id).collect(),
         }
     }
 
@@ -1338,7 +1336,9 @@ impl ReviewWatcher {
         // Only trigger-matched conversation comments are actionable feedback.
         let conversation_feedback: Vec<ReviewComment> = new_conversation_comments
             .iter()
-            .filter(|c| trigger.is_empty() || c.body.to_lowercase().contains(&trigger.to_lowercase()))
+            .filter(|c| {
+                trigger.is_empty() || c.body.to_lowercase().contains(&trigger.to_lowercase())
+            })
             .cloned()
             .collect();
 
@@ -5699,6 +5699,7 @@ mod tests {
 
     #[cfg(feature = "sqlite")]
     mod sqlite_persistence_tests {
+        use crate::scm::ReviewEvent;
         use crate::scm::{
             CodeReview, PrInfo, PrReviewState, PrStatus, RemoteRepo, ReviewComment, ReviewUser,
             ReviewWatcher, ScmProvider,
@@ -5708,7 +5709,6 @@ mod tests {
         use claudear_core::types::{
             ActivityLogEntry, FixAttempt, FixAttemptStats, FixAttemptStatus, PrReviewRecord,
         };
-        use crate::scm::ReviewEvent;
         use claudear_storage::{
             ActivityStore, AttemptTracker, ChatStore, DiscordStore, EmbeddingStore,
             EvaluationStore, ExperimentStore, FixAttemptTracker, KnowledgeStore, RegressionStore,
