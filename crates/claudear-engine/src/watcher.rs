@@ -3192,11 +3192,14 @@ Create a PR with your changes.{custom_instructions}"#,
                 // Ground the classification in the Discord reply thread (if any) so a
                 // follow-up in an ongoing QA conversation ("yes create a pr now") is
                 // classified in context and can escalate out of the read-only lane,
-                // instead of being judged as an isolated, ambiguous message.
+                // instead of being judged as an isolated, ambiguous message. Only
+                // Claudear's own answers feed routing, so untrusted user text in the
+                // thread cannot inject a fix/PR escalation.
                 let conversation = crate::processing::assemble_reply_chain(
                     &self.config,
                     self.tracker.as_ref(),
                     issue,
+                    crate::processing::TranscriptTrust::ClaudearOnly,
                 )
                 .await;
                 intents.push(
