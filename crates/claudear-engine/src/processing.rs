@@ -2412,7 +2412,13 @@ impl IssueProcessor {
     /// back to the label/source heuristic (matching `FixAttempt::is_bug`).
     async fn classify_is_bug_or_security(&self, issue: &Issue) -> bool {
         if let Some(classifier) = self.intent_classifier.as_ref() {
-            if let Some(intent) = classifier.classify_intent(issue).await {
+            // Classify in the context of the reply thread so a follow-up is judged
+            // against the ongoing conversation, not in isolation.
+            let conversation = self.assemble_reply_chain(issue).await;
+            if let Some(intent) = classifier
+                .classify_intent(issue, conversation.as_deref())
+                .await
+            {
                 return intent.is_bug_or_security();
             }
         }
