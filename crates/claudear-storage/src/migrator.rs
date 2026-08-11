@@ -162,6 +162,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_handled_col, 1);
+
+        let has_kind_col: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('pr_review_comments') WHERE name = 'comment_kind'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_kind_col, 1);
     }
 
     #[test]
