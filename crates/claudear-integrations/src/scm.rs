@@ -393,6 +393,22 @@ impl ReviewEvent {
         }
     }
 
+    /// The ledger comment ids carried by this event: standalone/conversation
+    /// comments for `CommentsAdded`, inline comments for `ReviewSubmitted`. Used to
+    /// acknowledge exactly the comments in a processed batch, so a comment recorded
+    /// concurrently (e.g. a webhook `check_for_pr`) isn't marked handled without
+    /// being processed. A formal review has no ledger row and contributes none.
+    pub fn comment_ids(&self) -> Vec<i64> {
+        match self {
+            ReviewEvent::ReviewSubmitted {
+                inline_comments, ..
+            } => inline_comments.iter().map(|c| c.id).collect(),
+            ReviewEvent::CommentsAdded { comments, .. } => {
+                comments.iter().map(|c| c.id).collect()
+            }
+        }
+    }
+
     /// Check if this event requires agent action.
     pub fn requires_action(&self) -> bool {
         match self {
