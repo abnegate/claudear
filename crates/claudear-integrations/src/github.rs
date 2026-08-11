@@ -290,6 +290,97 @@ impl<H: HttpClient> GitHubClient<H> {
         Ok(all_comments)
     }
 
+    /// Get a PR's *conversation* comments (the issue-comment timeline), as opposed
+    /// to inline review-thread comments. GitHub models a PR as an issue, so these
+    /// come from `/repos/{repo}/issues/{n}/comments` — a plain "@claudear fix this"
+    /// left on the PR conversation lands here, not in `/pulls/{n}/comments`.
+    ///
+    /// They are mapped into [`ReviewComment`] with an empty `path`/absent `line`
+    /// and no `pull_request_review_id`, so they flow through the same standalone
+    /// review-feedback pipeline as inline comments.
+    pub async fn get_pr_issue_comments(
+        &self,
+        repo: &str,
+        pr_number: i64,
+    ) -> Result<Vec<ReviewComment>> {
+        // A PR conversation comment as returned by the issues-comments endpoint.
+        // Only the fields we carry forward are deserialized.
+        #[derive(serde::Deserialize)]
+        struct GitHubIssueComment {
+            id: i64,
+            #[serde(default)]
+            body: Option<String>,
+            user: ReviewUser,
+            created_at: String,
+            updated_at: String,
+            html_url: String,
+        }
+
+        let token = self
+            .config
+            .token
+            .as_ref()
+            .ok_or_else(|| Error::config("GitHub token not configured"))?
+            .expose();
+
+        let base_url = format!(
+            "https://api.github.com/repos/{}/issues/{}/comments",
+            repo, pr_number
+        );
+        let headers = self.build_headers(token);
+
+        let mut all_comments = Vec::new();
+        let mut page = 1usize;
+        const DEFAULT_PAGE_SIZE: usize = 30;
+        const MAX_PAGES: usize = 100;
+
+        loop {
+            let url = if page == 1 {
+                base_url.clone()
+            } else {
+                format!("{}?page={}", base_url, page)
+            };
+            let response = self.http.get(&url, headers.clone()).await?;
+
+            if !response.is_success() {
+                return Err(Error::Other(format!(
+                    "GitHub API error ({}): {}",
+                    response.status, response.body
+                )));
+            }
+
+            let comments: Vec<GitHubIssueComment> = response.json()?;
+            let count = comments.len();
+            all_comments.extend(comments.into_iter().map(|c| ReviewComment {
+                id: c.id,
+                path: String::new(),
+                position: None,
+                original_position: None,
+                body: c.body.unwrap_or_default(),
+                user: c.user,
+                created_at: c.created_at,
+                updated_at: c.updated_at,
+                html_url: c.html_url,
+                pull_request_review_id: None,
+                line: None,
+                start_line: None,
+                side: None,
+            }));
+
+            if count < DEFAULT_PAGE_SIZE {
+                break;
+            }
+
+            page += 1;
+            if page > MAX_PAGES {
+                tracing::warn!(repo = %repo, pr_number, "Hit pagination limit for PR issue comments");
+                break;
+            }
+        }
+
+        Ok(all_comments)
+    }
+
     /// Get the GitHub token (if configured).
     pub fn token(&self) -> Option<&str> {
         self.config.token.expose_as_deref()
@@ -950,6 +1041,14 @@ impl<H: HttpClient> ScmProvider for GitHubClient<H> {
 
     async fn get_review_comments(&self, project: &str, number: i64) -> Result<Vec<ReviewComment>> {
         self.get_pr_review_comments(project, number).await
+    }
+
+    async fn get_pr_conversation_comments(
+        &self,
+        project: &str,
+        number: i64,
+    ) -> Result<Vec<ReviewComment>> {
+        self.get_pr_issue_comments(project, number).await
     }
 
     async fn list_repos(&self, org_or_group: &str) -> Result<Vec<RemoteRepo>> {
