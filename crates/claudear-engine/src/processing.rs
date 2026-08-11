@@ -538,10 +538,31 @@ impl IssueProcessor {
                 .iter()
                 .any(|s| s.category == claudear_core::types::EvalCategory::Test);
             if !has_test_baseline {
-                tracing::warn!(
-                    short_id = %issue.short_id,
-                    "require_red_green set but no test tool detected; skipping red-green"
+                // Fail closed: require_red_green demands a confirmed failing
+                // reproduction before any mutation. With no test tool we cannot
+                // author or run a failing test, so abort rather than fall through
+                // into the fix pipeline unguarded.
+                let error = "Red-green: require_red_green is set but no test tool was detected; cannot confirm a failing reproduction".to_string();
+                tracing::warn!(short_id = %issue.short_id, "{}", error);
+                let _ = self.tracker.record_action_run(
+                    source_name,
+                    &issue.id,
+                    &issue.short_id,
+                    "red_green",
+                    "no_test_tool",
+                    &error,
                 );
+                self.record_issue_decision(
+                    issue,
+                    "red_green_no_test_tool",
+                    error.clone(),
+                    json!({}),
+                );
+                self.tracker
+                    .mark_failed(source_name, &issue.id, &error)
+                    .ok();
+                self.cleanup_worktree(resolution, issue, &project_dir).await;
+                return Ok(ProcessingOutcome::Failed { error });
             } else {
                 self.record_timeline_event(
                     issue,
@@ -627,8 +648,34 @@ impl IssueProcessor {
                         );
                     }
                     Err(e) => {
-                        // Agent infra error: skip the red gate rather than fail the attempt.
-                        tracing::warn!(short_id = %issue.short_id, error = %e, "Red phase agent run failed; skipping red-green");
+                        // Fail closed: a red-phase agent error means we never
+                        // confirmed a failing reproduction. Under require_red_green
+                        // that gate is mandatory, so abort rather than proceed into
+                        // the mutation pipeline unguarded.
+                        let error = format!(
+                            "Red-green: red-phase agent run failed; cannot confirm a failing reproduction: {}",
+                            e
+                        );
+                        tracing::warn!(short_id = %issue.short_id, error = %e, "Red phase agent run failed; failing closed under require_red_green");
+                        let _ = self.tracker.record_action_run(
+                            source_name,
+                            &issue.id,
+                            &issue.short_id,
+                            "red_green",
+                            "agent_error",
+                            &error,
+                        );
+                        self.record_issue_decision(
+                            issue,
+                            "red_green_agent_error",
+                            error.clone(),
+                            json!({}),
+                        );
+                        self.tracker
+                            .mark_failed(source_name, &issue.id, &error)
+                            .ok();
+                        self.cleanup_worktree(resolution, issue, &project_dir).await;
+                        return Ok(ProcessingOutcome::Failed { error });
                     }
                 }
             }
