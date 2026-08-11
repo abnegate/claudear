@@ -1207,8 +1207,12 @@ impl ReviewWatcher {
             .cloned()
             .collect();
 
+        // Record new comments to the durable ledger. Track whether every write
+        // succeeded: if any failed, the inline cursor is held back below so the
+        // affected comment is re-fetched next poll rather than lost (a comment that
+        // is neither recorded nor re-fetchable would be dropped).
+        let mut inline_records_ok = true;
         if !attached_comment_ids.is_empty() || !standalone_comments.is_empty() {
-            // Record all new comments to database
             if let Some(ref tracker) = self.tracker {
                 for event in &events {
                     if let ReviewEvent::ReviewSubmitted {
@@ -1218,12 +1222,13 @@ impl ReviewWatcher {
                         for comment in inline_comments {
                             if let Err(e) = tracker.record_pr_review_comment(&state.pr_url, comment)
                             {
+                                inline_records_ok = false;
                                 tracing::warn!(
                                     component = "review_watcher",
                                     pr_url = %state.pr_url,
                                     comment_id = comment.id,
                                     error = %e,
-                                    "Failed to record PR review comment"
+                                    "Failed to record PR review comment; holding cursor"
                                 );
                             }
                         }
@@ -1231,19 +1236,22 @@ impl ReviewWatcher {
                 }
                 for comment in &standalone_comments {
                     if let Err(e) = tracker.record_pr_review_comment(&state.pr_url, comment) {
+                        inline_records_ok = false;
                         tracing::warn!(
                             component = "review_watcher",
                             pr_url = %state.pr_url,
                             comment_id = comment.id,
                             error = %e,
-                            "Failed to record PR review comment"
+                            "Failed to record PR review comment; holding cursor"
                         );
                     }
                 }
             }
         }
 
-        if !cursor_comments.is_empty() {
+        // Advance the inline-comment cursor only once every comment is durably
+        // recorded; the ledger, not the cursor, guarantees no comment is lost.
+        if inline_records_ok && !cursor_comments.is_empty() {
             // Update state cursor using all processed comments (including non-trigger comments)
             // to prevent repeatedly scanning unchanged comments every poll cycle.
             let mut latest_comment_id = state.last_comment_id;
@@ -5782,6 +5790,7 @@ mod tests {
             activity_calls: Arc<Mutex<Vec<String>>>,
             unhandled: Arc<Mutex<Vec<ReviewComment>>>,
             handled_calls: Arc<Mutex<Vec<String>>>,
+            fail_record: Arc<Mutex<bool>>,
         }
 
         impl MockTrackerWithRecording {
@@ -5791,11 +5800,16 @@ mod tests {
                     activity_calls: Arc::new(Mutex::new(Vec::new())),
                     unhandled: Arc::new(Mutex::new(Vec::new())),
                     handled_calls: Arc::new(Mutex::new(Vec::new())),
+                    fail_record: Arc::new(Mutex::new(false)),
                 }
             }
 
             fn set_unhandled(&self, comments: Vec<ReviewComment>) {
                 *self.unhandled.lock().unwrap() = comments;
+            }
+
+            fn set_fail_record(&self, fail: bool) {
+                *self.fail_record.lock().unwrap() = fail;
             }
         }
 
@@ -5897,6 +5911,18 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push(entry.activity_type.clone());
+                Ok(1)
+            }
+            fn record_pr_review_comment(
+                &self,
+                _pr_url: &str,
+                _comment: &ReviewComment,
+            ) -> Result<i64> {
+                if *self.fail_record.lock().unwrap() {
+                    return Err(claudear_core::error::Error::Other(
+                        "simulated record failure".to_string(),
+                    ));
+                }
                 Ok(1)
             }
             fn get_unhandled_pr_review_comments(
@@ -6004,6 +6030,35 @@ mod tests {
             let activity_calls = tracker.activity_calls.lock().unwrap();
             assert_eq!(activity_calls.len(), 1);
             assert_eq!(activity_calls[0], "pr_review_received");
+        }
+
+        #[tokio::test]
+        async fn test_failed_comment_record_holds_cursor() {
+            // If recording a standalone comment fails, the inline cursor must NOT
+            // advance past it — otherwise it is neither in the ledger nor re-fetched,
+            // and its feedback is lost.
+            let mock = MockScmProvider::new("github", true, "@claudear");
+            mock.set_comments(vec![make_comment(
+                55,
+                "@claudear please fix",
+                "2025-01-02T00:00:00Z",
+                None,
+            )]);
+            let provider: Arc<dyn ScmProvider> = Arc::new(mock);
+            let tracker = Arc::new(MockTrackerWithRecording::new());
+            tracker.set_fail_record(true);
+            let watcher = ReviewWatcher::with_tracker(provider, tracker.clone());
+            let pr_url = "https://github.com/org/repo/pull/1";
+            watcher.watch_pr(make_state(pr_url, "org/repo", 1));
+
+            let _ = watcher.check_for_reviews().await.unwrap();
+
+            // Cursor held at its initial (unset) value so the comment is re-fetched.
+            let state = watcher.get_state(pr_url).unwrap();
+            assert_eq!(
+                state.last_comment_id, None,
+                "cursor advanced past a comment that failed to record"
+            );
         }
 
         #[tokio::test]
