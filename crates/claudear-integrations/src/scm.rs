@@ -1438,20 +1438,31 @@ impl ReviewWatcher {
         // they come back through this query too — dedup against what we're already
         // emitting this cycle (the batch plus inline comments on review events).
         if let Some(ref tracker) = self.tracker {
-            let mut seen: std::collections::HashSet<i64> =
-                added_comments.iter().map(|c| c.id).collect();
+            // Dedup keyed on (id, kind): an inline and a conversation comment can
+            // share a numeric id, so an id-only key would collapse them and drop
+            // whichever is seen second. Conversation comments carry no path.
+            let key = |c: &ReviewComment| {
+                let kind = if c.path.is_empty() {
+                    "conversation"
+                } else {
+                    "inline"
+                };
+                (c.id, kind)
+            };
+            let mut seen: std::collections::HashSet<(i64, &'static str)> =
+                added_comments.iter().map(&key).collect();
             for event in &events {
                 if let ReviewEvent::ReviewSubmitted {
                     inline_comments, ..
                 } = event
                 {
-                    seen.extend(inline_comments.iter().map(|c| c.id));
+                    seen.extend(inline_comments.iter().map(&key));
                 }
             }
             match tracker.get_unhandled_pr_review_comments(&state.pr_url) {
                 Ok(pending) => {
                     for comment in pending {
-                        if seen.insert(comment.id) {
+                        if seen.insert(key(&comment)) {
                             added_comments.push(comment);
                         }
                     }
@@ -6120,6 +6131,52 @@ mod tests {
             assert_eq!(comment_events.len(), 1, "unhandled comment not re-surfaced");
             assert_eq!(comment_events[0].len(), 1);
             assert_eq!(comment_events[0][0].id, 4242);
+        }
+
+        #[tokio::test]
+        async fn test_resurface_keeps_colliding_ids_distinct() {
+            // An inline (non-empty path) and a conversation (empty path) comment
+            // share id 7. The re-surface dedup keys on (id, kind), so both must be
+            // emitted rather than collapsed to one.
+            let base = |path: &str| ReviewComment {
+                id: 7,
+                path: path.to_string(),
+                position: None,
+                original_position: None,
+                body: "@claudear fix".to_string(),
+                user: ReviewUser {
+                    id: 0,
+                    login: "reviewer".to_string(),
+                    user_type: None,
+                },
+                created_at: "2025-01-01T00:00:00Z".to_string(),
+                updated_at: "2025-01-01T00:00:00Z".to_string(),
+                html_url: "h".to_string(),
+                pull_request_review_id: None,
+                start_line: None,
+                line: None,
+                side: None,
+            };
+            let provider: Arc<dyn ScmProvider> =
+                Arc::new(MockScmProvider::new("github", true, "@claudear"));
+            let tracker = Arc::new(MockTrackerWithRecording::new());
+            tracker.set_unhandled(vec![base("src/main.rs"), base("")]);
+            let watcher = ReviewWatcher::with_tracker(provider, tracker.clone());
+            watcher.watch_pr(make_state(
+                "https://github.com/org/repo/pull/1",
+                "org/repo",
+                1,
+            ));
+
+            let events = watcher.check_for_reviews().await.unwrap();
+            let emitted: usize = events
+                .iter()
+                .filter_map(|e| match e {
+                    ReviewEvent::CommentsAdded { comments, .. } => Some(comments.len()),
+                    _ => None,
+                })
+                .sum();
+            assert_eq!(emitted, 2, "colliding-id comments collapsed on re-surface");
         }
 
         #[tokio::test]
