@@ -393,17 +393,31 @@ impl ReviewEvent {
         }
     }
 
-    /// The ledger comment ids carried by this event: standalone/conversation
-    /// comments for `CommentsAdded`, inline comments for `ReviewSubmitted`. Used to
-    /// acknowledge exactly the comments in a processed batch, so a comment recorded
+    /// The ledger comment references carried by this event as
+    /// `(scm_comment_id, comment_kind)`: standalone/conversation comments for
+    /// `CommentsAdded`, inline comments for `ReviewSubmitted`. The kind namespaces
+    /// the id so acknowledgement targets exactly the right ledger row even when an
+    /// inline and a conversation comment share a numeric id. Used to acknowledge
+    /// exactly the comments in a processed batch, so a comment recorded
     /// concurrently (e.g. a webhook `check_for_pr`) isn't marked handled without
     /// being processed. A formal review has no ledger row and contributes none.
-    pub fn comment_ids(&self) -> Vec<i64> {
+    pub fn comment_refs(&self) -> Vec<(i64, &'static str)> {
+        // Conversation comments carry no file path; inline comments always do —
+        // the same discriminator the storage layer uses when recording.
+        let kind = |c: &ReviewComment| {
+            if c.path.is_empty() {
+                "conversation"
+            } else {
+                "inline"
+            }
+        };
         match self {
             ReviewEvent::ReviewSubmitted {
                 inline_comments, ..
-            } => inline_comments.iter().map(|c| c.id).collect(),
-            ReviewEvent::CommentsAdded { comments, .. } => comments.iter().map(|c| c.id).collect(),
+            } => inline_comments.iter().map(|c| (c.id, kind(c))).collect(),
+            ReviewEvent::CommentsAdded { comments, .. } => {
+                comments.iter().map(|c| (c.id, kind(c))).collect()
+            }
         }
     }
 

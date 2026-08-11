@@ -2028,21 +2028,25 @@ impl ActivityStore for SqliteTracker {
     fn mark_pr_review_comments_handled_by_ids(
         &self,
         pr_url: &str,
-        comment_ids: &[i64],
+        comments: &[(i64, &str)],
     ) -> Result<()> {
-        if comment_ids.is_empty() {
+        if comments.is_empty() {
             return Ok(());
         }
         let conn = self.acquire_lock()?;
-        let placeholders = vec!["?"; comment_ids.len()].join(", ");
+        // Match (comment_kind, scm_comment_id) pairs so a colliding id in the other
+        // namespace is not acknowledged by mistake.
+        let pair_clause =
+            vec!["(comment_kind = ? AND scm_comment_id = ?)"; comments.len()].join(" OR ");
         let sql = format!(
             "UPDATE pr_review_comments SET handled_at = datetime('now') \
-             WHERE pr_url = ?1 AND handled_at IS NULL AND scm_comment_id IN ({})",
-            placeholders
+             WHERE pr_url = ? AND handled_at IS NULL AND ({})",
+            pair_clause
         );
-        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(comment_ids.len() + 1);
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(comments.len() * 2 + 1);
         binds.push(Box::new(pr_url.to_string()));
-        for id in comment_ids {
+        for (id, kind) in comments {
+            binds.push(Box::new(kind.to_string()));
             binds.push(Box::new(*id));
         }
         conn.execute(&sql, rusqlite::params_from_iter(binds.iter().map(|b| &**b)))?;
@@ -2052,20 +2056,23 @@ impl ActivityStore for SqliteTracker {
     fn note_pr_review_comment_failure_by_ids(
         &self,
         pr_url: &str,
-        comment_ids: &[i64],
+        comments: &[(i64, &str)],
         max_attempts: i64,
     ) -> Result<()> {
-        if comment_ids.is_empty() {
+        if comments.is_empty() {
             return Ok(());
         }
         let conn = self.acquire_lock()?;
-        let placeholders = vec!["?"; comment_ids.len()].join(", ");
+        // Match (comment_kind, scm_comment_id) pairs so a colliding id in the other
+        // namespace is not charged by mistake.
+        let pair_clause =
+            vec!["(comment_kind = ? AND scm_comment_id = ?)"; comments.len()].join(" OR ");
 
         // Count this failed cycle against exactly the comments we tried.
         let bump_sql = format!(
             "UPDATE pr_review_comments SET attempts = attempts + 1 \
-             WHERE pr_url = ?1 AND handled_at IS NULL AND scm_comment_id IN ({})",
-            placeholders
+             WHERE pr_url = ? AND handled_at IS NULL AND ({})",
+            pair_clause
         );
         // Give up on at most ONE comment per failed cycle: the single worst
         // offender (most attempts) that has hit the cap. A batch failure can't be
@@ -2077,22 +2084,18 @@ impl ActivityStore for SqliteTracker {
             "UPDATE pr_review_comments SET handled_at = datetime('now') \
              WHERE id = ( \
                  SELECT id FROM pr_review_comments \
-                 WHERE pr_url = ?1 AND handled_at IS NULL AND attempts >= ?2 \
-                   AND scm_comment_id IN ({}) \
+                 WHERE pr_url = ? AND handled_at IS NULL AND attempts >= ? AND ({}) \
                  ORDER BY attempts DESC, scm_comment_id ASC \
                  LIMIT 1 \
              )",
-            // ids start at bind position 3 for the give-up query
-            (0..comment_ids.len())
-                .map(|i| format!("?{}", i + 3))
-                .collect::<Vec<_>>()
-                .join(", ")
+            pair_clause
         );
 
         let mut bump_binds: Vec<Box<dyn rusqlite::ToSql>> =
-            Vec::with_capacity(comment_ids.len() + 1);
+            Vec::with_capacity(comments.len() * 2 + 1);
         bump_binds.push(Box::new(pr_url.to_string()));
-        for id in comment_ids {
+        for (id, kind) in comments {
+            bump_binds.push(Box::new(kind.to_string()));
             bump_binds.push(Box::new(*id));
         }
         conn.execute(
@@ -2101,10 +2104,11 @@ impl ActivityStore for SqliteTracker {
         )?;
 
         let mut giveup_binds: Vec<Box<dyn rusqlite::ToSql>> =
-            Vec::with_capacity(comment_ids.len() + 2);
+            Vec::with_capacity(comments.len() * 2 + 2);
         giveup_binds.push(Box::new(pr_url.to_string()));
         giveup_binds.push(Box::new(max_attempts));
-        for id in comment_ids {
+        for (id, kind) in comments {
+            giveup_binds.push(Box::new(kind.to_string()));
             giveup_binds.push(Box::new(*id));
         }
         conn.execute(
@@ -11421,10 +11425,10 @@ mod tests {
             1
         );
         tracker
-            .note_pr_review_comment_failure_by_ids(pr_url, &[3], 3)
+            .note_pr_review_comment_failure_by_ids(pr_url, &[(3, "conversation")], 3)
             .unwrap(); // attempts=1
         tracker
-            .note_pr_review_comment_failure_by_ids(pr_url, &[3], 3)
+            .note_pr_review_comment_failure_by_ids(pr_url, &[(3, "conversation")], 3)
             .unwrap(); // attempts=2
         assert_eq!(
             tracker
@@ -11435,7 +11439,7 @@ mod tests {
             "should still retry below the cap"
         );
         tracker
-            .note_pr_review_comment_failure_by_ids(pr_url, &[3], 3)
+            .note_pr_review_comment_failure_by_ids(pr_url, &[(3, "conversation")], 3)
             .unwrap(); // attempts=3 -> give up
         assert!(
             tracker
@@ -11475,7 +11479,7 @@ mod tests {
 
         // Acknowledge only comment 1; comment 2 (recorded concurrently) survives.
         tracker
-            .mark_pr_review_comments_handled_by_ids(pr_url, &[1])
+            .mark_pr_review_comments_handled_by_ids(pr_url, &[(1, "conversation")])
             .unwrap();
         let unhandled = tracker.get_unhandled_pr_review_comments(pr_url).unwrap();
         assert_eq!(unhandled.len(), 1);
@@ -11527,6 +11531,18 @@ mod tests {
                 .len(),
             2
         );
+
+        // Acknowledging only the inline row must not touch the conversation row
+        // that shares the id.
+        tracker
+            .mark_pr_review_comments_handled_by_ids(pr_url, &[(42, "inline")])
+            .unwrap();
+        let unhandled = tracker.get_unhandled_pr_review_comments(pr_url).unwrap();
+        assert_eq!(unhandled.len(), 1, "colliding id acknowledged wrong row");
+        assert!(
+            unhandled[0].path.is_empty(),
+            "the surviving row should be the conversation comment"
+        );
     }
 
     #[test]
@@ -11561,10 +11577,14 @@ mod tests {
         // Comment 1 fails once alone (attempts=1), then both fail together with
         // cap=2: comment 1 reaches the cap, comment 2 is only at 1.
         tracker
-            .note_pr_review_comment_failure_by_ids(pr_url, &[1], 2)
+            .note_pr_review_comment_failure_by_ids(pr_url, &[(1, "conversation")], 2)
             .unwrap();
         tracker
-            .note_pr_review_comment_failure_by_ids(pr_url, &[1, 2], 2)
+            .note_pr_review_comment_failure_by_ids(
+                pr_url,
+                &[(1, "conversation"), (2, "conversation")],
+                2,
+            )
             .unwrap();
 
         // Only the worst offender (id 1) is retired; the valid comment survives.
