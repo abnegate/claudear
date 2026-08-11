@@ -1908,19 +1908,30 @@ impl ActivityStore for SqliteTracker {
     ) -> Result<i64> {
         let conn = self.acquire_lock()?;
 
+        // Conversation comments (issues/{n}/comments) carry no file path; inline
+        // review comments (pulls/{n}/comments) always do. The two are separate
+        // GitHub id sequences, so uniqueness is keyed on (comment_kind, id) to keep
+        // a colliding id in one namespace from overwriting the other's row.
+        let comment_kind = if comment.path.is_empty() {
+            "conversation"
+        } else {
+            "inline"
+        };
+
         conn.execute(
             r#"
             INSERT INTO pr_review_comments (
-                scm_comment_id, pr_url, review_id, path, position, line,
+                scm_comment_id, comment_kind, pr_url, review_id, path, position, line,
                 body, author, created_at, updated_at, html_url
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-            ON CONFLICT(scm_comment_id) DO UPDATE SET
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            ON CONFLICT(comment_kind, scm_comment_id) DO UPDATE SET
                 body = excluded.body,
                 updated_at = excluded.updated_at
             "#,
             params![
                 comment.id,
+                comment_kind,
                 pr_url,
                 comment.pull_request_review_id,
                 comment.path,
@@ -2056,12 +2067,21 @@ impl ActivityStore for SqliteTracker {
              WHERE pr_url = ?1 AND handled_at IS NULL AND scm_comment_id IN ({})",
             placeholders
         );
-        // Give up on comments that have failed too many times so a poison comment
-        // does not re-trigger the fix agent forever.
+        // Give up on at most ONE comment per failed cycle: the single worst
+        // offender (most attempts) that has hit the cap. A batch failure can't be
+        // attributed to a specific comment, so retiring the whole over-cap set at
+        // once would drop valid comments that merely co-occur with a poison one.
+        // Retiring one per cycle lets a poison comment drain out first, after which
+        // the remaining comments get a fresh batch that can succeed.
         let giveup_sql = format!(
             "UPDATE pr_review_comments SET handled_at = datetime('now') \
-             WHERE pr_url = ?1 AND handled_at IS NULL AND attempts >= ?2 \
-             AND scm_comment_id IN ({})",
+             WHERE id = ( \
+                 SELECT id FROM pr_review_comments \
+                 WHERE pr_url = ?1 AND handled_at IS NULL AND attempts >= ?2 \
+                   AND scm_comment_id IN ({}) \
+                 ORDER BY attempts DESC, scm_comment_id ASC \
+                 LIMIT 1 \
+             )",
             // ids start at bind position 3 for the give-up query
             (0..comment_ids.len())
                 .map(|i| format!("?{}", i + 3))
@@ -11448,6 +11468,94 @@ mod tests {
         tracker
             .mark_pr_review_comments_handled_by_ids(pr_url, &[1])
             .unwrap();
+        let unhandled = tracker.get_unhandled_pr_review_comments(pr_url).unwrap();
+        assert_eq!(unhandled.len(), 1);
+        assert_eq!(unhandled[0].id, 2);
+    }
+
+    #[test]
+    fn test_inline_and_conversation_same_id_coexist() {
+        // The same numeric GitHub id can appear as both an inline review comment
+        // and a PR conversation comment (distinct id sequences). The composite
+        // (comment_kind, scm_comment_id) key must let both rows exist rather than
+        // one overwriting the other.
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let pr_url = "https://github.com/owner/repo/pull/1";
+
+        let base = |id: i64, path: &str| claudear_core::types::ReviewComment {
+            id,
+            path: path.to_string(),
+            position: None,
+            original_position: None,
+            body: format!("body for {}", path),
+            user: claudear_core::types::ReviewUser {
+                id: 1,
+                login: "reviewer".to_string(),
+                user_type: None,
+            },
+            created_at: "2024-01-15T10:00:00Z".to_string(),
+            updated_at: "2024-01-15T10:00:00Z".to_string(),
+            html_url: "h".to_string(),
+            pull_request_review_id: None,
+            start_line: None,
+            line: None,
+            side: None,
+        };
+        // Inline (non-empty path) and conversation (empty path) share id 42.
+        tracker
+            .record_pr_review_comment(pr_url, &base(42, "src/main.rs"))
+            .unwrap();
+        tracker
+            .record_pr_review_comment(pr_url, &base(42, ""))
+            .unwrap();
+
+        let comments = tracker.get_comments_for_pr(pr_url).unwrap();
+        assert_eq!(comments.len(), 2, "colliding id overwrote a row");
+        assert_eq!(
+            tracker.get_unhandled_pr_review_comments(pr_url).unwrap().len(),
+            2
+        );
+    }
+
+    #[test]
+    fn test_note_failure_retires_one_worst_offender() {
+        // A batch failure can't be blamed on a specific comment, so only the single
+        // worst offender (most attempts, at cap) is retired per cycle — a valid
+        // comment that merely co-occurs with a poison one isn't dropped alongside it.
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let pr_url = "https://github.com/owner/repo/pull/3";
+        let mk = |id: i64| claudear_core::types::ReviewComment {
+            id,
+            path: String::new(),
+            position: None,
+            original_position: None,
+            body: "@claudear fix".to_string(),
+            user: claudear_core::types::ReviewUser {
+                id: 1,
+                login: "reviewer".to_string(),
+                user_type: None,
+            },
+            created_at: "2024-01-15T10:00:00Z".to_string(),
+            updated_at: "2024-01-15T10:00:00Z".to_string(),
+            html_url: format!("h{}", id),
+            pull_request_review_id: None,
+            start_line: None,
+            line: None,
+            side: None,
+        };
+        tracker.record_pr_review_comment(pr_url, &mk(1)).unwrap(); // poison
+        tracker.record_pr_review_comment(pr_url, &mk(2)).unwrap(); // valid, arrives later
+
+        // Comment 1 fails once alone (attempts=1), then both fail together with
+        // cap=2: comment 1 reaches the cap, comment 2 is only at 1.
+        tracker
+            .note_pr_review_comment_failure_by_ids(pr_url, &[1], 2)
+            .unwrap();
+        tracker
+            .note_pr_review_comment_failure_by_ids(pr_url, &[1, 2], 2)
+            .unwrap();
+
+        // Only the worst offender (id 1) is retired; the valid comment survives.
         let unhandled = tracker.get_unhandled_pr_review_comments(pr_url).unwrap();
         assert_eq!(unhandled.len(), 1);
         assert_eq!(unhandled[0].id, 2);
