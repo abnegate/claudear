@@ -3189,9 +3189,19 @@ Create a PR with your changes.{custom_instructions}"#,
                 .expect("intent_classifier present (checked by qa_split_enabled)");
             let mut intents: Vec<Intent> = Vec::with_capacity(ordered.len());
             for (issue, _) in &ordered {
+                // Ground the classification in the Discord reply thread (if any) so a
+                // follow-up in an ongoing QA conversation ("yes create a pr now") is
+                // classified in context and can escalate out of the read-only lane,
+                // instead of being judged as an isolated, ambiguous message.
+                let conversation = crate::processing::assemble_reply_chain(
+                    &self.config,
+                    self.tracker.as_ref(),
+                    issue,
+                )
+                .await;
                 intents.push(
                     classifier
-                        .classify_intent(issue)
+                        .classify_intent(issue, conversation.as_deref())
                         .await
                         .unwrap_or(Intent::Fix),
                 );

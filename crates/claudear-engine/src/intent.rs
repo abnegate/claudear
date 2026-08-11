@@ -50,9 +50,34 @@ impl Intent {
 /// Classifies an issue's [`Intent`]. Returns `None` when the backend is
 /// unavailable or the response cannot be interpreted, so callers can fall back
 /// to a heuristic.
+///
+/// `conversation` carries the prior messages of an ongoing thread (e.g. a
+/// Discord reply chain), oldest-first, so a follow-up is classified in context
+/// rather than in isolation. A confirmation like "yes create a pr now" is
+/// ambiguous alone but clearly a `Fix` once the thread is visible. Pass `None`
+/// when there is no prior conversation.
 #[async_trait]
 pub trait IntentClassifier: Send + Sync {
-    async fn classify_intent(&self, issue: &Issue) -> Option<Intent>;
+    async fn classify_intent(&self, issue: &Issue, conversation: Option<&str>) -> Option<Intent>;
+}
+
+/// The prompt section that carries the prior conversation and instructs the
+/// model to classify the latest message in that context. Empty when there is no
+/// conversation, so single-message classification is unchanged. Shared by both
+/// backends so they frame the follow-up case identically.
+pub(crate) fn intent_conversation_section(conversation: Option<&str>) -> String {
+    match conversation.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(convo) => format!(
+            "This message is the latest turn in an ongoing conversation. Prior turns \
+             (oldest first) are context only:\n\
+             {convo}\n\n\
+             Classify the LATEST message below, not the prior turns. A follow-up that \
+             asks to open a PR, apply a change, or proceed with a fix is \"fix\" (or \
+             \"bug\"/\"security\" if it points at a defect), even when earlier turns \
+             were questions.\n\n"
+        ),
+        None => String::new(),
+    }
 }
 
 /// The message body shared by both prompts: the issue description, truncated and
