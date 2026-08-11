@@ -672,23 +672,27 @@ pub trait ActivityStore: Send + Sync {
         Ok(())
     }
 
-    /// Mark only the given comment ids on a PR as durably handled. Called once the
+    /// Mark only the given comments on a PR as durably handled. Called once the
     /// batch that carried exactly these comments has been successfully acted upon.
+    /// Each comment is `(scm_comment_id, comment_kind)` so a colliding id in the
+    /// other namespace is not acknowledged by mistake.
     fn mark_pr_review_comments_handled_by_ids(
         &self,
         _pr_url: &str,
-        _comment_ids: &[i64],
+        _comments: &[(i64, &str)],
     ) -> Result<()> {
         Ok(())
     }
 
-    /// Record a failed attempt to act on the given comment ids: bumps each one's
-    /// attempt count and gives up (marks it handled) once the count reaches
-    /// `max_attempts`, so a poison comment does not re-run the fix agent forever.
+    /// Record a failed attempt to act on the given comments: bumps each one's
+    /// attempt count and gives up (marks the single worst offender handled) once
+    /// it reaches `max_attempts`, so a poison comment does not re-run the fix agent
+    /// forever. Each comment is `(scm_comment_id, comment_kind)` so a colliding id
+    /// in the other namespace is not charged by mistake.
     fn note_pr_review_comment_failure_by_ids(
         &self,
         _pr_url: &str,
-        _comment_ids: &[i64],
+        _comments: &[(i64, &str)],
         _max_attempts: i64,
     ) -> Result<()> {
         Ok(())

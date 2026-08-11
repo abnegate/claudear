@@ -1238,7 +1238,7 @@ impl Watcher {
 
         // Check for new reviews
         let events = review_watcher.check_for_reviews().await?;
-        for (pr_url, feedback_summary, feedback_count, comment_ids) in
+        for (pr_url, feedback_summary, feedback_count, comment_refs) in
             Self::group_review_feedback_by_pr(events)
         {
             tracing::info!(
@@ -1275,7 +1275,7 @@ impl Watcher {
                         // comment recorded concurrently while we were processing.
                         if let Err(e) = self
                             .tracker
-                            .mark_pr_review_comments_handled_by_ids(&pr_url, &comment_ids)
+                            .mark_pr_review_comments_handled_by_ids(&pr_url, &comment_refs)
                         {
                             tracing::warn!(pr_url = %pr_url, error = %e, "Failed to mark review comments handled");
                         }
@@ -1290,7 +1290,7 @@ impl Watcher {
                         // count the failure so a poison comment eventually gives up.
                         if let Err(e) = self.tracker.note_pr_review_comment_failure_by_ids(
                             &pr_url,
-                            &comment_ids,
+                            &comment_refs,
                             MAX_REVIEW_COMMENT_ATTEMPTS,
                         ) {
                             tracing::warn!(pr_url = %pr_url, error = %e, "Failed to record review-comment failure");
@@ -1306,7 +1306,7 @@ impl Watcher {
                 // uncorrelated comments don't re-surface forever.
                 if let Err(e) = self.tracker.note_pr_review_comment_failure_by_ids(
                     &pr_url,
-                    &comment_ids,
+                    &comment_refs,
                     MAX_REVIEW_COMMENT_ATTEMPTS,
                 ) {
                     tracing::warn!(pr_url = %pr_url, error = %e, "Failed to record review-comment failure");
@@ -1325,15 +1325,17 @@ impl Watcher {
     }
 
     /// Group actionable review events per PR into (pr_url, feedback_summary,
-    /// feedback_count, comment_ids). `comment_ids` are exactly the ledger comments
-    /// carried by the batch, so acknowledgement can target them rather than the
-    /// whole PR (which would wrongly mark a concurrently-recorded comment handled).
+    /// feedback_count, comment_refs). `comment_refs` are exactly the ledger comments
+    /// carried by the batch as `(scm_comment_id, comment_kind)`, so acknowledgement
+    /// targets those specific rows rather than the whole PR (which would wrongly
+    /// mark a concurrently-recorded comment handled) or a colliding id in the other
+    /// namespace.
     fn group_review_feedback_by_pr(
         events: Vec<ReviewEvent>,
-    ) -> Vec<(String, String, usize, Vec<i64>)> {
+    ) -> Vec<(String, String, usize, Vec<(i64, &'static str)>)> {
         let mut feedback_by_pr: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
-        let mut ids_by_pr: std::collections::HashMap<String, Vec<i64>> =
+        let mut refs_by_pr: std::collections::HashMap<String, Vec<(i64, &'static str)>> =
             std::collections::HashMap::new();
         let mut pr_order: Vec<String> = Vec::new();
 
@@ -1346,10 +1348,10 @@ impl Watcher {
             if !feedback_by_pr.contains_key(&pr_url) {
                 pr_order.push(pr_url.clone());
             }
-            ids_by_pr
+            refs_by_pr
                 .entry(pr_url.clone())
                 .or_default()
-                .extend(event.comment_ids());
+                .extend(event.comment_refs());
             feedback_by_pr
                 .entry(pr_url)
                 .or_default()
@@ -1359,10 +1361,10 @@ impl Watcher {
         pr_order
             .into_iter()
             .filter_map(|pr_url| {
-                let ids = ids_by_pr.remove(&pr_url).unwrap_or_default();
+                let refs = refs_by_pr.remove(&pr_url).unwrap_or_default();
                 feedback_by_pr.remove(&pr_url).map(|feedbacks| {
                     let count = feedbacks.len();
-                    (pr_url, feedbacks.join("\n\n---\n\n"), count, ids)
+                    (pr_url, feedbacks.join("\n\n---\n\n"), count, refs)
                 })
             })
             .collect()
@@ -6389,9 +6391,17 @@ mod tests {
 
         let grouped = Watcher::group_review_feedback_by_pr(events);
         assert_eq!(grouped.len(), 1);
-        let mut ids = grouped[0].3.clone();
-        ids.sort();
-        assert_eq!(ids, vec![101, 102, 103]);
+        let mut refs = grouped[0].3.clone();
+        refs.sort();
+        // Empty-path comments are conversation-kind; each ref namespaces its id.
+        assert_eq!(
+            refs,
+            vec![
+                (101, "conversation"),
+                (102, "conversation"),
+                (103, "conversation")
+            ]
+        );
     }
 
     #[tokio::test]
