@@ -1311,9 +1311,42 @@ impl ReviewWatcher {
             }
         };
 
-        if !new_conversation_comments.is_empty() {
-            // Advance the issue-comment cursor over ALL new conversation comments
-            // (including non-trigger ones) so unchanged comments aren't rescanned.
+        // Only trigger-matched conversation comments are actionable feedback.
+        let conversation_feedback: Vec<ReviewComment> = new_conversation_comments
+            .iter()
+            .filter(|c| trigger.is_empty() || c.body.to_lowercase().contains(&trigger.to_lowercase()))
+            .cloned()
+            .collect();
+
+        // Record actionable comments into the durable ledger BEFORE advancing the
+        // cursor. The ledger is the recovery authority: if the cursor moved past a
+        // comment the ledger never captured, that comment would be neither
+        // re-fetched (cursor advanced) nor re-surfaced (no ledger row) — a
+        // permanent drop. If any record fails, hold the cursor back so the comment
+        // is re-fetched next poll rather than lost.
+        let mut all_recorded = true;
+        if !conversation_feedback.is_empty() {
+            if let Some(ref tracker) = self.tracker {
+                for comment in &conversation_feedback {
+                    if let Err(e) = tracker.record_pr_review_comment(&state.pr_url, comment) {
+                        all_recorded = false;
+                        tracing::warn!(
+                            component = "review_watcher",
+                            pr_url = %state.pr_url,
+                            comment_id = comment.id,
+                            error = %e,
+                            "Failed to record PR conversation comment; holding issue cursor"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Advance the issue-comment cursor over all fetched comments (including
+        // non-trigger ones, so unchanged comments aren't rescanned), but only once
+        // every actionable comment is durably recorded. The cursor is a scan-window
+        // optimization; the ledger, not the cursor, guarantees no comment is lost.
+        if all_recorded && !new_conversation_comments.is_empty() {
             let mut latest_id = state.last_issue_comment_id;
             let mut latest_time = state.last_issue_comment_time.clone();
             for comment in &new_conversation_comments {
@@ -1348,28 +1381,6 @@ impl ReviewWatcher {
                             pr_url = %s.pr_url,
                             error = %e,
                             "Failed to persist PR review state update"
-                        );
-                    }
-                }
-            }
-        }
-
-        // Only trigger-matched conversation comments are actionable feedback.
-        let conversation_feedback: Vec<ReviewComment> = new_conversation_comments
-            .into_iter()
-            .filter(|c| trigger.is_empty() || c.body.to_lowercase().contains(&trigger.to_lowercase()))
-            .collect();
-
-        if !conversation_feedback.is_empty() {
-            if let Some(ref tracker) = self.tracker {
-                for comment in &conversation_feedback {
-                    if let Err(e) = tracker.record_pr_review_comment(&state.pr_url, comment) {
-                        tracing::warn!(
-                            component = "review_watcher",
-                            pr_url = %state.pr_url,
-                            comment_id = comment.id,
-                            error = %e,
-                            "Failed to record PR conversation comment"
                         );
                     }
                 }
