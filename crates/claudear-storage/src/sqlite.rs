@@ -1814,9 +1814,10 @@ impl ActivityStore for SqliteTracker {
             INSERT INTO pr_review_states (
                 pr_url, repo, pr_number, issue_id, source,
                 last_review_id, last_review_time, last_comment_id, last_comment_time,
+                last_issue_comment_id, last_issue_comment_time,
                 is_active, created_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'))
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, datetime('now'))
             ON CONFLICT(pr_url) DO UPDATE SET
                 repo = excluded.repo,
                 pr_number = excluded.pr_number,
@@ -1826,6 +1827,8 @@ impl ActivityStore for SqliteTracker {
                 last_review_time = excluded.last_review_time,
                 last_comment_id = excluded.last_comment_id,
                 last_comment_time = excluded.last_comment_time,
+                last_issue_comment_id = excluded.last_issue_comment_id,
+                last_issue_comment_time = excluded.last_issue_comment_time,
                 is_active = excluded.is_active
             "#,
             params![
@@ -1838,6 +1841,8 @@ impl ActivityStore for SqliteTracker {
                 state.last_review_time,
                 state.last_comment_id,
                 state.last_comment_time,
+                state.last_issue_comment_id,
+                state.last_issue_comment_time,
                 state.is_active as i32,
             ],
         )?;
@@ -1858,6 +1863,7 @@ impl ActivityStore for SqliteTracker {
             r#"
             SELECT pr_url, repo, pr_number, issue_id, source,
                    last_review_id, last_review_time, last_comment_id, last_comment_time,
+                   last_issue_comment_id, last_issue_comment_time,
                    is_active
             FROM pr_review_states
             WHERE is_active = 1
@@ -5050,7 +5056,8 @@ impl SqliteTracker {
 
     /// Convert a database row to a PrReviewState.
     /// Expects columns: pr_url, repo, pr_number, issue_id, source,
-    /// last_review_id, last_review_time, last_comment_id, last_comment_time, is_active
+    /// last_review_id, last_review_time, last_comment_id, last_comment_time,
+    /// last_issue_comment_id, last_issue_comment_time, is_active
     fn row_to_pr_review_state(
         row: &rusqlite::Row<'_>,
     ) -> rusqlite::Result<claudear_core::types::PrReviewState> {
@@ -5064,7 +5071,9 @@ impl SqliteTracker {
             last_review_time: row.get(6)?,
             last_comment_id: row.get(7)?,
             last_comment_time: row.get(8)?,
-            is_active: row.get::<_, i32>(9)? != 0,
+            last_issue_comment_id: row.get(9)?,
+            last_issue_comment_time: row.get(10)?,
+            is_active: row.get::<_, i32>(11)? != 0,
         })
     }
 
@@ -11106,6 +11115,8 @@ mod tests {
         state.last_review_time = Some("2024-01-15T10:00:00Z".to_string());
         state.last_comment_id = Some(888);
         state.last_comment_time = Some("2024-01-15T11:00:00Z".to_string());
+        state.last_issue_comment_id = Some(777);
+        state.last_issue_comment_time = Some("2024-01-15T12:00:00Z".to_string());
         tracker.save_pr_review_state(&state).unwrap();
 
         // Verify the update
@@ -11120,6 +11131,11 @@ mod tests {
         assert_eq!(
             states[0].last_comment_time,
             Some("2024-01-15T11:00:00Z".to_string())
+        );
+        assert_eq!(states[0].last_issue_comment_id, Some(777));
+        assert_eq!(
+            states[0].last_issue_comment_time,
+            Some("2024-01-15T12:00:00Z".to_string())
         );
     }
 

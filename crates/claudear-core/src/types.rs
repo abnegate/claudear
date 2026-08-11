@@ -2971,6 +2971,11 @@ pub struct PrReviewState {
     pub last_review_time: Option<String>,
     pub last_comment_id: Option<i64>,
     pub last_comment_time: Option<String>,
+    /// Cursor for PR *conversation* comments (the `issues/{n}/comments` timeline),
+    /// tracked separately from inline review comments because the two live in
+    /// distinct GitHub comment id spaces and are fetched from different endpoints.
+    pub last_issue_comment_id: Option<i64>,
+    pub last_issue_comment_time: Option<String>,
     pub is_active: bool,
 }
 
@@ -2992,6 +2997,8 @@ impl PrReviewState {
             last_review_time: None,
             last_comment_id: None,
             last_comment_time: None,
+            last_issue_comment_id: None,
+            last_issue_comment_time: None,
             is_active: true,
         }
     }
