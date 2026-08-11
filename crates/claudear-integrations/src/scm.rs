@@ -113,6 +113,39 @@ pub trait ScmProvider: Send + Sync {
         }
     }
 
+    /// Get a PR/MR's *conversation* comments (non-inline), e.g. GitHub's
+    /// `issues/{n}/comments` timeline. These are plain comments left on the PR
+    /// outside a formal review. Default: none, since not every provider exposes a
+    /// separate conversation timeline.
+    async fn get_pr_conversation_comments(
+        &self,
+        _project: &str,
+        _number: i64,
+    ) -> Result<Vec<ReviewComment>> {
+        Ok(Vec::new())
+    }
+
+    /// Get conversation comments updated at or after `since` (RFC 3339 timestamp).
+    ///
+    /// Default implementation fetches all conversation comments and filters by
+    /// timestamp, mirroring [`get_new_review_comments`](Self::get_new_review_comments).
+    async fn get_new_conversation_comments(
+        &self,
+        project: &str,
+        number: i64,
+        since: Option<&str>,
+    ) -> Result<Vec<ReviewComment>> {
+        let comments = self.get_pr_conversation_comments(project, number).await?;
+        if let Some(since_time) = since {
+            Ok(comments
+                .into_iter()
+                .filter(|c| timestamp_at_or_after(&c.updated_at, since_time))
+                .collect())
+        } else {
+            Ok(comments)
+        }
+    }
+
     /// List repositories for an organization / group.
     async fn list_repos(&self, org_or_group: &str) -> Result<Vec<RemoteRepo>>;
 
@@ -407,12 +440,19 @@ impl ReviewEvent {
             ReviewEvent::CommentsAdded { comments, .. } => {
                 let mut summary = String::new();
                 for comment in comments {
-                    summary.push_str(&format!(
-                        "Comment from @{} on `{}`",
-                        comment.user.login, comment.path
-                    ));
-                    if let Some(line) = comment.line {
-                        summary.push_str(&format!(" (line {})", line));
+                    // Inline comments carry a file path (and often a line); PR
+                    // conversation comments have neither, so omit the "on `path`"
+                    // clause for them rather than printing an empty backtick pair.
+                    if comment.path.is_empty() {
+                        summary.push_str(&format!("Comment from @{}", comment.user.login));
+                    } else {
+                        summary.push_str(&format!(
+                            "Comment from @{} on `{}`",
+                            comment.user.login, comment.path
+                        ));
+                        if let Some(line) = comment.line {
+                            summary.push_str(&format!(" (line {})", line));
+                        }
                     }
                     summary.push_str(&format!(":\n{}\n\n", comment.body));
                 }
@@ -1233,12 +1273,119 @@ impl ReviewWatcher {
             }
         }
 
-        if !standalone_comments.is_empty() {
+        // PR conversation comments (the issues-comments timeline). A reviewer who
+        // leaves a plain "@claudear fix this" on the PR conversation — rather than
+        // an inline review-thread comment or a formal review — lands here. These
+        // use a distinct GitHub comment id space and endpoint, so they carry their
+        // own cursor (`last_issue_comment_*`).
+        let new_conversation_comments: Vec<ReviewComment> = match self
+            .provider
+            .get_new_conversation_comments(
+                &state.repo,
+                state.pr_number,
+                state.last_issue_comment_time.as_deref(),
+            )
+            .await
+        {
+            Ok(comments) => comments
+                .into_iter()
+                .filter(|c| !is_skippable_bot(&c.user, allowed_bots))
+                .filter(|c| {
+                    Self::comment_is_after_cursor(
+                        c,
+                        state.last_issue_comment_time.as_deref(),
+                        state.last_issue_comment_id,
+                    )
+                })
+                .collect(),
+            Err(e) => {
+                // A transient failure here must not drop the review/comment events
+                // already collected this cycle.
+                tracing::warn!(
+                    component = "review_watcher",
+                    pr_url = %state.pr_url,
+                    error = %e,
+                    "Failed to fetch PR conversation comments; continuing without them"
+                );
+                Vec::new()
+            }
+        };
+
+        if !new_conversation_comments.is_empty() {
+            // Advance the issue-comment cursor over ALL new conversation comments
+            // (including non-trigger ones) so unchanged comments aren't rescanned.
+            let mut latest_id = state.last_issue_comment_id;
+            let mut latest_time = state.last_issue_comment_time.clone();
+            for comment in &new_conversation_comments {
+                let replace = latest_time
+                    .as_deref()
+                    .map(|existing_time| {
+                        let cmp = compare_timestamps(&comment.updated_at, existing_time);
+                        cmp == std::cmp::Ordering::Greater
+                            || (cmp == std::cmp::Ordering::Equal
+                                && comment.id > latest_id.unwrap_or(i64::MIN))
+                    })
+                    .unwrap_or(true);
+                if replace {
+                    latest_id = Some(comment.id);
+                    latest_time = Some(comment.updated_at.clone());
+                }
+            }
+
+            let mut states = self.states.write().unwrap_or_else(|poisoned| {
+                tracing::warn!(component = "review_watcher", "RwLock poisoned, recovering");
+                poisoned.into_inner()
+            });
+            if let Some(s) = states.get_mut(&state.pr_url) {
+                s.last_issue_comment_id = latest_id;
+                if let Some(t) = latest_time {
+                    s.last_issue_comment_time = Some(t);
+                }
+                if let Some(ref tracker) = self.tracker {
+                    if let Err(e) = tracker.save_pr_review_state(s) {
+                        tracing::warn!(
+                            component = "review_watcher",
+                            pr_url = %s.pr_url,
+                            error = %e,
+                            "Failed to persist PR review state update"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Only trigger-matched conversation comments are actionable feedback.
+        let conversation_feedback: Vec<ReviewComment> = new_conversation_comments
+            .into_iter()
+            .filter(|c| trigger.is_empty() || c.body.to_lowercase().contains(&trigger.to_lowercase()))
+            .collect();
+
+        if !conversation_feedback.is_empty() {
+            if let Some(ref tracker) = self.tracker {
+                for comment in &conversation_feedback {
+                    if let Err(e) = tracker.record_pr_review_comment(&state.pr_url, comment) {
+                        tracing::warn!(
+                            component = "review_watcher",
+                            pr_url = %state.pr_url,
+                            comment_id = comment.id,
+                            error = %e,
+                            "Failed to record PR conversation comment"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Emit inline standalone comments and conversation comments together so the
+        // downstream fix loop sees a single feedback batch per PR per cycle.
+        let mut added_comments = standalone_comments;
+        added_comments.extend(conversation_feedback);
+        if !added_comments.is_empty() {
             events.push(ReviewEvent::CommentsAdded {
                 pr_url: state.pr_url.clone(),
                 repo: state.repo.clone(),
                 pr_number: state.pr_number,
-                comments: standalone_comments,
+                comments: added_comments,
             });
         }
 
@@ -1688,6 +1835,8 @@ mod tests {
             last_review_time: Some("2024-03-15T10:30:00Z".to_string()),
             last_comment_id: Some(888),
             last_comment_time: Some("2024-03-15T11:00:00Z".to_string()),
+            last_issue_comment_id: Some(777),
+            last_issue_comment_time: Some("2024-03-15T11:30:00Z".to_string()),
             is_active: true,
         };
         let json = serde_json::to_string(&state).expect("serialize");
@@ -2793,6 +2942,7 @@ mod tests {
             allowed_bots: Vec<String>,
             reviews: Arc<Mutex<Vec<CodeReview>>>,
             comments: Arc<Mutex<Vec<ReviewComment>>>,
+            conversation: Arc<Mutex<Vec<ReviewComment>>>,
             /// When true, get_review_comments returns an error.
             comments_error: Arc<Mutex<bool>>,
         }
@@ -2806,6 +2956,7 @@ mod tests {
                     allowed_bots: Vec::new(),
                     reviews: Arc::new(Mutex::new(Vec::new())),
                     comments: Arc::new(Mutex::new(Vec::new())),
+                    conversation: Arc::new(Mutex::new(Vec::new())),
                     comments_error: Arc::new(Mutex::new(false)),
                 }
             }
@@ -2825,6 +2976,10 @@ mod tests {
 
             fn set_comments_error(&self, should_error: bool) {
                 *self.comments_error.lock().unwrap() = should_error;
+            }
+
+            fn set_conversation_comments(&self, comments: Vec<ReviewComment>) {
+                *self.conversation.lock().unwrap() = comments;
             }
         }
 
@@ -2881,8 +3036,40 @@ mod tests {
                 Ok(self.comments.lock().unwrap().clone())
             }
 
+            async fn get_pr_conversation_comments(
+                &self,
+                _project: &str,
+                _number: i64,
+            ) -> Result<Vec<ReviewComment>> {
+                Ok(self.conversation.lock().unwrap().clone())
+            }
+
             async fn list_repos(&self, _org_or_group: &str) -> Result<Vec<RemoteRepo>> {
                 Ok(vec![])
+            }
+        }
+
+        /// A PR conversation (issue-timeline) comment: no file path, no line,
+        /// no parent review id — the shape produced by `get_pr_issue_comments`.
+        fn make_conversation_comment(id: i64, body: &str, updated_at: &str) -> ReviewComment {
+            ReviewComment {
+                id,
+                path: String::new(),
+                position: None,
+                original_position: None,
+                body: body.to_string(),
+                user: ReviewUser {
+                    id: id + 3000,
+                    login: "reviewer".to_string(),
+                    user_type: Some("User".to_string()),
+                },
+                created_at: updated_at.to_string(),
+                updated_at: updated_at.to_string(),
+                html_url: format!("https://github.com/org/repo/pull/1#issuecomment-{}", id),
+                pull_request_review_id: None,
+                line: None,
+                start_line: None,
+                side: None,
             }
         }
 
@@ -3311,6 +3498,98 @@ mod tests {
                 .filter(|e| matches!(e, ReviewEvent::CommentsAdded { .. }))
                 .collect();
             assert!(comments_events.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_conversation_comment_with_trigger_is_actionable() {
+            // A plain "@claudear ..." left on the PR conversation timeline (not an
+            // inline review comment) must surface as actionable review feedback.
+            let mock = MockScmProvider::new("github", true, "@claudear");
+            mock.set_conversation_comments(vec![make_conversation_comment(
+                501,
+                "@claudear this shutdown path misses a task, please fix it",
+                "2025-01-02T00:00:00Z",
+            )]);
+            let provider: Arc<dyn ScmProvider> = Arc::new(mock);
+            let watcher = ReviewWatcher::new(provider);
+            watcher.watch_pr(make_state(
+                "https://github.com/org/repo/pull/1",
+                "org/repo",
+                1,
+            ));
+
+            let events = watcher.check_for_reviews().await.unwrap();
+            let comment_events: Vec<_> = events
+                .iter()
+                .filter(|e| matches!(e, ReviewEvent::CommentsAdded { .. }))
+                .collect();
+            assert_eq!(comment_events.len(), 1, "conversation comment not surfaced");
+            match comment_events[0] {
+                ReviewEvent::CommentsAdded { comments, .. } => {
+                    assert_eq!(comments.len(), 1);
+                    assert_eq!(comments[0].id, 501);
+                    assert!(comments[0].path.is_empty());
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_conversation_comment_without_trigger_is_ignored() {
+            let mock = MockScmProvider::new("github", true, "@claudear");
+            mock.set_conversation_comments(vec![make_conversation_comment(
+                502,
+                "nice work, LGTM",
+                "2025-01-02T00:00:00Z",
+            )]);
+            let provider: Arc<dyn ScmProvider> = Arc::new(mock);
+            let watcher = ReviewWatcher::new(provider);
+            watcher.watch_pr(make_state(
+                "https://github.com/org/repo/pull/1",
+                "org/repo",
+                1,
+            ));
+
+            let events = watcher.check_for_reviews().await.unwrap();
+            assert!(events
+                .iter()
+                .all(|e| !matches!(e, ReviewEvent::CommentsAdded { .. })));
+        }
+
+        #[tokio::test]
+        async fn test_conversation_comment_cursor_prevents_reprocessing() {
+            // The issue-comment cursor must advance so the same conversation
+            // comment is not re-emitted on the next poll cycle.
+            let mock = MockScmProvider::new("github", true, "@claudear");
+            mock.set_conversation_comments(vec![make_conversation_comment(
+                503,
+                "@claudear please address this",
+                "2025-01-02T00:00:00Z",
+            )]);
+            let provider: Arc<dyn ScmProvider> = Arc::new(mock);
+            let watcher = ReviewWatcher::new(provider);
+            watcher.watch_pr(make_state(
+                "https://github.com/org/repo/pull/1",
+                "org/repo",
+                1,
+            ));
+
+            let first = watcher.check_for_reviews().await.unwrap();
+            assert_eq!(
+                first
+                    .iter()
+                    .filter(|e| matches!(e, ReviewEvent::CommentsAdded { .. }))
+                    .count(),
+                1
+            );
+
+            let second = watcher.check_for_reviews().await.unwrap();
+            assert!(
+                second
+                    .iter()
+                    .all(|e| !matches!(e, ReviewEvent::CommentsAdded { .. })),
+                "conversation comment re-emitted after cursor should have advanced"
+            );
         }
 
         #[tokio::test]
