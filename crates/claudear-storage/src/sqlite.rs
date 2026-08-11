@@ -1960,6 +1960,78 @@ impl ActivityStore for SqliteTracker {
         Ok(results)
     }
 
+    fn get_unhandled_pr_review_comments(
+        &self,
+        pr_url: &str,
+    ) -> Result<Vec<claudear_core::types::ReviewComment>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT scm_comment_id, review_id, path, position, line,
+                   body, author, created_at, updated_at, html_url
+            FROM pr_review_comments
+            WHERE pr_url = ? AND handled_at IS NULL
+            ORDER BY scm_comment_id ASC
+            "#,
+        )?;
+
+        let rows = stmt.query_map(params![pr_url], |row| {
+            Ok(claudear_core::types::ReviewComment {
+                id: row.get(0)?,
+                pull_request_review_id: row.get(1)?,
+                path: row.get(2)?,
+                position: row.get(3)?,
+                line: row.get(4)?,
+                body: row.get(5)?,
+                user: claudear_core::types::ReviewUser {
+                    id: 0,
+                    login: row.get(6)?,
+                    user_type: None,
+                },
+                created_at: row.get(7)?,
+                updated_at: row.get(8)?,
+                html_url: row.get(9)?,
+                original_position: None,
+                start_line: None,
+                side: None,
+            })
+        })?;
+
+        let mut results = Vec::new();
+        for row in rows.flatten() {
+            results.push(row);
+        }
+        Ok(results)
+    }
+
+    fn mark_pr_review_comments_handled(&self, pr_url: &str) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            "UPDATE pr_review_comments SET handled_at = datetime('now') \
+             WHERE pr_url = ? AND handled_at IS NULL",
+            params![pr_url],
+        )?;
+        Ok(())
+    }
+
+    fn note_pr_review_comment_failure(&self, pr_url: &str, max_attempts: i64) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        // Count this failed cycle against every still-unhandled comment on the PR.
+        conn.execute(
+            "UPDATE pr_review_comments SET attempts = attempts + 1 \
+             WHERE pr_url = ? AND handled_at IS NULL",
+            params![pr_url],
+        )?;
+        // Give up on comments that have failed too many times so a poison comment
+        // does not re-trigger the fix agent forever.
+        conn.execute(
+            "UPDATE pr_review_comments SET handled_at = datetime('now') \
+             WHERE pr_url = ? AND handled_at IS NULL AND attempts >= ?",
+            params![pr_url, max_attempts],
+        )?;
+        Ok(())
+    }
+
     /// Get metric row counts grouped by name since a timestamp.
     fn get_metric_counts_since(
         &self,
@@ -11209,6 +11281,72 @@ mod tests {
         assert_eq!(comments[0].body, "Consider using a const here");
         assert_eq!(comments[0].author, "reviewer1");
         assert_eq!(comments[0].line, Some(42));
+    }
+
+    #[test]
+    fn test_pr_review_comment_handled_ledger() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let pr_url = "https://github.com/owner/repo/pull/7";
+
+        let mk = |id: i64| claudear_core::types::ReviewComment {
+            id,
+            path: String::new(),
+            position: None,
+            original_position: None,
+            body: "@claudear please fix".to_string(),
+            user: claudear_core::types::ReviewUser {
+                id: 1,
+                login: "reviewer".to_string(),
+                user_type: Some("User".to_string()),
+            },
+            created_at: "2024-01-15T10:00:00Z".to_string(),
+            updated_at: "2024-01-15T10:00:00Z".to_string(),
+            html_url: format!("https://github.com/owner/repo/pull/7#c{}", id),
+            pull_request_review_id: None,
+            start_line: None,
+            line: None,
+            side: None,
+        };
+
+        // A freshly recorded comment is unhandled.
+        tracker.record_pr_review_comment(pr_url, &mk(1)).unwrap();
+        tracker.record_pr_review_comment(pr_url, &mk(2)).unwrap();
+        let unhandled = tracker.get_unhandled_pr_review_comments(pr_url).unwrap();
+        assert_eq!(unhandled.len(), 2);
+        assert_eq!(unhandled[0].id, 1);
+
+        // Marking handled clears them.
+        tracker.mark_pr_review_comments_handled(pr_url).unwrap();
+        assert!(tracker
+            .get_unhandled_pr_review_comments(pr_url)
+            .unwrap()
+            .is_empty());
+
+        // Re-recording a handled comment does not resurrect it (handled_at kept).
+        tracker.record_pr_review_comment(pr_url, &mk(1)).unwrap();
+        assert!(tracker
+            .get_unhandled_pr_review_comments(pr_url)
+            .unwrap()
+            .is_empty());
+
+        // A new comment fails repeatedly and is given up on at the cap.
+        tracker.record_pr_review_comment(pr_url, &mk(3)).unwrap();
+        assert_eq!(tracker.get_unhandled_pr_review_comments(pr_url).unwrap().len(), 1);
+        tracker.note_pr_review_comment_failure(pr_url, 3).unwrap(); // attempts=1
+        tracker.note_pr_review_comment_failure(pr_url, 3).unwrap(); // attempts=2
+        assert_eq!(
+            tracker.get_unhandled_pr_review_comments(pr_url).unwrap().len(),
+            1,
+            "should still retry below the cap"
+        );
+        tracker.note_pr_review_comment_failure(pr_url, 3).unwrap(); // attempts=3 -> give up
+        assert!(
+            tracker
+                .get_unhandled_pr_review_comments(pr_url)
+                .unwrap()
+                .is_empty(),
+            "should stop retrying once the attempt cap is reached"
+        );
     }
 
     #[test]

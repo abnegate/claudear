@@ -143,7 +143,8 @@ mod tests {
             .unwrap();
         assert_eq!(has_col, 1);
 
-        // Verify the V9 column exists on pr_review_states.
+        // Verify the V9 columns exist: the issue-comment cursor on pr_review_states
+        // and the handled ledger on pr_review_comments.
         let has_issue_comment_col: u32 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('pr_review_states') WHERE name = 'last_issue_comment_id'",
@@ -152,6 +153,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_issue_comment_col, 1);
+
+        let has_handled_col: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('pr_review_comments') WHERE name = 'handled_at'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_handled_col, 1);
     }
 
     #[test]
