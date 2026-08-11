@@ -653,6 +653,31 @@ pub trait ActivityStore: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Get review comments recorded for a PR that have not yet been durably
+    /// handled (their feedback has not been acted upon). Re-surfaced each poll so
+    /// review-comment processing is at-least-once: a crash or downstream failure
+    /// between detecting a comment and acting on it does not drop it.
+    fn get_unhandled_pr_review_comments(
+        &self,
+        _pr_url: &str,
+    ) -> Result<Vec<claudear_core::types::ReviewComment>> {
+        Ok(Vec::new())
+    }
+
+    /// Mark every not-yet-handled review comment on a PR as durably handled.
+    /// Called once the PR's review feedback has been successfully acted upon.
+    fn mark_pr_review_comments_handled(&self, _pr_url: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Record a failed attempt to act on a PR's unhandled review comments: bumps
+    /// each unhandled comment's attempt count and gives up (marks it handled) once
+    /// the count reaches `max_attempts`, so a poison comment does not re-run the
+    /// fix agent forever.
+    fn note_pr_review_comment_failure(&self, _pr_url: &str, _max_attempts: i64) -> Result<()> {
+        Ok(())
+    }
+
     /// Get fix attempts for a batch of (source, issue_id) keys.
     fn get_attempts_batch(&self, _keys: &[(&str, &str)]) -> Result<Vec<Option<FixAttempt>>> {
         Ok(Vec::new())
