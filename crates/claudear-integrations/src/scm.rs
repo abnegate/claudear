@@ -1380,6 +1380,45 @@ impl ReviewWatcher {
         // downstream fix loop sees a single feedback batch per PR per cycle.
         let mut added_comments = standalone_comments;
         added_comments.extend(conversation_feedback);
+
+        // Re-surface any recorded comments not yet durably handled so a crash or
+        // downstream failure between detecting a comment and acting on it doesn't
+        // drop it. The pr_review_comments ledger, not the polling cursor, is the
+        // authority for outstanding work; the cursor is only a fetch-window
+        // optimization. Newly detected comments were already recorded above, so
+        // they come back through this query too — dedup against what we're already
+        // emitting this cycle (the batch plus inline comments on review events).
+        if let Some(ref tracker) = self.tracker {
+            let mut seen: std::collections::HashSet<i64> =
+                added_comments.iter().map(|c| c.id).collect();
+            for event in &events {
+                if let ReviewEvent::ReviewSubmitted {
+                    inline_comments, ..
+                } = event
+                {
+                    seen.extend(inline_comments.iter().map(|c| c.id));
+                }
+            }
+            match tracker.get_unhandled_pr_review_comments(&state.pr_url) {
+                Ok(pending) => {
+                    for comment in pending {
+                        if seen.insert(comment.id) {
+                            added_comments.push(comment);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        component = "review_watcher",
+                        pr_url = %state.pr_url,
+                        error = %e,
+                        "Failed to load unhandled PR review comments; \
+                         relying on freshly detected ones this cycle"
+                    );
+                }
+            }
+        }
+
         if !added_comments.is_empty() {
             events.push(ReviewEvent::CommentsAdded {
                 pr_url: state.pr_url.clone(),
@@ -5634,6 +5673,7 @@ mod tests {
         use claudear_core::types::{
             ActivityLogEntry, FixAttempt, FixAttemptStats, FixAttemptStatus, PrReviewRecord,
         };
+        use crate::scm::ReviewEvent;
         use claudear_storage::{
             ActivityStore, AttemptTracker, ChatStore, DiscordStore, EmbeddingStore,
             EvaluationStore, ExperimentStore, FixAttemptTracker, KnowledgeStore, RegressionStore,
@@ -5713,6 +5753,8 @@ mod tests {
         struct MockTrackerWithRecording {
             review_calls: Arc<Mutex<Vec<String>>>,
             activity_calls: Arc<Mutex<Vec<String>>>,
+            unhandled: Arc<Mutex<Vec<ReviewComment>>>,
+            handled_calls: Arc<Mutex<Vec<String>>>,
         }
 
         impl MockTrackerWithRecording {
@@ -5720,7 +5762,13 @@ mod tests {
                 Self {
                     review_calls: Arc::new(Mutex::new(Vec::new())),
                     activity_calls: Arc::new(Mutex::new(Vec::new())),
+                    unhandled: Arc::new(Mutex::new(Vec::new())),
+                    handled_calls: Arc::new(Mutex::new(Vec::new())),
                 }
+            }
+
+            fn set_unhandled(&self, comments: Vec<ReviewComment>) {
+                *self.unhandled.lock().unwrap() = comments;
             }
         }
 
@@ -5824,6 +5872,16 @@ mod tests {
                     .push(entry.activity_type.clone());
                 Ok(1)
             }
+            fn get_unhandled_pr_review_comments(
+                &self,
+                _pr_url: &str,
+            ) -> Result<Vec<ReviewComment>> {
+                Ok(self.unhandled.lock().unwrap().clone())
+            }
+            fn mark_pr_review_comments_handled(&self, pr_url: &str) -> Result<()> {
+                self.handled_calls.lock().unwrap().push(pr_url.to_string());
+                Ok(())
+            }
         }
 
         impl KnowledgeStore for MockTrackerWithRecording {}
@@ -5919,6 +5977,53 @@ mod tests {
             let activity_calls = tracker.activity_calls.lock().unwrap();
             assert_eq!(activity_calls.len(), 1);
             assert_eq!(activity_calls[0], "pr_review_received");
+        }
+
+        #[tokio::test]
+        async fn test_unhandled_comments_are_resurfaced() {
+            // No new reviews/comments from GitHub this cycle, but the ledger still
+            // holds an unhandled comment (e.g. a prior cycle detected it but the
+            // fix run failed). It must be re-emitted so processing is at-least-once.
+            let provider: Arc<dyn ScmProvider> =
+                Arc::new(MockScmProvider::new("github", true, "@claudear"));
+            let tracker = Arc::new(MockTrackerWithRecording::new());
+            tracker.set_unhandled(vec![ReviewComment {
+                id: 4242,
+                path: String::new(),
+                position: None,
+                original_position: None,
+                body: "@claudear please address the shutdown race".to_string(),
+                user: ReviewUser {
+                    id: 0,
+                    login: "reviewer".to_string(),
+                    user_type: None,
+                },
+                created_at: "2025-01-01T00:00:00Z".to_string(),
+                updated_at: "2025-01-01T00:00:00Z".to_string(),
+                html_url: "https://github.com/org/repo/pull/1#issuecomment-4242".to_string(),
+                pull_request_review_id: None,
+                start_line: None,
+                line: None,
+                side: None,
+            }]);
+            let watcher = ReviewWatcher::with_tracker(provider, tracker.clone());
+            watcher.watch_pr(make_state(
+                "https://github.com/org/repo/pull/1",
+                "org/repo",
+                1,
+            ));
+
+            let events = watcher.check_for_reviews().await.unwrap();
+            let comment_events: Vec<_> = events
+                .iter()
+                .filter_map(|e| match e {
+                    ReviewEvent::CommentsAdded { comments, .. } => Some(comments),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(comment_events.len(), 1, "unhandled comment not re-surfaced");
+            assert_eq!(comment_events[0].len(), 1);
+            assert_eq!(comment_events[0][0].id, 4242);
         }
 
         #[tokio::test]

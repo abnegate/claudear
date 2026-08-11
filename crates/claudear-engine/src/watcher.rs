@@ -40,6 +40,10 @@ use tokio::time::{interval, Duration};
 /// decided routing `Intent` (`None` for non-QA-eligible / QA-disabled sources).
 type QueuedIssue = (Issue, MatchResult, Option<Intent>);
 
+/// How many times a PR review comment may fail processing before it is given up
+/// on (marked handled) instead of re-triggering the fix agent every cycle.
+const MAX_REVIEW_COMMENT_ATTEMPTS: i64 = 5;
+
 /// Extracts the source name from a processing key of the form "source:issue_id".
 fn source_from_processing_key(key: &str) -> &str {
     key.split_once(':').map_or(key, |(source, _)| source)
@@ -1252,24 +1256,52 @@ impl Watcher {
                         status = %attempt.status,
                         "Skipping review feedback for terminal attempt status"
                     );
+                    // The PR is merged/closed/cannot-fix: close out the ledger so
+                    // its comments stop being re-surfaced, then stop watching.
+                    if let Err(e) = self.tracker.mark_pr_review_comments_handled(&pr_url) {
+                        tracing::warn!(pr_url = %pr_url, error = %e, "Failed to close review-comment ledger for terminal PR");
+                    }
                     review_watcher.unwatch_pr(&pr_url);
                     continue;
                 }
-                if let Err(e) = self
-                    .process_review_action(&attempt, &feedback_summary)
-                    .await
-                {
-                    tracing::error!(
-                        pr_url = %pr_url,
-                        error = %e,
-                        "Failed to process review feedback"
-                    );
+                match self.process_review_action(&attempt, &feedback_summary).await {
+                    Ok(()) => {
+                        // Durably handled: mark the PR's comments so they aren't
+                        // re-surfaced next cycle (at-least-once, exactly the success
+                        // path marks completion).
+                        if let Err(e) = self.tracker.mark_pr_review_comments_handled(&pr_url) {
+                            tracing::warn!(pr_url = %pr_url, error = %e, "Failed to mark review comments handled");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            pr_url = %pr_url,
+                            error = %e,
+                            "Failed to process review feedback; will retry next cycle"
+                        );
+                        // Leave comments unhandled so they retry, but count the
+                        // failure so a poison comment eventually gives up.
+                        if let Err(e) = self
+                            .tracker
+                            .note_pr_review_comment_failure(&pr_url, MAX_REVIEW_COMMENT_ATTEMPTS)
+                        {
+                            tracing::warn!(pr_url = %pr_url, error = %e, "Failed to record review-comment failure");
+                        }
+                    }
                 }
             } else {
                 tracing::warn!(
                     pr_url = %pr_url,
                     "Received review for unknown PR, skipping"
                 );
+                // No attempt to act on; count it as a failure so unhandled ledger
+                // comments for an uncorrelated PR don't re-surface forever.
+                if let Err(e) = self
+                    .tracker
+                    .note_pr_review_comment_failure(&pr_url, MAX_REVIEW_COMMENT_ATTEMPTS)
+                {
+                    tracing::warn!(pr_url = %pr_url, error = %e, "Failed to record review-comment failure");
+                }
             }
         }
 
