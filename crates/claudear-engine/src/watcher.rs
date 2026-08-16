@@ -3574,15 +3574,25 @@ Create a PR with your changes.{custom_instructions}"#,
             // the housekeeping loop (review checks, auto-close, retries) is not starved.
             let watcher = Arc::clone(self);
             let source_clone = Arc::clone(source);
-            let handle = tokio::spawn(async move {
-                watcher
-                    .process_issue(source_clone, issue, match_result, None, None, intent)
-                    .await;
-            });
             {
                 let mut handles = self.spawn_handles.lock().await;
+                // Re-check is_running under the same lock that drain_spawned_tasks
+                // takes, then spawn+record atomically. This closes the shutdown
+                // race: once stop() has set is_running=false (before the drain),
+                // a dispatch either records its handle before the drain's take (so
+                // shutdown joins it) or sees the stop here and never spawns. The
+                // top-of-loop check is not enough on its own — it runs before the
+                // spawn, so a concurrent drain could take the vector between it and
+                // the push.
+                if !self.is_running.load(Ordering::SeqCst) {
+                    break;
+                }
                 handles.retain(|h| !h.is_finished());
-                handles.push(handle);
+                handles.push(tokio::spawn(async move {
+                    watcher
+                        .process_issue(source_clone, issue, match_result, None, None, intent)
+                        .await;
+                }));
             }
 
             // Add delay between starting new issues (skip trailing delay after the last item).
@@ -5191,6 +5201,42 @@ mod tests {
             "watcher retained {retained} handles for completed issue-processing tasks; \
              each one pins a full process_issue allocation for the daemon's lifetime"
         );
+    }
+
+    #[tokio::test]
+    async fn test_stop_and_drain_joins_recorded_task() {
+        use std::sync::atomic::AtomicBool;
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let source = Arc::new(MockSource::new("drain")) as Arc<dyn IssueSource>;
+        let watcher = create_test_watcher(notifier, tracker, vec![source], false);
+        watcher.is_running.store(true, Ordering::SeqCst);
+
+        // A recorded task whose teardown completes shortly after it is spawned.
+        let done = Arc::new(AtomicBool::new(false));
+        let done_clone = Arc::clone(&done);
+        {
+            let mut handles = watcher.spawn_handles.lock().await;
+            handles.push(tokio::spawn(async move {
+                tokio::task::yield_now().await;
+                done_clone.store(true, Ordering::SeqCst);
+            }));
+        }
+
+        // Graceful shutdown must wait for the recorded task's teardown rather than
+        // reporting a clean stop while it is still mutating shared state.
+        watcher.stop_and_drain().await;
+
+        assert!(
+            done.load(Ordering::SeqCst),
+            "stop_and_drain returned before the recorded task finished; a \
+             concurrently processing issue could still be mutating tracker/notifier/agent state"
+        );
+        assert!(
+            watcher.spawn_handles.lock().await.is_empty(),
+            "drain must release recorded handles"
+        );
+        assert!(!watcher.is_running.load(Ordering::SeqCst));
     }
 
     #[test]
