@@ -2807,7 +2807,17 @@ impl IssueProcessor {
                     format!("{block}\n\n{context}")
                 }
             }
-            _ => context,
+            Ok(None) => context,
+            Err(e) => {
+                // Fail open so a storage hiccup never blocks a run, but surface
+                // it: the agent proceeds without operator constraints here.
+                tracing::warn!(
+                    error = %e,
+                    repo = ?repo,
+                    "Failed to resolve operator instructions; proceeding without them"
+                );
+                context
+            }
         }
     }
 
