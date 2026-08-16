@@ -577,6 +577,8 @@ impl IssueProcessor {
                     json!({}),
                 );
                 let (context, _discord_refs) = self.build_rag_context(issue, attempt_id).await;
+                let context =
+                    self.prepend_operator_instructions(context, resolution.repo_name());
                 let prompt = build_failing_test_prompt(issue, &context);
                 match self
                     .agent
@@ -1303,6 +1305,10 @@ impl IssueProcessor {
                 context
             );
         }
+
+        // Prepend operator instructions so the agent knows this repo's role
+        // (e.g. generated output vs source) before it starts editing.
+        let mut context = self.prepend_operator_instructions(context, resolution.repo_name());
 
         // Claude execution + ask loop
         let mut rounds: u8 = 0;
@@ -2525,6 +2531,7 @@ impl IssueProcessor {
         let project_dir = self.action_project_dir(resolution);
         // Verify is read-only and posts no user-facing message, so drop the refs.
         let (context, _discord_refs) = self.build_rag_context(issue, attempt_id).await;
+        let context = self.prepend_operator_instructions(context, resolution.repo_name());
 
         self.record_issue_decision(
             issue,
@@ -2645,6 +2652,7 @@ impl IssueProcessor {
     ) -> ProcessingOutcome {
         let project_dir = self.action_project_dir(resolution);
         let (context, discord_refs) = self.build_rag_context(issue, attempt_id).await;
+        let context = self.prepend_operator_instructions(context, resolution.repo_name());
 
         // The inbox key is the HelpScout mailbox id when present, else the source.
         let inbox_key = issue
@@ -2778,6 +2786,27 @@ impl IssueProcessor {
                 let _ = std::fs::create_dir_all(&dir);
                 dir
             }
+        }
+    }
+
+    /// Prepend operator-authored instructions (global + per-repo) to the agent
+    /// context so it knows this repo's role and any cross-repo relationships
+    /// before acting. No-op when the repo is unknown or nothing is configured.
+    /// Prompt-string only: never writes files, so a repo's own AGENTS.md is
+    /// left untouched.
+    fn prepend_operator_instructions(&self, context: String, repo: Option<&str>) -> String {
+        let Some(repo) = repo else {
+            return context;
+        };
+        match self.tracker.resolve_agent_instructions(repo) {
+            Ok(Some(block)) => {
+                if context.is_empty() {
+                    block
+                } else {
+                    format!("{block}\n\n{context}")
+                }
+            }
+            _ => context,
         }
     }
 
