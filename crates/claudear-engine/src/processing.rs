@@ -2222,6 +2222,9 @@ impl IssueProcessor {
 
         // Ground the answer in the reply thread when this question is a reply.
         let context = self.with_reply_chain(issue, context).await;
+        // QA answers still honor operator instructions (global always; per-repo
+        // when a repo resolved).
+        let context = self.prepend_operator_instructions(context, resolution.repo_name());
 
         self.record_issue_decision(
             issue,
@@ -2795,9 +2798,8 @@ impl IssueProcessor {
     /// Prompt-string only: never writes files, so a repo's own AGENTS.md is
     /// left untouched.
     fn prepend_operator_instructions(&self, context: String, repo: Option<&str>) -> String {
-        let Some(repo) = repo else {
-            return context;
-        };
+        // repo is None for runs without a resolved repo (QA answers, skipped
+        // resolution); global instructions still apply in that case.
         match self.tracker.resolve_agent_instructions(repo) {
             Ok(Some(block)) => {
                 if context.is_empty() {
