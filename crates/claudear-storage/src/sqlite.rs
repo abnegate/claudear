@@ -3151,7 +3151,7 @@ impl KnowledgeStore for SqliteTracker {
         SqliteTracker::get_agent_instruction(self, scope, repo)
     }
 
-    fn resolve_agent_instructions(&self, repo: &str) -> Result<Option<String>> {
+    fn resolve_agent_instructions(&self, repo: Option<&str>) -> Result<Option<String>> {
         SqliteTracker::resolve_agent_instructions(self, repo)
     }
 
@@ -7892,18 +7892,23 @@ impl SqliteTracker {
         Ok(row)
     }
 
-    /// Resolve the effective instruction block for a repo: global first, then the
-    /// per-repo override, concatenated with clear provenance. Returns None when
-    /// neither scope has active text.
-    pub fn resolve_agent_instructions(&self, repo: &str) -> Result<Option<String>> {
+    /// Resolve the effective instruction block: global first, then the per-repo
+    /// override, concatenated with clear provenance. `repo` is None when the run
+    /// has no resolved repo (e.g. skipped resolution or a QA answer); global
+    /// instructions still apply in that case. Returns None when neither scope has
+    /// active text.
+    pub fn resolve_agent_instructions(&self, repo: Option<&str>) -> Result<Option<String>> {
         let global = self
             .get_agent_instruction(claudear_core::types::InstructionScope::Global, None)?
             .map(|i| i.instruction_text)
             .filter(|t| !t.trim().is_empty());
-        let per_repo = self
-            .get_agent_instruction(claudear_core::types::InstructionScope::Repo, Some(repo))?
-            .map(|i| i.instruction_text)
-            .filter(|t| !t.trim().is_empty());
+        let per_repo = match repo {
+            Some(r) => self
+                .get_agent_instruction(claudear_core::types::InstructionScope::Repo, Some(r))?
+                .map(|i| i.instruction_text)
+                .filter(|t| !t.trim().is_empty()),
+            None => None,
+        };
 
         if global.is_none() && per_repo.is_none() {
             return Ok(None);
@@ -7917,7 +7922,7 @@ impl SqliteTracker {
             block.push_str(g.trim());
             block.push('\n');
         }
-        if let Some(r) = per_repo {
+        if let (Some(r), Some(repo)) = (per_repo, repo) {
             block.push_str(&format!("\n## Repository: {}\n", repo));
             block.push_str(r.trim());
             block.push('\n');
@@ -9930,7 +9935,7 @@ mod tests {
         let tracker = SqliteTracker::in_memory().unwrap();
 
         // Nothing set: resolve is None.
-        assert!(tracker.resolve_agent_instructions("org/repo").unwrap().is_none());
+        assert!(tracker.resolve_agent_instructions(Some("org/repo")).unwrap().is_none());
 
         // Global only.
         tracker
@@ -9944,10 +9949,15 @@ mod tests {
         assert_eq!(g.scope, InstructionScope::Global);
         assert!(g.repo.is_none());
 
-        let resolved = tracker.resolve_agent_instructions("org/repo").unwrap().unwrap();
+        let resolved = tracker.resolve_agent_instructions(Some("org/repo")).unwrap().unwrap();
         assert!(resolved.contains("## Global"));
         assert!(resolved.contains("Be terse."));
         assert!(!resolved.contains("## Repository:"));
+
+        // Global still applies when there is no resolved repo (e.g. QA / Skip).
+        let no_repo = tracker.resolve_agent_instructions(None).unwrap().unwrap();
+        assert!(no_repo.contains("## Global"));
+        assert!(!no_repo.contains("## Repository:"));
 
         // Per-repo override is namespaced and concatenated after global.
         tracker
@@ -9958,14 +9968,18 @@ mod tests {
                 None,
             )
             .unwrap();
-        let resolved = tracker.resolve_agent_instructions("org/repo").unwrap().unwrap();
+        let resolved = tracker.resolve_agent_instructions(Some("org/repo")).unwrap().unwrap();
         assert!(resolved.contains("## Global"));
         assert!(resolved.contains("## Repository: org/repo"));
         assert!(resolved.contains("edit the generator instead"));
 
         // A different repo does not see the override.
-        let other = tracker.resolve_agent_instructions("org/other").unwrap().unwrap();
+        let other = tracker.resolve_agent_instructions(Some("org/other")).unwrap().unwrap();
         assert!(!other.contains("## Repository:"));
+
+        // No-repo resolution never leaks a per-repo override.
+        let no_repo = tracker.resolve_agent_instructions(None).unwrap().unwrap();
+        assert!(!no_repo.contains("## Repository:"));
 
         // Upsert replaces text for the same scope (no duplicate row).
         tracker
