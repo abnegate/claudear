@@ -577,8 +577,7 @@ impl IssueProcessor {
                     json!({}),
                 );
                 let (context, _discord_refs) = self.build_rag_context(issue, attempt_id).await;
-                let context =
-                    self.prepend_operator_instructions(context, resolution.repo_name());
+                let context = self.prepend_operator_instructions(context, resolution.repo_name());
                 let prompt = build_failing_test_prompt(issue, &context);
                 match self
                     .agent
