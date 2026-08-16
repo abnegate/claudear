@@ -3133,6 +3133,28 @@ impl KnowledgeStore for SqliteTracker {
         SqliteTracker::get_promoted_instructions(self, repo)
     }
 
+    fn upsert_agent_instruction(
+        &self,
+        scope: claudear_core::types::InstructionScope,
+        repo: Option<&str>,
+        text: &str,
+        updated_by: Option<&str>,
+    ) -> Result<i64> {
+        SqliteTracker::upsert_agent_instruction(self, scope, repo, text, updated_by)
+    }
+
+    fn get_agent_instruction(
+        &self,
+        scope: claudear_core::types::InstructionScope,
+        repo: Option<&str>,
+    ) -> Result<Option<claudear_core::types::AgentInstruction>> {
+        SqliteTracker::get_agent_instruction(self, scope, repo)
+    }
+
+    fn resolve_agent_instructions(&self, repo: &str) -> Result<Option<String>> {
+        SqliteTracker::resolve_agent_instructions(self, repo)
+    }
+
     fn upsert_repo_knowledge(&self, entry: &claudear_core::types::RepoKnowledge) -> Result<i64> {
         SqliteTracker::upsert_repo_knowledge(self, entry)
     }
@@ -7799,6 +7821,110 @@ impl SqliteTracker {
         Ok(rows)
     }
 
+    /// Upsert the single agent-instruction row for a scope. `repo` is None for
+    /// the global row and Some(`org/name`) for a per-repo row.
+    pub fn upsert_agent_instruction(
+        &self,
+        scope: claudear_core::types::InstructionScope,
+        repo: Option<&str>,
+        text: &str,
+        updated_by: Option<&str>,
+    ) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+        let now = Utc::now().to_rfc3339();
+        let scope_str = scope.to_string();
+
+        // Match on IFNULL so the NULL-repo global row is addressable.
+        let updated = conn.execute(
+            "UPDATE agent_instructions SET instruction_text = ?1, is_active = 1, updated_by = ?2, updated_at = ?3
+             WHERE scope = ?4 AND IFNULL(repo, '') = IFNULL(?5, '')",
+            params![text, updated_by, now, scope_str, repo],
+        )?;
+
+        if updated > 0 {
+            let id: i64 = conn
+                .query_row(
+                    "SELECT id FROM agent_instructions WHERE scope = ?1 AND IFNULL(repo, '') = IFNULL(?2, '')",
+                    params![scope_str, repo],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            return Ok(id);
+        }
+
+        conn.execute(
+            "INSERT INTO agent_instructions (scope, repo, instruction_text, is_active, updated_by, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 1, ?4, ?5, ?5)",
+            params![scope_str, repo, text, updated_by, now],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Get the active agent instruction for a scope, if any.
+    pub fn get_agent_instruction(
+        &self,
+        scope: claudear_core::types::InstructionScope,
+        repo: Option<&str>,
+    ) -> Result<Option<claudear_core::types::AgentInstruction>> {
+        let conn = self.acquire_lock()?;
+        let scope_str = scope.to_string();
+        let row = conn
+            .query_row(
+                "SELECT id, scope, repo, instruction_text, is_active, updated_at
+                 FROM agent_instructions
+                 WHERE scope = ?1 AND IFNULL(repo, '') = IFNULL(?2, '') AND is_active = 1",
+                params![scope_str, repo],
+                |row| {
+                    let scope_val: String = row.get(1)?;
+                    Ok(claudear_core::types::AgentInstruction {
+                        id: row.get(0)?,
+                        scope: scope_val
+                            .parse()
+                            .unwrap_or(claudear_core::types::InstructionScope::Global),
+                        repo: row.get(2)?,
+                        instruction_text: row.get(3)?,
+                        is_active: row.get::<_, i32>(4)? != 0,
+                        updated_at: Self::parse_datetime(&row.get::<_, String>(5)?)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Resolve the effective instruction block for a repo: global first, then the
+    /// per-repo override, concatenated with clear provenance. Returns None when
+    /// neither scope has active text.
+    pub fn resolve_agent_instructions(&self, repo: &str) -> Result<Option<String>> {
+        let global = self
+            .get_agent_instruction(claudear_core::types::InstructionScope::Global, None)?
+            .map(|i| i.instruction_text)
+            .filter(|t| !t.trim().is_empty());
+        let per_repo = self
+            .get_agent_instruction(claudear_core::types::InstructionScope::Repo, Some(repo))?
+            .map(|i| i.instruction_text)
+            .filter(|t| !t.trim().is_empty());
+
+        if global.is_none() && per_repo.is_none() {
+            return Ok(None);
+        }
+
+        let mut block = String::from(
+            "# Operator Instructions (claudear)\nThese instructions were configured by your operators. Follow them.\n",
+        );
+        if let Some(g) = global {
+            block.push_str("\n## Global\n");
+            block.push_str(g.trim());
+            block.push('\n');
+        }
+        if let Some(r) = per_repo {
+            block.push_str(&format!("\n## Repository: {}\n", repo));
+            block.push_str(r.trim());
+            block.push('\n');
+        }
+        Ok(Some(block))
+    }
+
     /// System 4: Upsert a repo knowledge entry.
     pub fn upsert_repo_knowledge(
         &self,
@@ -9797,6 +9923,60 @@ fn complexity_to_hours(score: f64) -> f64 {
 mod tests {
     use super::*;
     use chrono::{Datelike, Timelike, Utc};
+
+    #[test]
+    fn test_agent_instructions_scope_and_resolve() {
+        use claudear_core::types::InstructionScope;
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Nothing set: resolve is None.
+        assert!(tracker.resolve_agent_instructions("org/repo").unwrap().is_none());
+
+        // Global only.
+        tracker
+            .upsert_agent_instruction(InstructionScope::Global, None, "Be terse.", Some("admin"))
+            .unwrap();
+        let g = tracker
+            .get_agent_instruction(InstructionScope::Global, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(g.instruction_text, "Be terse.");
+        assert_eq!(g.scope, InstructionScope::Global);
+        assert!(g.repo.is_none());
+
+        let resolved = tracker.resolve_agent_instructions("org/repo").unwrap().unwrap();
+        assert!(resolved.contains("## Global"));
+        assert!(resolved.contains("Be terse."));
+        assert!(!resolved.contains("## Repository:"));
+
+        // Per-repo override is namespaced and concatenated after global.
+        tracker
+            .upsert_agent_instruction(
+                InstructionScope::Repo,
+                Some("org/repo"),
+                "Generated output; edit the generator instead.",
+                None,
+            )
+            .unwrap();
+        let resolved = tracker.resolve_agent_instructions("org/repo").unwrap().unwrap();
+        assert!(resolved.contains("## Global"));
+        assert!(resolved.contains("## Repository: org/repo"));
+        assert!(resolved.contains("edit the generator instead"));
+
+        // A different repo does not see the override.
+        let other = tracker.resolve_agent_instructions("org/other").unwrap().unwrap();
+        assert!(!other.contains("## Repository:"));
+
+        // Upsert replaces text for the same scope (no duplicate row).
+        tracker
+            .upsert_agent_instruction(InstructionScope::Global, None, "Updated.", None)
+            .unwrap();
+        let g = tracker
+            .get_agent_instruction(InstructionScope::Global, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(g.instruction_text, "Updated.");
+    }
 
     #[test]
     fn test_record_and_retrieve_attempt() {
