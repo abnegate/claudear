@@ -442,12 +442,12 @@ function GlobalInstructionsCard() {
             <Save className="h-3.5 w-3.5" />
             {saving ? 'Saving...' : 'Save Instructions'}
           </button>
-          {saved && (
+          {saved && !dirty && (
             <span className="text-xs text-green-600 flex items-center gap-1">
               <CheckCircle2 className="h-3.5 w-3.5" /> Saved
             </span>
           )}
-          {dirty && !saved && !saveError && <span className="text-xs text-amber-600">Unsaved changes</span>}
+          {dirty && !saveError && <span className="text-xs text-amber-600">Unsaved changes</span>}
           {saveError && (
             <span className="text-xs text-red-600 flex items-center gap-1">
               <AlertTriangle className="h-3.5 w-3.5" /> {saveError}
