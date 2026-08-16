@@ -1324,22 +1324,43 @@ impl AttemptTracker for SqliteTracker {
         Ok(())
     }
 
-    fn mark_answered(&self, source: &str, issue_id: &str, summary: &str) -> Result<()> {
+    fn mark_answered(
+        &self,
+        source: &str,
+        issue_id: &str,
+        summary: &str,
+        intent: Option<&str>,
+    ) -> Result<()> {
         tracing::info!(
             source = source,
             issue_id = issue_id,
             "Marking attempt as answered"
         );
         let conn = self.acquire_lock()?;
+        // COALESCE keeps any previously-stored intent when this call omits one.
         conn.execute(
             r#"
             UPDATE fix_attempts
-            SET status = 'answered', error_message = ?
+            SET status = 'answered', error_message = ?, routing_intent = COALESCE(?, routing_intent)
             WHERE source = ? AND issue_id = ?
             "#,
-            params![summary, source, issue_id],
+            params![summary, intent, source, issue_id],
         )?;
         Ok(())
+    }
+
+    /// Read the routing intent classified for an attempt, if one was stored.
+    fn get_routing_intent(&self, source: &str, issue_id: &str) -> Result<Option<String>> {
+        let conn = self.acquire_lock()?;
+        let intent = conn
+            .query_row(
+                "SELECT routing_intent FROM fix_attempts WHERE source = ? AND issue_id = ?",
+                params![source, issue_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(intent)
     }
 
     fn record_answer_message_ids(
