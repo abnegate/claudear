@@ -1,6 +1,9 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import useSWR from 'swr'
-import { fetchConfig, saveConfig, type ConfigResponse } from '../lib/api'
+import {
+  fetchConfig, saveConfig, type ConfigResponse,
+  fetchGlobalInstruction, saveGlobalInstruction, type InstructionResponse,
+} from '../lib/api'
 import { PageHeader } from '../components/layout/page-header'
 import { CardStackSkeleton } from '../components/shared/page-skeletons'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '../components/ui/card'
@@ -369,6 +372,70 @@ function SectionFormCard({
   )
 }
 
+function GlobalInstructionsCard() {
+  const { data, mutate } = useSWR<InstructionResponse>('global-instruction', fetchGlobalInstruction)
+  const [draft, setDraft] = useState<string | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [saved, setSaved] = useState(false)
+
+  const serverText = data?.text ?? ''
+  const text = draft ?? serverText
+  const dirty = text !== serverText
+
+  const handleSave = useCallback(async () => {
+    setSaving(true)
+    try {
+      await saveGlobalInstruction(text)
+      await mutate()
+      setDraft(null)
+      setSaved(true)
+      setTimeout(() => setSaved(false), 3000)
+    } finally {
+      setSaving(false)
+    }
+  }, [text, mutate])
+
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <div className="flex items-center gap-2">
+          <Bot className="h-4 w-4 text-muted-foreground" />
+          <CardTitle className="text-base">Global Agent Instructions</CardTitle>
+        </div>
+        <CardDescription>
+          Prepended to the agent's context on every run, for all repos. Set per-repo
+          overrides from the Repos page. This never overwrites a repo's own AGENTS.md.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <textarea
+          value={text}
+          onChange={e => setDraft(e.target.value)}
+          placeholder="e.g. Prefer minimal diffs. Never edit generated files; fix the generator instead."
+          className="w-full font-mono text-xs bg-muted/50 border rounded-md p-4 min-h-[160px] resize-y focus:outline-none focus:ring-2 focus:ring-primary/30"
+          spellCheck={false}
+        />
+        <div className="flex items-center gap-3">
+          <button
+            onClick={handleSave}
+            disabled={saving || !dirty}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-green-600 text-white hover:bg-green-700 disabled:opacity-40 disabled:pointer-events-none transition-colors"
+          >
+            <Save className="h-3.5 w-3.5" />
+            {saving ? 'Saving...' : 'Save Instructions'}
+          </button>
+          {saved && (
+            <span className="text-xs text-green-600 flex items-center gap-1">
+              <CheckCircle2 className="h-3.5 w-3.5" /> Saved
+            </span>
+          )}
+          {dirty && !saved && <span className="text-xs text-amber-600">Unsaved changes</span>}
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
 export default function ConfigPage() {
   const { user: currentUser } = useAuth()
   const { data, isLoading, error, mutate } = useSWR<ConfigResponse>('config', fetchConfig)
@@ -442,6 +509,8 @@ export default function ConfigPage() {
   return (
     <div className="space-y-6">
       <PageHeader title="Configuration" description="View and edit your claudear.toml config file" />
+
+      <GlobalInstructionsCard />
 
       {/* Toolbar */}
       <div className="flex items-center gap-3 flex-wrap">
