@@ -9935,7 +9935,10 @@ mod tests {
         let tracker = SqliteTracker::in_memory().unwrap();
 
         // Nothing set: resolve is None.
-        assert!(tracker.resolve_agent_instructions(Some("org/repo")).unwrap().is_none());
+        assert!(tracker
+            .resolve_agent_instructions(Some("org/repo"))
+            .unwrap()
+            .is_none());
 
         // Global only.
         tracker
@@ -9949,7 +9952,10 @@ mod tests {
         assert_eq!(g.scope, InstructionScope::Global);
         assert!(g.repo.is_none());
 
-        let resolved = tracker.resolve_agent_instructions(Some("org/repo")).unwrap().unwrap();
+        let resolved = tracker
+            .resolve_agent_instructions(Some("org/repo"))
+            .unwrap()
+            .unwrap();
         assert!(resolved.contains("## Global"));
         assert!(resolved.contains("Be terse."));
         assert!(!resolved.contains("## Repository:"));
@@ -9968,13 +9974,19 @@ mod tests {
                 None,
             )
             .unwrap();
-        let resolved = tracker.resolve_agent_instructions(Some("org/repo")).unwrap().unwrap();
+        let resolved = tracker
+            .resolve_agent_instructions(Some("org/repo"))
+            .unwrap()
+            .unwrap();
         assert!(resolved.contains("## Global"));
         assert!(resolved.contains("## Repository: org/repo"));
         assert!(resolved.contains("edit the generator instead"));
 
         // A different repo does not see the override.
-        let other = tracker.resolve_agent_instructions(Some("org/other")).unwrap().unwrap();
+        let other = tracker
+            .resolve_agent_instructions(Some("org/other"))
+            .unwrap()
+            .unwrap();
         assert!(!other.contains("## Repository:"));
 
         // No-repo resolution never leaks a per-repo override.

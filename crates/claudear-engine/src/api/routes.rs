@@ -191,8 +191,7 @@ pub fn create_api_router_full(
         )
         .route(
             "/api/instructions/global",
-            axum::routing::get(get_global_instruction_handler)
-                .put(put_global_instruction_handler),
+            axum::routing::get(get_global_instruction_handler).put(put_global_instruction_handler),
         )
         // User CRUD routes
         .route(
