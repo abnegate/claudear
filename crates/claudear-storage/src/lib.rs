@@ -877,8 +877,9 @@ pub trait KnowledgeStore: Send + Sync {
         Ok(None)
     }
 
-    /// Resolve the effective instruction block (global + per-repo) for a repo.
-    fn resolve_agent_instructions(&self, _repo: &str) -> Result<Option<String>> {
+    /// Resolve the effective instruction block (global + per-repo). `repo` is
+    /// None when there is no resolved repo; global instructions still apply.
+    fn resolve_agent_instructions(&self, _repo: Option<&str>) -> Result<Option<String>> {
         Ok(None)
     }
 
