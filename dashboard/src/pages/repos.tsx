@@ -136,15 +136,19 @@ function RepoInstructionsEditor({ repo }: { repo: string }) {
     setSaveError(null)
     try {
       await saveRepoInstruction(repo, text)
-      await mutate()
-      setDraft(null)
-      setSaved(true)
-      setTimeout(() => setSaved(false), 3000)
     } catch (e: any) {
       setSaveError(e?.message || 'Failed to save instructions')
+      return
     } finally {
       setSaving(false)
     }
+    // PUT persisted. Sync the cache optimistically from the known-saved value so
+    // a background revalidation failure can't misreport the save or blank the
+    // editor.
+    setDraft(null)
+    setSaved(true)
+    setTimeout(() => setSaved(false), 3000)
+    mutate(prev => (prev ? { ...prev, text } : prev), { revalidate: false })
   }, [repo, text, mutate])
 
   return (
