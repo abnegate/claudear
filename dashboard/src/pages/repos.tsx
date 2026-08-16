@@ -188,12 +188,12 @@ function RepoInstructionsEditor({ repo }: { repo: string }) {
           <Save className="h-4 w-4" />
           {saving ? 'Saving...' : 'Save'}
         </button>
-        {saved && (
+        {saved && !dirty && (
           <span className="text-xs text-green-600 inline-flex items-center gap-1">
             <CheckCircle2 className="h-3.5 w-3.5" /> Saved
           </span>
         )}
-        {dirty && !saved && !saveError && <span className="text-xs text-amber-600">Unsaved changes</span>}
+        {dirty && !saveError && <span className="text-xs text-amber-600">Unsaved changes</span>}
         {saveError && (
           <span className="text-xs text-red-600 inline-flex items-center gap-1">
             <AlertTriangle className="h-3.5 w-3.5" /> {saveError}
