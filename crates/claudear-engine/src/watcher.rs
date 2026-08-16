@@ -255,6 +255,13 @@ pub struct Watcher {
     spawn_handles: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
+/// A ledger comment carried by a review batch: `(scm_comment_id, comment_kind)`.
+type CommentRef = (i64, &'static str);
+
+/// Actionable review feedback grouped for one PR:
+/// `(pr_url, feedback_summary, feedback_count, comment_refs)`.
+type PrReviewFeedback = (String, String, usize, Vec<CommentRef>);
+
 impl Watcher {
     /// Create a new watcher.
     pub fn new(options: WatcherOptions) -> Self {
@@ -1330,12 +1337,10 @@ impl Watcher {
     /// targets those specific rows rather than the whole PR (which would wrongly
     /// mark a concurrently-recorded comment handled) or a colliding id in the other
     /// namespace.
-    fn group_review_feedback_by_pr(
-        events: Vec<ReviewEvent>,
-    ) -> Vec<(String, String, usize, Vec<(i64, &'static str)>)> {
+    fn group_review_feedback_by_pr(events: Vec<ReviewEvent>) -> Vec<PrReviewFeedback> {
         let mut feedback_by_pr: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
-        let mut refs_by_pr: std::collections::HashMap<String, Vec<(i64, &'static str)>> =
+        let mut refs_by_pr: std::collections::HashMap<String, Vec<CommentRef>> =
             std::collections::HashMap::new();
         let mut pr_order: Vec<String> = Vec::new();
 
