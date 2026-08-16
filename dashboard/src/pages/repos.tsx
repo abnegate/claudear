@@ -23,7 +23,7 @@ import { Modal } from '../components/shared/modal'
 import { Tabs } from '../components/ui/tabs'
 import { Card, CardContent } from '../components/ui/card'
 import { formatNumber, formatDate } from '../lib/formatters'
-import { Database, FileText, Clock, ExternalLink, Loader2, GraduationCap, Save, Bot, CheckCircle2 } from 'lucide-react'
+import { Database, FileText, Clock, ExternalLink, Loader2, GraduationCap, Save, Bot, CheckCircle2, AlertTriangle } from 'lucide-react'
 import { useRouter } from '../router'
 
 const tabItems = [
@@ -118,13 +118,14 @@ function useIndexingProgress() {
 }
 
 function RepoInstructionsEditor({ repo }: { repo: string }) {
-  const { data, mutate } = useSWR<InstructionResponse>(
+  const { data, error, isLoading, mutate } = useSWR<InstructionResponse>(
     ['repo-instruction', repo],
     () => fetchRepoInstruction(repo),
   )
   const [draft, setDraft] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
 
   const serverText = data?.text ?? ''
   const text = draft ?? serverText
@@ -132,12 +133,15 @@ function RepoInstructionsEditor({ repo }: { repo: string }) {
 
   const handleSave = useCallback(async () => {
     setSaving(true)
+    setSaveError(null)
     try {
       await saveRepoInstruction(repo, text)
       await mutate()
       setDraft(null)
       setSaved(true)
       setTimeout(() => setSaved(false), 3000)
+    } catch (e: any) {
+      setSaveError(e?.message || 'Failed to save instructions')
     } finally {
       setSaving(false)
     }
@@ -154,17 +158,25 @@ function RepoInstructionsEditor({ repo }: { repo: string }) {
         Describe the repo's role (e.g. generated output vs source). Never overwrites the
         repo's own AGENTS.md.
       </p>
-      <textarea
-        value={text}
-        onChange={e => setDraft(e.target.value)}
-        placeholder="e.g. This repo holds generated SDK output. Do not edit here; fix the sdk-generator repo instead."
-        className="w-full font-mono text-xs bg-muted/50 border rounded-md p-3 min-h-[120px] resize-y focus:outline-none focus:ring-2 focus:ring-primary/30"
-        spellCheck={false}
-      />
+      {error ? (
+        <div className="flex items-center gap-2 text-sm text-red-600">
+          <AlertTriangle className="h-4 w-4" />
+          <span>Failed to load instructions: {error.message}. Editing is disabled to avoid overwriting.</span>
+        </div>
+      ) : (
+        <textarea
+          value={text}
+          onChange={e => setDraft(e.target.value)}
+          disabled={isLoading}
+          placeholder="e.g. This repo holds generated SDK output. Do not edit here; fix the sdk-generator repo instead."
+          className="w-full font-mono text-xs bg-muted/50 border rounded-md p-3 min-h-[120px] resize-y focus:outline-none focus:ring-2 focus:ring-primary/30 disabled:opacity-50"
+          spellCheck={false}
+        />
+      )}
       <div className="flex items-center gap-3">
         <button
           onClick={handleSave}
-          disabled={saving || !dirty}
+          disabled={saving || !dirty || !!error}
           className="inline-flex items-center gap-1.5 rounded-md bg-green-600 text-white px-3 py-1.5 text-sm font-medium hover:bg-green-700 disabled:opacity-40 disabled:pointer-events-none transition-colors"
         >
           <Save className="h-4 w-4" />
@@ -175,7 +187,12 @@ function RepoInstructionsEditor({ repo }: { repo: string }) {
             <CheckCircle2 className="h-3.5 w-3.5" /> Saved
           </span>
         )}
-        {dirty && !saved && <span className="text-xs text-amber-600">Unsaved changes</span>}
+        {dirty && !saved && !saveError && <span className="text-xs text-amber-600">Unsaved changes</span>}
+        {saveError && (
+          <span className="text-xs text-red-600 inline-flex items-center gap-1">
+            <AlertTriangle className="h-3.5 w-3.5" /> {saveError}
+          </span>
+        )}
       </div>
     </div>
   )
