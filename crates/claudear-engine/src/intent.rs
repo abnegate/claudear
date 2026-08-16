@@ -45,6 +45,17 @@ impl Intent {
     pub fn is_bug_or_security(&self) -> bool {
         matches!(self, Intent::Bug | Intent::Security)
     }
+
+    /// Stable short label persisted as the attempt's routing intent and emitted
+    /// as a structural marker in the reply-chain transcript.
+    pub fn routing_label(&self) -> &'static str {
+        match self {
+            Intent::Bug => "bug",
+            Intent::Security => "security",
+            Intent::Question => "QA",
+            Intent::Fix => "fix",
+        }
+    }
 }
 
 /// Classifies an issue's [`Intent`]. Returns `None` when the backend is
