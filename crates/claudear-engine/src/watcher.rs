@@ -380,6 +380,31 @@ impl Watcher {
         }
     }
 
+    /// Join spawned tasks until they finish or `deadline` passes.
+    ///
+    /// Cancel-safe, unlike wrapping [`Self::drain_spawned_tasks`] in a
+    /// `timeout`: that takes every handle out of `spawn_handles` first, so a
+    /// firing timeout drops the taken handles and *detaches* the still-running
+    /// tasks, which the runtime then aborts mid-operation. Here each handle is
+    /// popped one at a time and joined via `&mut handle`, so a handle whose join
+    /// exceeds the deadline is put back into `spawn_handles` rather than dropped.
+    /// Returns `true` when every task was joined within the budget.
+    async fn drain_spawned_tasks_until(&self, deadline: std::time::Instant) -> bool {
+        loop {
+            let mut handle = match self.spawn_handles.lock().await.pop() {
+                Some(h) => h,
+                None => return true,
+            };
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            // `&mut handle` is the future, so a timeout drops only the borrow;
+            // `handle` survives and goes back into the list, never detached.
+            if remaining.is_zero() || tokio::time::timeout(remaining, &mut handle).await.is_err() {
+                self.spawn_handles.lock().await.push(handle);
+                return false;
+            }
+        }
+    }
+
     /// Get a trait-object reference to the LLM analyzer, if available.
     fn llm(&self) -> Option<&dyn claudear_analysis::llm::LlmAnalyzer> {
         self.llm_analyzer
@@ -1193,12 +1218,18 @@ impl Watcher {
             let _ = tokio::time::timeout(remaining, self.slot_available.notified()).await;
         }
 
-        // Join the spawned tasks themselves so shutdown waits for their teardown too,
-        // and so their handles are released rather than dropped with the watcher.
-        let remaining = max_wait.saturating_sub(start.elapsed());
-        let _ = tokio::time::timeout(remaining, self.drain_spawned_tasks()).await;
-
-        tracing::info!("Claude Watcher stopped gracefully");
+        // Join the spawned tasks themselves so shutdown waits for their teardown
+        // too, and so their handles are released rather than dropped with the
+        // watcher. Bounded by the same 30s budget, but cancel-safely: an
+        // unfinished task is left in spawn_handles rather than detached.
+        if self.drain_spawned_tasks_until(start + max_wait).await {
+            tracing::info!("Claude Watcher stopped gracefully");
+        } else {
+            tracing::warn!(
+                "Graceful shutdown budget exhausted while draining spawned tasks; \
+                 unfinished tasks remain and were not detached"
+            );
+        }
     }
 
     /// Check if the watcher is currently running.
@@ -5237,6 +5268,50 @@ mod tests {
             "drain must release recorded handles"
         );
         assert!(!watcher.is_running.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_drain_spawned_tasks_until_keeps_unfinished_handle() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let source = Arc::new(MockSource::new("drain")) as Arc<dyn IssueSource>;
+        let watcher = create_test_watcher(notifier, tracker, vec![source], false);
+
+        // A task that outlives a short drain budget.
+        let done = Arc::new(AtomicBool::new(false));
+        let done_clone = Arc::clone(&done);
+        {
+            let mut handles = watcher.spawn_handles.lock().await;
+            handles.push(tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                done_clone.store(true, Ordering::SeqCst);
+            }));
+        }
+
+        // Budget shorter than the task: reports incomplete and must NOT detach it
+        // (dropping the handle would let the runtime abort it mid-operation).
+        let ok = watcher
+            .drain_spawned_tasks_until(Instant::now() + Duration::from_millis(20))
+            .await;
+        assert!(!ok, "budget was too short, drain should report incomplete");
+        assert_eq!(
+            watcher.spawn_handles.lock().await.len(),
+            1,
+            "the unfinished task's handle must be kept, not dropped/detached"
+        );
+
+        // The task is still alive; draining with ample budget joins it to completion.
+        let ok = watcher
+            .drain_spawned_tasks_until(Instant::now() + Duration::from_secs(5))
+            .await;
+        assert!(ok);
+        assert!(
+            done.load(Ordering::SeqCst),
+            "task ran to completion — it was never aborted"
+        );
+        assert!(watcher.spawn_handles.lock().await.is_empty());
     }
 
     #[test]
