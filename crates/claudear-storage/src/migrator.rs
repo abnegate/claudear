@@ -61,6 +61,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "pr_review_states_issue_comments",
         sql: include_str!("../../../migrations/V9__pr_review_states_issue_comments.sql"),
     },
+    Migration {
+        version: 10,
+        name: "agent_instructions",
+        sql: include_str!("../../../migrations/V10__agent_instructions.sql"),
+    },
 ];
 
 /// Run all pending migrations against the given connection.
@@ -121,7 +126,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
 
         // Verify a table from V1 exists
         let count: u32 = conn
@@ -171,6 +176,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_kind_col, 1);
+
+        // Verify the V10 table exists.
+        let has_instructions: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='agent_instructions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_instructions, 1);
     }
 
     #[test]
@@ -185,7 +200,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
     }
 
     #[test]
