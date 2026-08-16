@@ -3533,6 +3533,15 @@ Create a PR with your changes.{custom_instructions}"#,
                 self.slot_available.notified().await;
             }
 
+            // Carry the trusted routing intent (classified upstream on trusted
+            // content) so the answered attempt is stamped with it, letting the
+            // reply-chain transcript emit a structural marker instead of
+            // re-injecting the generated answer body into the classifier.
+            let mut issue = issue;
+            if let Some(intent) = intent {
+                issue.set_metadata("routing_intent", intent.routing_label());
+            }
+
             // Spawn processing as a background task so poll_source returns promptly and
             // the housekeeping loop (review checks, auto-close, retries) is not starved.
             let watcher = Arc::clone(self);
