@@ -356,6 +356,25 @@ impl ScmProvider for InstrumentedScm {
             .get_new_review_comments(project, number, since)
             .await
     }
+    async fn get_pr_conversation_comments(
+        &self,
+        project: &str,
+        number: i64,
+    ) -> Result<Vec<ReviewComment>> {
+        self.inner
+            .get_pr_conversation_comments(project, number)
+            .await
+    }
+    async fn get_new_conversation_comments(
+        &self,
+        project: &str,
+        number: i64,
+        since: Option<&str>,
+    ) -> Result<Vec<ReviewComment>> {
+        self.inner
+            .get_new_conversation_comments(project, number, since)
+            .await
+    }
     async fn list_repos(&self, org_or_group: &str) -> Result<Vec<RemoteRepo>> {
         self.inner.list_repos(org_or_group).await
     }

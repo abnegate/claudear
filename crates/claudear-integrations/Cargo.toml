@@ -29,6 +29,9 @@ rustls-acme = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+# Temp files (rendered MCP config passed to the agent CLI)
+tempfile = { workspace = true }
+
 # Time
 chrono = { workspace = true }
 

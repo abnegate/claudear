@@ -156,6 +156,10 @@ pub fn create_api_router_full(
         )
         .route("/api/repos/dependencies", get(dependencies_handler))
         .route("/api/repos/{repo}/learning", get(repo_learning_handler))
+        .route(
+            "/api/repos/{repo}/instructions",
+            get(get_repo_instruction_handler).put(put_repo_instruction_handler),
+        )
         .route("/api/channels", get(discord_channels_handler))
         .route("/api/channels/stats", get(discord_channel_stats_handler))
         .route("/api/inference/stats", get(inference_stats_handler))
@@ -184,6 +188,10 @@ pub fn create_api_router_full(
         .route(
             "/api/config",
             axum::routing::get(get_config_handler).put(put_config_handler),
+        )
+        .route(
+            "/api/instructions/global",
+            axum::routing::get(get_global_instruction_handler).put(put_global_instruction_handler),
         )
         // User CRUD routes
         .route(
@@ -2730,6 +2738,132 @@ async fn put_config_handler(
     Ok(Json(
         serde_json::json!({ "ok": true, "message": "Config saved. Restart to apply changes." }),
     ))
+}
+
+#[derive(Serialize)]
+struct InstructionResponse {
+    scope: String,
+    repo: Option<String>,
+    text: String,
+    updated_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct InstructionUpdateRequest {
+    text: String,
+}
+
+fn instruction_response(
+    scope: claudear_core::types::InstructionScope,
+    repo: Option<String>,
+    instruction: Option<claudear_core::types::AgentInstruction>,
+) -> InstructionResponse {
+    match instruction {
+        Some(i) => InstructionResponse {
+            scope: i.scope.to_string(),
+            repo: i.repo,
+            text: i.instruction_text,
+            updated_at: Some(i.updated_at.to_rfc3339()),
+        },
+        None => InstructionResponse {
+            scope: scope.to_string(),
+            repo,
+            text: String::new(),
+            updated_at: None,
+        },
+    }
+}
+
+/// GET /api/instructions/global — read the global agent instruction.
+async fn get_global_instruction_handler(
+    _user: AdminUser,
+    State(state): State<ApiState>,
+) -> Result<Json<InstructionResponse>, StatusCode> {
+    let instruction = state
+        .tracker
+        .get_agent_instruction(claudear_core::types::InstructionScope::Global, None)
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to read global instruction");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(Json(instruction_response(
+        claudear_core::types::InstructionScope::Global,
+        None,
+        instruction,
+    )))
+}
+
+/// PUT /api/instructions/global — write the global agent instruction.
+async fn put_global_instruction_handler(
+    _user: AdminUser,
+    State(state): State<ApiState>,
+    Json(body): Json<InstructionUpdateRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !check_api_rate_limit(_user.0.id) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    state
+        .tracker
+        .upsert_agent_instruction(
+            claudear_core::types::InstructionScope::Global,
+            None,
+            &body.text,
+            Some(&_user.0.name),
+        )
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to save global instruction");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// GET /api/repos/{repo}/instructions — read a repo's agent instruction.
+async fn get_repo_instruction_handler(
+    _user: AdminUser,
+    State(state): State<ApiState>,
+    Path(repo): Path<String>,
+) -> Result<Json<InstructionResponse>, StatusCode> {
+    let instruction = state
+        .tracker
+        .get_agent_instruction(claudear_core::types::InstructionScope::Repo, Some(&repo))
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to read repo instruction");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(Json(instruction_response(
+        claudear_core::types::InstructionScope::Repo,
+        Some(repo),
+        instruction,
+    )))
+}
+
+/// PUT /api/repos/{repo}/instructions — write a repo's agent instruction.
+async fn put_repo_instruction_handler(
+    _user: AdminUser,
+    State(state): State<ApiState>,
+    Path(repo): Path<String>,
+    Json(body): Json<InstructionUpdateRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !check_api_rate_limit(_user.0.id) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    state
+        .tracker
+        .upsert_agent_instruction(
+            claudear_core::types::InstructionScope::Repo,
+            Some(&repo),
+            &body.text,
+            Some(&_user.0.name),
+        )
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to save repo instruction");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 /// Browse GGUF models from HuggingFace.

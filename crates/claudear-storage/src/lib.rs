@@ -192,9 +192,21 @@ pub trait AttemptTracker: Send + Sync {
     ///
     /// Default no-op; persistent trackers should set the attempt status to
     /// `answered` so it is not retried or re-polled.
-    fn mark_answered(&self, source: &str, issue_id: &str, summary: &str) -> Result<()> {
-        let _ = (source, issue_id, summary);
+    fn mark_answered(
+        &self,
+        source: &str,
+        issue_id: &str,
+        summary: &str,
+        intent: Option<&str>,
+    ) -> Result<()> {
+        let _ = (source, issue_id, summary, intent);
         Ok(())
+    }
+
+    /// Read the routing intent classified for an attempt, if one was stored.
+    fn get_routing_intent(&self, source: &str, issue_id: &str) -> Result<Option<String>> {
+        let _ = (source, issue_id);
+        Ok(None)
     }
 
     /// Record the Discord message ids of the answer chunks Claudear sent for an
@@ -653,6 +665,51 @@ pub trait ActivityStore: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Get review comments recorded for a PR that have not yet been durably
+    /// handled (their feedback has not been acted upon). Re-surfaced each poll so
+    /// review-comment processing is at-least-once: a crash or downstream failure
+    /// between detecting a comment and acting on it does not drop it.
+    fn get_unhandled_pr_review_comments(
+        &self,
+        _pr_url: &str,
+    ) -> Result<Vec<claudear_core::types::ReviewComment>> {
+        Ok(Vec::new())
+    }
+
+    /// Mark every not-yet-handled review comment on a PR as durably handled.
+    /// Use only when the whole PR is done (merged/closed); to acknowledge a
+    /// processed batch, prefer [`mark_pr_review_comments_handled_by_ids`] so a
+    /// concurrently-recorded comment isn't marked without being processed.
+    fn mark_pr_review_comments_handled(&self, _pr_url: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Mark only the given comments on a PR as durably handled. Called once the
+    /// batch that carried exactly these comments has been successfully acted upon.
+    /// Each comment is `(scm_comment_id, comment_kind)` so a colliding id in the
+    /// other namespace is not acknowledged by mistake.
+    fn mark_pr_review_comments_handled_by_ids(
+        &self,
+        _pr_url: &str,
+        _comments: &[(i64, &str)],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Record a failed attempt to act on the given comments: bumps each one's
+    /// attempt count and gives up (marks the single worst offender handled) once
+    /// it reaches `max_attempts`, so a poison comment does not re-run the fix agent
+    /// forever. Each comment is `(scm_comment_id, comment_kind)` so a colliding id
+    /// in the other namespace is not charged by mistake.
+    fn note_pr_review_comment_failure_by_ids(
+        &self,
+        _pr_url: &str,
+        _comments: &[(i64, &str)],
+        _max_attempts: i64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Get fix attempts for a batch of (source, issue_id) keys.
     fn get_attempts_batch(&self, _keys: &[(&str, &str)]) -> Result<Vec<Option<FixAttempt>>> {
         Ok(Vec::new())
@@ -810,6 +867,32 @@ pub trait KnowledgeStore: Send + Sync {
         _repo: &str,
     ) -> Result<Vec<claudear_core::types::PromotedInstruction>> {
         Ok(Vec::new())
+    }
+
+    /// Upsert the single agent-instruction row for a scope (None repo = global).
+    fn upsert_agent_instruction(
+        &self,
+        _scope: claudear_core::types::InstructionScope,
+        _repo: Option<&str>,
+        _text: &str,
+        _updated_by: Option<&str>,
+    ) -> Result<i64> {
+        Ok(0)
+    }
+
+    /// Get the active agent instruction for a scope, if any.
+    fn get_agent_instruction(
+        &self,
+        _scope: claudear_core::types::InstructionScope,
+        _repo: Option<&str>,
+    ) -> Result<Option<claudear_core::types::AgentInstruction>> {
+        Ok(None)
+    }
+
+    /// Resolve the effective instruction block (global + per-repo). `repo` is
+    /// None when there is no resolved repo; global instructions still apply.
+    fn resolve_agent_instructions(&self, _repo: Option<&str>) -> Result<Option<String>> {
+        Ok(None)
     }
 
     /// System 4: Upsert a repo knowledge entry.
@@ -3384,6 +3467,8 @@ mod tests {
                 last_review_time: None,
                 last_comment_id: None,
                 last_comment_time: None,
+                last_issue_comment_id: None,
+                last_issue_comment_time: None,
                 is_active: true,
             };
             assert!(t.save_pr_review_state(&state).is_ok());

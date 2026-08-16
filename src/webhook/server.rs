@@ -1036,6 +1036,7 @@ async fn process_issue(
         // classification falls back to the heuristic; `None` keeps it on the fix pipeline
         // (behaviour-preserving).
         intent: None,
+        diagnosis: None,
     };
 
     let context_provider = WebhookContext(handler.as_ref());

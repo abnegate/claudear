@@ -40,6 +40,10 @@ use tokio::time::{interval, Duration};
 /// decided routing `Intent` (`None` for non-QA-eligible / QA-disabled sources).
 type QueuedIssue = (Issue, MatchResult, Option<Intent>);
 
+/// How many times a PR review comment may fail processing before it is given up
+/// on (marked handled) instead of re-triggering the fix agent every cycle.
+const MAX_REVIEW_COMMENT_ATTEMPTS: i64 = 5;
+
 /// Extracts the source name from a processing key of the form "source:issue_id".
 fn source_from_processing_key(key: &str) -> &str {
     key.split_once(':').map_or(key, |(source, _)| source)
@@ -253,6 +257,13 @@ pub struct Watcher {
     /// list stays bounded by concurrency rather than by issues-processed-ever.
     spawn_handles: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
+
+/// A ledger comment carried by a review batch: `(scm_comment_id, comment_kind)`.
+type CommentRef = (i64, &'static str);
+
+/// Actionable review feedback grouped for one PR:
+/// `(pr_url, feedback_summary, feedback_count, comment_refs)`.
+type PrReviewFeedback = (String, String, usize, Vec<CommentRef>);
 
 impl Watcher {
     /// Create a new watcher.
@@ -1258,7 +1269,8 @@ impl Watcher {
 
         // Check for new reviews
         let events = review_watcher.check_for_reviews().await?;
-        for (pr_url, feedback_summary, feedback_count) in Self::group_review_feedback_by_pr(events)
+        for (pr_url, feedback_summary, feedback_count, comment_refs) in
+            Self::group_review_feedback_by_pr(events)
         {
             tracing::info!(
                 pr_url = %pr_url,
@@ -1276,24 +1288,60 @@ impl Watcher {
                         status = %attempt.status,
                         "Skipping review feedback for terminal attempt status"
                     );
+                    // The PR is merged/closed/cannot-fix: close out the ledger so
+                    // its comments stop being re-surfaced, then stop watching.
+                    if let Err(e) = self.tracker.mark_pr_review_comments_handled(&pr_url) {
+                        tracing::warn!(pr_url = %pr_url, error = %e, "Failed to close review-comment ledger for terminal PR");
+                    }
                     review_watcher.unwatch_pr(&pr_url);
                     continue;
                 }
-                if let Err(e) = self
+                match self
                     .process_review_action(&attempt, &feedback_summary)
                     .await
                 {
-                    tracing::error!(
-                        pr_url = %pr_url,
-                        error = %e,
-                        "Failed to process review feedback"
-                    );
+                    Ok(()) => {
+                        // Durably handled: acknowledge exactly the comments in this
+                        // batch so they aren't re-surfaced, without touching any
+                        // comment recorded concurrently while we were processing.
+                        if let Err(e) = self
+                            .tracker
+                            .mark_pr_review_comments_handled_by_ids(&pr_url, &comment_refs)
+                        {
+                            tracing::warn!(pr_url = %pr_url, error = %e, "Failed to mark review comments handled");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            pr_url = %pr_url,
+                            error = %e,
+                            "Failed to process review feedback; will retry next cycle"
+                        );
+                        // Leave the batch's comments unhandled so they retry, but
+                        // count the failure so a poison comment eventually gives up.
+                        if let Err(e) = self.tracker.note_pr_review_comment_failure_by_ids(
+                            &pr_url,
+                            &comment_refs,
+                            MAX_REVIEW_COMMENT_ATTEMPTS,
+                        ) {
+                            tracing::warn!(pr_url = %pr_url, error = %e, "Failed to record review-comment failure");
+                        }
+                    }
                 }
             } else {
                 tracing::warn!(
                     pr_url = %pr_url,
                     "Received review for unknown PR, skipping"
                 );
+                // No attempt to act on; count it as a failure so this batch's
+                // uncorrelated comments don't re-surface forever.
+                if let Err(e) = self.tracker.note_pr_review_comment_failure_by_ids(
+                    &pr_url,
+                    &comment_refs,
+                    MAX_REVIEW_COMMENT_ATTEMPTS,
+                ) {
+                    tracing::warn!(pr_url = %pr_url, error = %e, "Failed to record review-comment failure");
+                }
             }
         }
 
@@ -1307,8 +1355,16 @@ impl Watcher {
         )
     }
 
-    fn group_review_feedback_by_pr(events: Vec<ReviewEvent>) -> Vec<(String, String, usize)> {
+    /// Group actionable review events per PR into (pr_url, feedback_summary,
+    /// feedback_count, comment_refs). `comment_refs` are exactly the ledger comments
+    /// carried by the batch as `(scm_comment_id, comment_kind)`, so acknowledgement
+    /// targets those specific rows rather than the whole PR (which would wrongly
+    /// mark a concurrently-recorded comment handled) or a colliding id in the other
+    /// namespace.
+    fn group_review_feedback_by_pr(events: Vec<ReviewEvent>) -> Vec<PrReviewFeedback> {
         let mut feedback_by_pr: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        let mut refs_by_pr: std::collections::HashMap<String, Vec<CommentRef>> =
             std::collections::HashMap::new();
         let mut pr_order: Vec<String> = Vec::new();
 
@@ -1321,6 +1377,10 @@ impl Watcher {
             if !feedback_by_pr.contains_key(&pr_url) {
                 pr_order.push(pr_url.clone());
             }
+            refs_by_pr
+                .entry(pr_url.clone())
+                .or_default()
+                .extend(event.comment_refs());
             feedback_by_pr
                 .entry(pr_url)
                 .or_default()
@@ -1330,9 +1390,10 @@ impl Watcher {
         pr_order
             .into_iter()
             .filter_map(|pr_url| {
+                let refs = refs_by_pr.remove(&pr_url).unwrap_or_default();
                 feedback_by_pr.remove(&pr_url).map(|feedbacks| {
                     let count = feedbacks.len();
-                    (pr_url, feedbacks.join("\n\n---\n\n"), count)
+                    (pr_url, feedbacks.join("\n\n---\n\n"), count, refs)
                 })
             })
             .collect()
@@ -3217,9 +3278,22 @@ Create a PR with your changes.{custom_instructions}"#,
                 .expect("intent_classifier present (checked by qa_split_enabled)");
             let mut intents: Vec<Intent> = Vec::with_capacity(ordered.len());
             for (issue, _) in &ordered {
+                // Ground the classification in the Discord reply thread (if any) so a
+                // follow-up in an ongoing QA conversation ("yes create a pr now") is
+                // classified in context and can escalate out of the read-only lane,
+                // instead of being judged as an isolated, ambiguous message. Only
+                // Claudear's own answers feed routing, so untrusted user text in the
+                // thread cannot inject a fix/PR escalation.
+                let conversation = crate::processing::assemble_reply_chain(
+                    &self.config,
+                    self.tracker.as_ref(),
+                    issue,
+                    crate::processing::TranscriptTrust::ClaudearOnly,
+                )
+                .await;
                 intents.push(
                     classifier
-                        .classify_intent(issue)
+                        .classify_intent(issue, conversation.as_deref())
                         .await
                         .unwrap_or(Intent::Fix),
                 );
@@ -3485,6 +3559,15 @@ Create a PR with your changes.{custom_instructions}"#,
                     return;
                 }
                 self.slot_available.notified().await;
+            }
+
+            // Carry the trusted routing intent (classified upstream on trusted
+            // content) so the answered attempt is stamped with it, letting the
+            // reply-chain transcript emit a structural marker instead of
+            // re-injecting the generated answer body into the classifier.
+            let mut issue = issue;
+            if let Some(intent) = intent {
+                issue.set_metadata("routing_intent", intent.routing_label());
             }
 
             // Spawn processing as a background task so poll_source returns promptly and
@@ -3902,6 +3985,7 @@ Create a PR with your changes.{custom_instructions}"#,
             review_feedback,
             existing_pr_branch,
             intent,
+            diagnosis: None,
         };
 
         let context_provider = crate::processing::SourceContext(source.as_ref());
@@ -4602,6 +4686,7 @@ Create a PR with your changes.{custom_instructions}"#,
             review_feedback: None,
             existing_pr_branch: None,
             intent: None,
+            diagnosis: None,
         };
 
         let context_provider = crate::processing::SourceContext(source.as_ref());
@@ -6359,6 +6444,61 @@ mod tests {
         assert!(grouped[0].1.contains("first"));
         assert!(grouped[0].1.contains("second"));
         assert!(grouped[0].1.contains("---"));
+        // Reviews carry no ledger comment ids.
+        assert!(grouped[0].3.is_empty());
+    }
+
+    #[test]
+    fn test_group_review_feedback_collects_comment_ids() {
+        // CommentsAdded events contribute their comment ids so acknowledgement can
+        // target exactly the batch, not the whole PR.
+        let mk = |id: i64| claudear_integrations::scm::ReviewComment {
+            id,
+            path: String::new(),
+            position: None,
+            original_position: None,
+            body: "@claudear fix".to_string(),
+            user: claudear_integrations::scm::ReviewUser {
+                id: 1,
+                login: "reviewer".to_string(),
+                user_type: None,
+            },
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+            html_url: format!("h{}", id),
+            pull_request_review_id: None,
+            start_line: None,
+            line: None,
+            side: None,
+        };
+        let events = vec![
+            claudear_integrations::scm::ReviewEvent::CommentsAdded {
+                pr_url: "https://github.com/org/repo/pull/1".to_string(),
+                repo: "org/repo".to_string(),
+                pr_number: 1,
+                comments: vec![mk(101), mk(102)],
+            },
+            claudear_integrations::scm::ReviewEvent::CommentsAdded {
+                pr_url: "https://github.com/org/repo/pull/1".to_string(),
+                repo: "org/repo".to_string(),
+                pr_number: 1,
+                comments: vec![mk(103)],
+            },
+        ];
+
+        let grouped = Watcher::group_review_feedback_by_pr(events);
+        assert_eq!(grouped.len(), 1);
+        let mut refs = grouped[0].3.clone();
+        refs.sort();
+        // Empty-path comments are conversation-kind; each ref namespaces its id.
+        assert_eq!(
+            refs,
+            vec![
+                (101, "conversation"),
+                (102, "conversation"),
+                (103, "conversation")
+            ]
+        );
     }
 
     #[tokio::test]

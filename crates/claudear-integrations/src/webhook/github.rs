@@ -1,8 +1,9 @@
 //! GitHub webhook handler for PR review and pull request events.
 //!
 //! This handler processes `pull_request_review`, `pull_request_review_comment`,
-//! and `pull_request` events from GitHub webhooks to trigger review processing
-//! and detect PR merges/closes in real-time instead of relying solely on polling.
+//! `issue_comment` (PR conversation comments), and `pull_request` events from
+//! GitHub webhooks to trigger review processing and detect PR merges/closes in
+//! real-time instead of relying solely on polling.
 
 use crate::scm::{is_skippable_bot, CodeReview, ReviewComment, ReviewUser, ReviewWatcher};
 use claudear_config::config::GitHubConfig;
@@ -170,6 +171,7 @@ impl GitHubWebhookHandler {
         match event_type {
             "pull_request_review" => self.handle_review_submitted(payload).await,
             "pull_request_review_comment" => self.handle_review_comment(payload).await,
+            "issue_comment" => self.handle_issue_comment(payload).await,
             "pull_request" => self.handle_pull_request(payload).await,
             _ => {
                 tracing::debug!(
@@ -373,6 +375,149 @@ impl GitHubWebhookHandler {
             pr_url = %pr_url,
             events = processed_events.len(),
             "Processed review comment webhook through ReviewWatcher"
+        );
+
+        Ok(WebhookAction::Processed)
+    }
+
+    /// Handle an `issue_comment.created` event.
+    ///
+    /// GitHub fires this for comments on the PR *conversation* timeline (a plain
+    /// "@claudear fix this" left outside a formal review or inline thread). Only
+    /// comments on pull requests are relevant, so non-PR issue comments are
+    /// ignored. When the comment mentions the review trigger on a watched PR, we
+    /// re-poll via `check_for_pr`, which now picks up conversation comments.
+    async fn handle_issue_comment(&self, payload: &serde_json::Value) -> Result<WebhookAction> {
+        let action = payload.get("action").and_then(|v| v.as_str()).unwrap_or("");
+
+        if action != "created" {
+            tracing::debug!(
+                source = "github",
+                action = %action,
+                "Ignoring non-created issue comment action"
+            );
+            return Ok(WebhookAction::Ignored);
+        }
+
+        let issue = match payload.get("issue") {
+            Some(i) => i,
+            None => {
+                tracing::warn!(source = "github", "Missing issue in payload");
+                return Ok(WebhookAction::Ignored);
+            }
+        };
+
+        // Only PR conversation comments matter; a plain issue has no `pull_request`.
+        let pr = match issue.get("pull_request") {
+            Some(p) => p,
+            None => {
+                tracing::debug!(
+                    source = "github",
+                    "Issue comment is not on a pull request, ignoring"
+                );
+                return Ok(WebhookAction::Ignored);
+            }
+        };
+
+        let pr_url = pr
+            .get("html_url")
+            .and_then(|v| v.as_str())
+            .or_else(|| issue.get("html_url").and_then(|v| v.as_str()))
+            .unwrap_or_default();
+
+        let comment = match payload.get("comment") {
+            Some(c) => c,
+            None => {
+                tracing::warn!(source = "github", "Missing comment in payload");
+                return Ok(WebhookAction::Ignored);
+            }
+        };
+
+        let review_watcher = match &self.review_watcher {
+            Some(rw) => rw,
+            None => {
+                tracing::debug!(
+                    source = "github",
+                    pr_url = %pr_url,
+                    "ReviewWatcher not available, ignoring event"
+                );
+                return Ok(WebhookAction::Ignored);
+            }
+        };
+
+        // Only act on PRs we're actively watching.
+        let state = match review_watcher.get_state(pr_url) {
+            Some(s) if s.is_active => s,
+            _ => {
+                tracing::debug!(
+                    source = "github",
+                    pr_url = %pr_url,
+                    "PR not being watched, ignoring issue comment"
+                );
+                return Ok(WebhookAction::Ignored);
+            }
+        };
+
+        // Skip bot comments (unless the bot is in the allowed list).
+        let user = ReviewUser {
+            id: comment
+                .get("user")
+                .and_then(|u| u.get("id"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or_default(),
+            login: comment
+                .get("user")
+                .and_then(|u| u.get("login"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            user_type: comment
+                .get("user")
+                .and_then(|u| u.get("type"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+        };
+        if is_skippable_bot(&user, &self.config.allowed_bots) {
+            tracing::debug!(
+                source = "github",
+                pr_url = %pr_url,
+                author = %user.login,
+                "Skipping bot issue comment"
+            );
+            return Ok(WebhookAction::Ignored);
+        }
+
+        // Require the review trigger so unrelated PR chatter doesn't spin up a
+        // re-poll. The polling path applies the same filter, so this only avoids
+        // needless work; correctness does not depend on it.
+        let trigger = self.config.review_trigger.to_lowercase();
+        let body = comment
+            .get("body")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if !trigger.is_empty() && !body.to_lowercase().contains(&trigger) {
+            tracing::debug!(
+                source = "github",
+                pr_url = %pr_url,
+                "Issue comment does not mention review trigger, ignoring"
+            );
+            return Ok(WebhookAction::Ignored);
+        }
+
+        tracing::info!(
+            source = "github",
+            pr_url = %pr_url,
+            author = %user.login,
+            issue_id = %state.issue_id,
+            "Received PR conversation comment via webhook"
+        );
+
+        let processed_events = review_watcher.check_for_pr(pr_url).await?;
+        tracing::info!(
+            source = "github",
+            pr_url = %pr_url,
+            events = processed_events.len(),
+            "Processed issue comment webhook through ReviewWatcher"
         );
 
         Ok(WebhookAction::Processed)
@@ -1103,6 +1248,88 @@ mod tests {
         assert!(
             !result.unwrap().is_processed(),
             "Comment on unwatched PR should return Ok(false)"
+        );
+    }
+
+    /// Helper: an `issue_comment.created` payload on a pull request.
+    fn issue_comment_payload(pr_url: &str, body: &str, is_pr: bool) -> serde_json::Value {
+        let mut issue = serde_json::json!({
+            "number": 1,
+            "html_url": pr_url
+        });
+        if is_pr {
+            issue["pull_request"] = serde_json::json!({ "html_url": pr_url });
+        }
+        serde_json::json!({
+            "action": "created",
+            "comment": {
+                "id": 300,
+                "user": { "id": 3, "login": "reviewer", "type": "User" },
+                "body": body,
+                "created_at": "2024-01-15T12:00:00Z",
+                "updated_at": "2024-01-15T12:00:00Z",
+                "html_url": "https://github.com/owner/repo/pull/1#issuecomment-300"
+            },
+            "issue": issue
+        })
+    }
+
+    #[tokio::test]
+    async fn test_issue_comment_on_watched_pr_with_trigger_is_processed() {
+        let pr_url = "https://github.com/owner/repo/pull/1";
+        let handler = make_handler_watching_pr(pr_url, Arc::new(MockScmProvider::new()));
+
+        let payload_value =
+            issue_comment_payload(pr_url, "@claudear please fix the shutdown race", true);
+        let payload_bytes = serde_json::to_vec(&payload_value).unwrap();
+        let sig = make_valid_signature("test_secret", &payload_bytes);
+        let headers = make_headers("issue_comment", &sig);
+
+        let result = handler
+            .process_webhook(&payload_bytes, &payload_value, &headers)
+            .await;
+        assert!(
+            result.unwrap().is_processed(),
+            "Triggered PR conversation comment should be processed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_issue_comment_without_trigger_is_ignored() {
+        let pr_url = "https://github.com/owner/repo/pull/1";
+        let handler = make_handler_watching_pr(pr_url, Arc::new(MockScmProvider::new()));
+
+        let payload_value = issue_comment_payload(pr_url, "LGTM, nice", true);
+        let payload_bytes = serde_json::to_vec(&payload_value).unwrap();
+        let sig = make_valid_signature("test_secret", &payload_bytes);
+        let headers = make_headers("issue_comment", &sig);
+
+        let result = handler
+            .process_webhook(&payload_bytes, &payload_value, &headers)
+            .await;
+        assert!(
+            !result.unwrap().is_processed(),
+            "Untriggered PR conversation comment should be ignored"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_issue_comment_on_plain_issue_is_ignored() {
+        let pr_url = "https://github.com/owner/repo/pull/1";
+        let handler = make_handler_watching_pr(pr_url, Arc::new(MockScmProvider::new()));
+
+        // No `pull_request` field => a regular issue, not a PR.
+        let payload_value = issue_comment_payload(pr_url, "@claudear fix this", false);
+        let payload_bytes = serde_json::to_vec(&payload_value).unwrap();
+        let sig = make_valid_signature("test_secret", &payload_bytes);
+        let headers = make_headers("issue_comment", &sig);
+
+        let result = handler
+            .process_webhook(&payload_bytes, &payload_value, &headers)
+            .await;
+        assert!(
+            !result.unwrap().is_processed(),
+            "Comment on a non-PR issue should be ignored"
         );
     }
 

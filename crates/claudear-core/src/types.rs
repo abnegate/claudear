@@ -1923,6 +1923,50 @@ pub struct PromotedInstruction {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Scope of an operator-authored agent instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstructionScope {
+    /// Applies to every repo.
+    Global,
+    /// Applies to a single repo (keyed by `org/name`).
+    Repo,
+}
+
+impl std::fmt::Display for InstructionScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Global => write!(f, "global"),
+            Self::Repo => write!(f, "repo"),
+        }
+    }
+}
+
+impl std::str::FromStr for InstructionScope {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "global" => Ok(Self::Global),
+            "repo" => Ok(Self::Repo),
+            _ => Err(format!("Unknown instruction scope: {}", s)),
+        }
+    }
+}
+
+/// Operator-authored instruction injected into the agent's context on every run.
+/// Scoped either globally or to a single repo; see `InstructionScope`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentInstruction {
+    pub id: i64,
+    pub scope: InstructionScope,
+    /// Some(`org/name`) when scope is `Repo`; None for global.
+    pub repo: Option<String>,
+    pub instruction_text: String,
+    pub is_active: bool,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Per-repo accumulated knowledge entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoKnowledge {
@@ -2971,6 +3015,11 @@ pub struct PrReviewState {
     pub last_review_time: Option<String>,
     pub last_comment_id: Option<i64>,
     pub last_comment_time: Option<String>,
+    /// Cursor for PR *conversation* comments (the `issues/{n}/comments` timeline),
+    /// tracked separately from inline review comments because the two live in
+    /// distinct GitHub comment id spaces and are fetched from different endpoints.
+    pub last_issue_comment_id: Option<i64>,
+    pub last_issue_comment_time: Option<String>,
     pub is_active: bool,
 }
 
@@ -2992,6 +3041,8 @@ impl PrReviewState {
             last_review_time: None,
             last_comment_id: None,
             last_comment_time: None,
+            last_issue_comment_id: None,
+            last_issue_comment_time: None,
             is_active: true,
         }
     }
@@ -3232,6 +3283,18 @@ pub enum TimelineEventStatus {
     #[serde(rename = "verify_completed")]
     VerifyCompleted,
 
+    /// Red-green: the failing-test (red) phase began.
+    #[serde(rename = "red_green_started")]
+    RedGreenStarted,
+
+    /// Red-green: the authored test failed on the unfixed code (red confirmed).
+    #[serde(rename = "red_confirmed")]
+    RedConfirmed,
+
+    /// Red-green: the authored test passed after the fix (green confirmed).
+    #[serde(rename = "green_confirmed")]
+    GreenConfirmed,
+
     #[serde(rename = "reply_started")]
     ReplyStarted,
 
@@ -3292,6 +3355,9 @@ impl TimelineEventStatus {
             Self::FixStarted => "fix_started",
             Self::VerifyStarted => "verify_started",
             Self::VerifyCompleted => "verify_completed",
+            Self::RedGreenStarted => "red_green_started",
+            Self::RedConfirmed => "red_confirmed",
+            Self::GreenConfirmed => "green_confirmed",
             Self::ReplyStarted => "reply_started",
             Self::ReplySent => "reply_sent",
             Self::FixSucceeded => "fix_succeeded",

@@ -143,6 +143,38 @@ api_url = ""
 # Sandbox mode (e.g., "network-off" for Codex)
 sandbox = ""
 
+# MCP servers attached to agent runs, keyed by server name.
+# Gated per-run by `sources` against the issue source. Default here: HelpScout only.
+# Add "discord" to enable there; set sources = [] to enable for all sources.
+# Keep secrets out of this file: reference them via ${VAR} from the daemon/provider env.
+# [agent.providers.claude.mcp.appwrite]
+# command = "uvx"
+# args    = ["mcp-server-appwrite", "--databases", "--users", "--functions"]
+# sources = ["helpscout"]
+# tools: tool names to allow (empty/omitted grants all of the server's tools).
+# tools   = ["databases_list_documents", "databases_get_document"]
+# [agent.providers.claude.mcp.appwrite.env]
+# APPWRITE_ENDPOINT   = "https://fra.cloud.appwrite.io/v1"
+# APPWRITE_PROJECT_ID = "monitoring-fra"
+# APPWRITE_API_KEY    = "${APPWRITE_API_KEY}"   # read-only key, set in daemon env
+
+# Grafana (mcp-grafana) — query dashboards, datasources, and metrics so the
+# agent can pull live telemetry when triaging an issue.
+# [agent.providers.claude.mcp.grafana]
+# command = "uvx"
+# args    = ["mcp-grafana"]
+# sources = ["sentry"]
+# tools: tool names to allow (empty/omitted grants all of the server's tools).
+# tools   = ["search_dashboards", "query_prometheus", "list_datasources"]
+# [agent.providers.claude.mcp.grafana.env]
+# GRAFANA_URL                   = "https://telemetry.example.com/"
+# Env values are written to .mcp.json verbatim, so you can inline literals here
+# or reference ${VAR} from the daemon env (Claude Code expands ${VAR}).
+# GRAFANA_SERVICE_ACCOUNT_TOKEN = "glsa_xxxxxxxxxxxx"   # or "${GRAFANA_SERVICE_ACCOUNT_TOKEN}"
+# When Grafana sits behind Cloudflare Access, pass the service-token headers as a
+# JSON string (inline literals or ${VAR} both work).
+# GRAFANA_EXTRA_HEADERS         = "{\"CF-Access-Client-Id\": \"your-cf-access-client-id\", \"CF-Access-Client-Secret\": \"your-cf-access-client-secret\"}"
+
 # A/B Experiments (optional)
 # Test different providers or configurations against each other.
 #

@@ -113,6 +113,39 @@ pub trait ScmProvider: Send + Sync {
         }
     }
 
+    /// Get a PR/MR's *conversation* comments (non-inline), e.g. GitHub's
+    /// `issues/{n}/comments` timeline. These are plain comments left on the PR
+    /// outside a formal review. Default: none, since not every provider exposes a
+    /// separate conversation timeline.
+    async fn get_pr_conversation_comments(
+        &self,
+        _project: &str,
+        _number: i64,
+    ) -> Result<Vec<ReviewComment>> {
+        Ok(Vec::new())
+    }
+
+    /// Get conversation comments updated at or after `since` (RFC 3339 timestamp).
+    ///
+    /// Default implementation fetches all conversation comments and filters by
+    /// timestamp, mirroring [`get_new_review_comments`](Self::get_new_review_comments).
+    async fn get_new_conversation_comments(
+        &self,
+        project: &str,
+        number: i64,
+        since: Option<&str>,
+    ) -> Result<Vec<ReviewComment>> {
+        let comments = self.get_pr_conversation_comments(project, number).await?;
+        if let Some(since_time) = since {
+            Ok(comments
+                .into_iter()
+                .filter(|c| timestamp_at_or_after(&c.updated_at, since_time))
+                .collect())
+        } else {
+            Ok(comments)
+        }
+    }
+
     /// List repositories for an organization / group.
     async fn list_repos(&self, org_or_group: &str) -> Result<Vec<RemoteRepo>>;
 
@@ -360,6 +393,34 @@ impl ReviewEvent {
         }
     }
 
+    /// The ledger comment references carried by this event as
+    /// `(scm_comment_id, comment_kind)`: standalone/conversation comments for
+    /// `CommentsAdded`, inline comments for `ReviewSubmitted`. The kind namespaces
+    /// the id so acknowledgement targets exactly the right ledger row even when an
+    /// inline and a conversation comment share a numeric id. Used to acknowledge
+    /// exactly the comments in a processed batch, so a comment recorded
+    /// concurrently (e.g. a webhook `check_for_pr`) isn't marked handled without
+    /// being processed. A formal review has no ledger row and contributes none.
+    pub fn comment_refs(&self) -> Vec<(i64, &'static str)> {
+        // Conversation comments carry no file path; inline comments always do —
+        // the same discriminator the storage layer uses when recording.
+        let kind = |c: &ReviewComment| {
+            if c.path.is_empty() {
+                "conversation"
+            } else {
+                "inline"
+            }
+        };
+        match self {
+            ReviewEvent::ReviewSubmitted {
+                inline_comments, ..
+            } => inline_comments.iter().map(|c| (c.id, kind(c))).collect(),
+            ReviewEvent::CommentsAdded { comments, .. } => {
+                comments.iter().map(|c| (c.id, kind(c))).collect()
+            }
+        }
+    }
+
     /// Check if this event requires agent action.
     pub fn requires_action(&self) -> bool {
         match self {
@@ -407,12 +468,19 @@ impl ReviewEvent {
             ReviewEvent::CommentsAdded { comments, .. } => {
                 let mut summary = String::new();
                 for comment in comments {
-                    summary.push_str(&format!(
-                        "Comment from @{} on `{}`",
-                        comment.user.login, comment.path
-                    ));
-                    if let Some(line) = comment.line {
-                        summary.push_str(&format!(" (line {})", line));
+                    // Inline comments carry a file path (and often a line); PR
+                    // conversation comments have neither, so omit the "on `path`"
+                    // clause for them rather than printing an empty backtick pair.
+                    if comment.path.is_empty() {
+                        summary.push_str(&format!("Comment from @{}", comment.user.login));
+                    } else {
+                        summary.push_str(&format!(
+                            "Comment from @{} on `{}`",
+                            comment.user.login, comment.path
+                        ));
+                        if let Some(line) = comment.line {
+                            summary.push_str(&format!(" (line {})", line));
+                        }
                     }
                     summary.push_str(&format!(":\n{}\n\n", comment.body));
                 }
@@ -1151,8 +1219,12 @@ impl ReviewWatcher {
             .cloned()
             .collect();
 
+        // Record new comments to the durable ledger. Track whether every write
+        // succeeded: if any failed, the inline cursor is held back below so the
+        // affected comment is re-fetched next poll rather than lost (a comment that
+        // is neither recorded nor re-fetchable would be dropped).
+        let mut inline_records_ok = true;
         if !attached_comment_ids.is_empty() || !standalone_comments.is_empty() {
-            // Record all new comments to database
             if let Some(ref tracker) = self.tracker {
                 for event in &events {
                     if let ReviewEvent::ReviewSubmitted {
@@ -1162,12 +1234,13 @@ impl ReviewWatcher {
                         for comment in inline_comments {
                             if let Err(e) = tracker.record_pr_review_comment(&state.pr_url, comment)
                             {
+                                inline_records_ok = false;
                                 tracing::warn!(
                                     component = "review_watcher",
                                     pr_url = %state.pr_url,
                                     comment_id = comment.id,
                                     error = %e,
-                                    "Failed to record PR review comment"
+                                    "Failed to record PR review comment; holding cursor"
                                 );
                             }
                         }
@@ -1175,19 +1248,22 @@ impl ReviewWatcher {
                 }
                 for comment in &standalone_comments {
                     if let Err(e) = tracker.record_pr_review_comment(&state.pr_url, comment) {
+                        inline_records_ok = false;
                         tracing::warn!(
                             component = "review_watcher",
                             pr_url = %state.pr_url,
                             comment_id = comment.id,
                             error = %e,
-                            "Failed to record PR review comment"
+                            "Failed to record PR review comment; holding cursor"
                         );
                     }
                 }
             }
         }
 
-        if !cursor_comments.is_empty() {
+        // Advance the inline-comment cursor only once every comment is durably
+        // recorded; the ledger, not the cursor, guarantees no comment is lost.
+        if inline_records_ok && !cursor_comments.is_empty() {
             // Update state cursor using all processed comments (including non-trigger comments)
             // to prevent repeatedly scanning unchanged comments every poll cycle.
             let mut latest_comment_id = state.last_comment_id;
@@ -1233,12 +1309,182 @@ impl ReviewWatcher {
             }
         }
 
-        if !standalone_comments.is_empty() {
+        // PR conversation comments (the issues-comments timeline). A reviewer who
+        // leaves a plain "@claudear fix this" on the PR conversation — rather than
+        // an inline review-thread comment or a formal review — lands here. These
+        // use a distinct GitHub comment id space and endpoint, so they carry their
+        // own cursor (`last_issue_comment_*`).
+        let new_conversation_comments: Vec<ReviewComment> = match self
+            .provider
+            .get_new_conversation_comments(
+                &state.repo,
+                state.pr_number,
+                state.last_issue_comment_time.as_deref(),
+            )
+            .await
+        {
+            Ok(comments) => comments
+                .into_iter()
+                .filter(|c| !is_skippable_bot(&c.user, allowed_bots))
+                .filter(|c| {
+                    Self::comment_is_after_cursor(
+                        c,
+                        state.last_issue_comment_time.as_deref(),
+                        state.last_issue_comment_id,
+                    )
+                })
+                .collect(),
+            Err(e) => {
+                // A transient failure here must not drop the review/comment events
+                // already collected this cycle.
+                tracing::warn!(
+                    component = "review_watcher",
+                    pr_url = %state.pr_url,
+                    error = %e,
+                    "Failed to fetch PR conversation comments; continuing without them"
+                );
+                Vec::new()
+            }
+        };
+
+        // Only trigger-matched conversation comments are actionable feedback.
+        let conversation_feedback: Vec<ReviewComment> = new_conversation_comments
+            .iter()
+            .filter(|c| {
+                trigger.is_empty() || c.body.to_lowercase().contains(&trigger.to_lowercase())
+            })
+            .cloned()
+            .collect();
+
+        // Record actionable comments into the durable ledger BEFORE advancing the
+        // cursor. The ledger is the recovery authority: if the cursor moved past a
+        // comment the ledger never captured, that comment would be neither
+        // re-fetched (cursor advanced) nor re-surfaced (no ledger row) — a
+        // permanent drop. If any record fails, hold the cursor back so the comment
+        // is re-fetched next poll rather than lost.
+        let mut all_recorded = true;
+        if !conversation_feedback.is_empty() {
+            if let Some(ref tracker) = self.tracker {
+                for comment in &conversation_feedback {
+                    if let Err(e) = tracker.record_pr_review_comment(&state.pr_url, comment) {
+                        all_recorded = false;
+                        tracing::warn!(
+                            component = "review_watcher",
+                            pr_url = %state.pr_url,
+                            comment_id = comment.id,
+                            error = %e,
+                            "Failed to record PR conversation comment; holding issue cursor"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Advance the issue-comment cursor over all fetched comments (including
+        // non-trigger ones, so unchanged comments aren't rescanned), but only once
+        // every actionable comment is durably recorded. The cursor is a scan-window
+        // optimization; the ledger, not the cursor, guarantees no comment is lost.
+        if all_recorded && !new_conversation_comments.is_empty() {
+            let mut latest_id = state.last_issue_comment_id;
+            let mut latest_time = state.last_issue_comment_time.clone();
+            for comment in &new_conversation_comments {
+                let replace = latest_time
+                    .as_deref()
+                    .map(|existing_time| {
+                        let cmp = compare_timestamps(&comment.updated_at, existing_time);
+                        cmp == std::cmp::Ordering::Greater
+                            || (cmp == std::cmp::Ordering::Equal
+                                && comment.id > latest_id.unwrap_or(i64::MIN))
+                    })
+                    .unwrap_or(true);
+                if replace {
+                    latest_id = Some(comment.id);
+                    latest_time = Some(comment.updated_at.clone());
+                }
+            }
+
+            let mut states = self.states.write().unwrap_or_else(|poisoned| {
+                tracing::warn!(component = "review_watcher", "RwLock poisoned, recovering");
+                poisoned.into_inner()
+            });
+            if let Some(s) = states.get_mut(&state.pr_url) {
+                s.last_issue_comment_id = latest_id;
+                if let Some(t) = latest_time {
+                    s.last_issue_comment_time = Some(t);
+                }
+                if let Some(ref tracker) = self.tracker {
+                    if let Err(e) = tracker.save_pr_review_state(s) {
+                        tracing::warn!(
+                            component = "review_watcher",
+                            pr_url = %s.pr_url,
+                            error = %e,
+                            "Failed to persist PR review state update"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Emit inline standalone comments and conversation comments together so the
+        // downstream fix loop sees a single feedback batch per PR per cycle.
+        let mut added_comments = standalone_comments;
+        added_comments.extend(conversation_feedback);
+
+        // Re-surface any recorded comments not yet durably handled so a crash or
+        // downstream failure between detecting a comment and acting on it doesn't
+        // drop it. The pr_review_comments ledger, not the polling cursor, is the
+        // authority for outstanding work; the cursor is only a fetch-window
+        // optimization. Newly detected comments were already recorded above, so
+        // they come back through this query too — dedup against what we're already
+        // emitting this cycle (the batch plus inline comments on review events).
+        if let Some(ref tracker) = self.tracker {
+            // Dedup keyed on (id, kind): an inline and a conversation comment can
+            // share a numeric id, so an id-only key would collapse them and drop
+            // whichever is seen second. Conversation comments carry no path.
+            let key = |c: &ReviewComment| {
+                let kind = if c.path.is_empty() {
+                    "conversation"
+                } else {
+                    "inline"
+                };
+                (c.id, kind)
+            };
+            let mut seen: std::collections::HashSet<(i64, &'static str)> =
+                added_comments.iter().map(&key).collect();
+            for event in &events {
+                if let ReviewEvent::ReviewSubmitted {
+                    inline_comments, ..
+                } = event
+                {
+                    seen.extend(inline_comments.iter().map(&key));
+                }
+            }
+            match tracker.get_unhandled_pr_review_comments(&state.pr_url) {
+                Ok(pending) => {
+                    for comment in pending {
+                        if seen.insert(key(&comment)) {
+                            added_comments.push(comment);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        component = "review_watcher",
+                        pr_url = %state.pr_url,
+                        error = %e,
+                        "Failed to load unhandled PR review comments; \
+                         relying on freshly detected ones this cycle"
+                    );
+                }
+            }
+        }
+
+        if !added_comments.is_empty() {
             events.push(ReviewEvent::CommentsAdded {
                 pr_url: state.pr_url.clone(),
                 repo: state.repo.clone(),
                 pr_number: state.pr_number,
-                comments: standalone_comments,
+                comments: added_comments,
             });
         }
 
@@ -1688,6 +1934,8 @@ mod tests {
             last_review_time: Some("2024-03-15T10:30:00Z".to_string()),
             last_comment_id: Some(888),
             last_comment_time: Some("2024-03-15T11:00:00Z".to_string()),
+            last_issue_comment_id: Some(777),
+            last_issue_comment_time: Some("2024-03-15T11:30:00Z".to_string()),
             is_active: true,
         };
         let json = serde_json::to_string(&state).expect("serialize");
@@ -2793,6 +3041,7 @@ mod tests {
             allowed_bots: Vec<String>,
             reviews: Arc<Mutex<Vec<CodeReview>>>,
             comments: Arc<Mutex<Vec<ReviewComment>>>,
+            conversation: Arc<Mutex<Vec<ReviewComment>>>,
             /// When true, get_review_comments returns an error.
             comments_error: Arc<Mutex<bool>>,
         }
@@ -2806,6 +3055,7 @@ mod tests {
                     allowed_bots: Vec::new(),
                     reviews: Arc::new(Mutex::new(Vec::new())),
                     comments: Arc::new(Mutex::new(Vec::new())),
+                    conversation: Arc::new(Mutex::new(Vec::new())),
                     comments_error: Arc::new(Mutex::new(false)),
                 }
             }
@@ -2825,6 +3075,10 @@ mod tests {
 
             fn set_comments_error(&self, should_error: bool) {
                 *self.comments_error.lock().unwrap() = should_error;
+            }
+
+            fn set_conversation_comments(&self, comments: Vec<ReviewComment>) {
+                *self.conversation.lock().unwrap() = comments;
             }
         }
 
@@ -2881,8 +3135,40 @@ mod tests {
                 Ok(self.comments.lock().unwrap().clone())
             }
 
+            async fn get_pr_conversation_comments(
+                &self,
+                _project: &str,
+                _number: i64,
+            ) -> Result<Vec<ReviewComment>> {
+                Ok(self.conversation.lock().unwrap().clone())
+            }
+
             async fn list_repos(&self, _org_or_group: &str) -> Result<Vec<RemoteRepo>> {
                 Ok(vec![])
+            }
+        }
+
+        /// A PR conversation (issue-timeline) comment: no file path, no line,
+        /// no parent review id — the shape produced by `get_pr_issue_comments`.
+        fn make_conversation_comment(id: i64, body: &str, updated_at: &str) -> ReviewComment {
+            ReviewComment {
+                id,
+                path: String::new(),
+                position: None,
+                original_position: None,
+                body: body.to_string(),
+                user: ReviewUser {
+                    id: id + 3000,
+                    login: "reviewer".to_string(),
+                    user_type: Some("User".to_string()),
+                },
+                created_at: updated_at.to_string(),
+                updated_at: updated_at.to_string(),
+                html_url: format!("https://github.com/org/repo/pull/1#issuecomment-{}", id),
+                pull_request_review_id: None,
+                line: None,
+                start_line: None,
+                side: None,
             }
         }
 
@@ -3311,6 +3597,98 @@ mod tests {
                 .filter(|e| matches!(e, ReviewEvent::CommentsAdded { .. }))
                 .collect();
             assert!(comments_events.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_conversation_comment_with_trigger_is_actionable() {
+            // A plain "@claudear ..." left on the PR conversation timeline (not an
+            // inline review comment) must surface as actionable review feedback.
+            let mock = MockScmProvider::new("github", true, "@claudear");
+            mock.set_conversation_comments(vec![make_conversation_comment(
+                501,
+                "@claudear this shutdown path misses a task, please fix it",
+                "2025-01-02T00:00:00Z",
+            )]);
+            let provider: Arc<dyn ScmProvider> = Arc::new(mock);
+            let watcher = ReviewWatcher::new(provider);
+            watcher.watch_pr(make_state(
+                "https://github.com/org/repo/pull/1",
+                "org/repo",
+                1,
+            ));
+
+            let events = watcher.check_for_reviews().await.unwrap();
+            let comment_events: Vec<_> = events
+                .iter()
+                .filter(|e| matches!(e, ReviewEvent::CommentsAdded { .. }))
+                .collect();
+            assert_eq!(comment_events.len(), 1, "conversation comment not surfaced");
+            match comment_events[0] {
+                ReviewEvent::CommentsAdded { comments, .. } => {
+                    assert_eq!(comments.len(), 1);
+                    assert_eq!(comments[0].id, 501);
+                    assert!(comments[0].path.is_empty());
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_conversation_comment_without_trigger_is_ignored() {
+            let mock = MockScmProvider::new("github", true, "@claudear");
+            mock.set_conversation_comments(vec![make_conversation_comment(
+                502,
+                "nice work, LGTM",
+                "2025-01-02T00:00:00Z",
+            )]);
+            let provider: Arc<dyn ScmProvider> = Arc::new(mock);
+            let watcher = ReviewWatcher::new(provider);
+            watcher.watch_pr(make_state(
+                "https://github.com/org/repo/pull/1",
+                "org/repo",
+                1,
+            ));
+
+            let events = watcher.check_for_reviews().await.unwrap();
+            assert!(events
+                .iter()
+                .all(|e| !matches!(e, ReviewEvent::CommentsAdded { .. })));
+        }
+
+        #[tokio::test]
+        async fn test_conversation_comment_cursor_prevents_reprocessing() {
+            // The issue-comment cursor must advance so the same conversation
+            // comment is not re-emitted on the next poll cycle.
+            let mock = MockScmProvider::new("github", true, "@claudear");
+            mock.set_conversation_comments(vec![make_conversation_comment(
+                503,
+                "@claudear please address this",
+                "2025-01-02T00:00:00Z",
+            )]);
+            let provider: Arc<dyn ScmProvider> = Arc::new(mock);
+            let watcher = ReviewWatcher::new(provider);
+            watcher.watch_pr(make_state(
+                "https://github.com/org/repo/pull/1",
+                "org/repo",
+                1,
+            ));
+
+            let first = watcher.check_for_reviews().await.unwrap();
+            assert_eq!(
+                first
+                    .iter()
+                    .filter(|e| matches!(e, ReviewEvent::CommentsAdded { .. }))
+                    .count(),
+                1
+            );
+
+            let second = watcher.check_for_reviews().await.unwrap();
+            assert!(
+                second
+                    .iter()
+                    .all(|e| !matches!(e, ReviewEvent::CommentsAdded { .. })),
+                "conversation comment re-emitted after cursor should have advanced"
+            );
         }
 
         #[tokio::test]
@@ -5346,6 +5724,7 @@ mod tests {
 
     #[cfg(feature = "sqlite")]
     mod sqlite_persistence_tests {
+        use crate::scm::ReviewEvent;
         use crate::scm::{
             CodeReview, PrInfo, PrReviewState, PrStatus, RemoteRepo, ReviewComment, ReviewUser,
             ReviewWatcher, ScmProvider,
@@ -5434,6 +5813,9 @@ mod tests {
         struct MockTrackerWithRecording {
             review_calls: Arc<Mutex<Vec<String>>>,
             activity_calls: Arc<Mutex<Vec<String>>>,
+            unhandled: Arc<Mutex<Vec<ReviewComment>>>,
+            handled_calls: Arc<Mutex<Vec<String>>>,
+            fail_record: Arc<Mutex<bool>>,
         }
 
         impl MockTrackerWithRecording {
@@ -5441,7 +5823,18 @@ mod tests {
                 Self {
                     review_calls: Arc::new(Mutex::new(Vec::new())),
                     activity_calls: Arc::new(Mutex::new(Vec::new())),
+                    unhandled: Arc::new(Mutex::new(Vec::new())),
+                    handled_calls: Arc::new(Mutex::new(Vec::new())),
+                    fail_record: Arc::new(Mutex::new(false)),
                 }
+            }
+
+            fn set_unhandled(&self, comments: Vec<ReviewComment>) {
+                *self.unhandled.lock().unwrap() = comments;
+            }
+
+            fn set_fail_record(&self, fail: bool) {
+                *self.fail_record.lock().unwrap() = fail;
             }
         }
 
@@ -5545,6 +5938,28 @@ mod tests {
                     .push(entry.activity_type.clone());
                 Ok(1)
             }
+            fn record_pr_review_comment(
+                &self,
+                _pr_url: &str,
+                _comment: &ReviewComment,
+            ) -> Result<i64> {
+                if *self.fail_record.lock().unwrap() {
+                    return Err(claudear_core::error::Error::Other(
+                        "simulated record failure".to_string(),
+                    ));
+                }
+                Ok(1)
+            }
+            fn get_unhandled_pr_review_comments(
+                &self,
+                _pr_url: &str,
+            ) -> Result<Vec<ReviewComment>> {
+                Ok(self.unhandled.lock().unwrap().clone())
+            }
+            fn mark_pr_review_comments_handled(&self, pr_url: &str) -> Result<()> {
+                self.handled_calls.lock().unwrap().push(pr_url.to_string());
+                Ok(())
+            }
         }
 
         impl KnowledgeStore for MockTrackerWithRecording {}
@@ -5640,6 +6055,128 @@ mod tests {
             let activity_calls = tracker.activity_calls.lock().unwrap();
             assert_eq!(activity_calls.len(), 1);
             assert_eq!(activity_calls[0], "pr_review_received");
+        }
+
+        #[tokio::test]
+        async fn test_failed_comment_record_holds_cursor() {
+            // If recording a standalone comment fails, the inline cursor must NOT
+            // advance past it — otherwise it is neither in the ledger nor re-fetched,
+            // and its feedback is lost.
+            let mock = MockScmProvider::new("github", true, "@claudear");
+            mock.set_comments(vec![make_comment(
+                55,
+                "@claudear please fix",
+                "2025-01-02T00:00:00Z",
+                None,
+            )]);
+            let provider: Arc<dyn ScmProvider> = Arc::new(mock);
+            let tracker = Arc::new(MockTrackerWithRecording::new());
+            tracker.set_fail_record(true);
+            let watcher = ReviewWatcher::with_tracker(provider, tracker.clone());
+            let pr_url = "https://github.com/org/repo/pull/1";
+            watcher.watch_pr(make_state(pr_url, "org/repo", 1));
+
+            let _ = watcher.check_for_reviews().await.unwrap();
+
+            // Cursor held at its initial (unset) value so the comment is re-fetched.
+            let state = watcher.get_state(pr_url).unwrap();
+            assert_eq!(
+                state.last_comment_id, None,
+                "cursor advanced past a comment that failed to record"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_unhandled_comments_are_resurfaced() {
+            // No new reviews/comments from GitHub this cycle, but the ledger still
+            // holds an unhandled comment (e.g. a prior cycle detected it but the
+            // fix run failed). It must be re-emitted so processing is at-least-once.
+            let provider: Arc<dyn ScmProvider> =
+                Arc::new(MockScmProvider::new("github", true, "@claudear"));
+            let tracker = Arc::new(MockTrackerWithRecording::new());
+            tracker.set_unhandled(vec![ReviewComment {
+                id: 4242,
+                path: String::new(),
+                position: None,
+                original_position: None,
+                body: "@claudear please address the shutdown race".to_string(),
+                user: ReviewUser {
+                    id: 0,
+                    login: "reviewer".to_string(),
+                    user_type: None,
+                },
+                created_at: "2025-01-01T00:00:00Z".to_string(),
+                updated_at: "2025-01-01T00:00:00Z".to_string(),
+                html_url: "https://github.com/org/repo/pull/1#issuecomment-4242".to_string(),
+                pull_request_review_id: None,
+                start_line: None,
+                line: None,
+                side: None,
+            }]);
+            let watcher = ReviewWatcher::with_tracker(provider, tracker.clone());
+            watcher.watch_pr(make_state(
+                "https://github.com/org/repo/pull/1",
+                "org/repo",
+                1,
+            ));
+
+            let events = watcher.check_for_reviews().await.unwrap();
+            let comment_events: Vec<_> = events
+                .iter()
+                .filter_map(|e| match e {
+                    ReviewEvent::CommentsAdded { comments, .. } => Some(comments),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(comment_events.len(), 1, "unhandled comment not re-surfaced");
+            assert_eq!(comment_events[0].len(), 1);
+            assert_eq!(comment_events[0][0].id, 4242);
+        }
+
+        #[tokio::test]
+        async fn test_resurface_keeps_colliding_ids_distinct() {
+            // An inline (non-empty path) and a conversation (empty path) comment
+            // share id 7. The re-surface dedup keys on (id, kind), so both must be
+            // emitted rather than collapsed to one.
+            let base = |path: &str| ReviewComment {
+                id: 7,
+                path: path.to_string(),
+                position: None,
+                original_position: None,
+                body: "@claudear fix".to_string(),
+                user: ReviewUser {
+                    id: 0,
+                    login: "reviewer".to_string(),
+                    user_type: None,
+                },
+                created_at: "2025-01-01T00:00:00Z".to_string(),
+                updated_at: "2025-01-01T00:00:00Z".to_string(),
+                html_url: "h".to_string(),
+                pull_request_review_id: None,
+                start_line: None,
+                line: None,
+                side: None,
+            };
+            let provider: Arc<dyn ScmProvider> =
+                Arc::new(MockScmProvider::new("github", true, "@claudear"));
+            let tracker = Arc::new(MockTrackerWithRecording::new());
+            tracker.set_unhandled(vec![base("src/main.rs"), base("")]);
+            let watcher = ReviewWatcher::with_tracker(provider, tracker.clone());
+            watcher.watch_pr(make_state(
+                "https://github.com/org/repo/pull/1",
+                "org/repo",
+                1,
+            ));
+
+            let events = watcher.check_for_reviews().await.unwrap();
+            let emitted: usize = events
+                .iter()
+                .filter_map(|e| match e {
+                    ReviewEvent::CommentsAdded { comments, .. } => Some(comments.len()),
+                    _ => None,
+                })
+                .sum();
+            assert_eq!(emitted, 2, "colliding-id comments collapsed on re-surface");
         }
 
         #[tokio::test]

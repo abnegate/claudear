@@ -29,6 +29,20 @@ impl EvaluationResult {
         }
     }
 
+    /// Whether any test tool gained new failures vs the baseline.
+    pub fn has_new_test_failures(&self) -> bool {
+        self.deltas
+            .iter()
+            .any(|d| d.after.category == EvalCategory::Test && d.new_failures > 0)
+    }
+
+    /// Whether the fix introduced new failures or regressions in any tool.
+    pub fn has_regressions(&self) -> bool {
+        self.deltas
+            .iter()
+            .any(|d| d.new_failures > 0 || !d.regressions.is_empty())
+    }
+
     fn build_summary(deltas: &[EvalDelta]) -> String {
         if deltas.is_empty() {
             return "No evaluation tools ran.".to_string();
@@ -223,6 +237,42 @@ mod tests {
         let result = EvaluationResult::new(1, "org/repo".into(), vec![delta]);
         assert!(result.overall_improved);
         assert!(!result.summary.is_empty());
+    }
+
+    #[test]
+    fn test_has_new_test_failures() {
+        // A newly-added failing test (red) shows up as a new test failure.
+        let red = EvaluationResult::new(
+            1,
+            "org/repo".into(),
+            vec![EvalDelta::compute(
+                make_snapshot(EvalCategory::Test, "cargo test", 10, 0),
+                make_snapshot(EvalCategory::Test, "cargo test", 10, 1),
+            )],
+        );
+        assert!(red.has_new_test_failures());
+
+        // Once the fix lands, the test passes again (green) — no new test failures.
+        let green = EvaluationResult::new(
+            1,
+            "org/repo".into(),
+            vec![EvalDelta::compute(
+                make_snapshot(EvalCategory::Test, "cargo test", 10, 0),
+                make_snapshot(EvalCategory::Test, "cargo test", 11, 0),
+            )],
+        );
+        assert!(!green.has_new_test_failures());
+
+        // A lint regression is not a test failure.
+        let lint = EvaluationResult::new(
+            1,
+            "org/repo".into(),
+            vec![EvalDelta::compute(
+                make_snapshot(EvalCategory::Lint, "clippy", 10, 0),
+                make_snapshot(EvalCategory::Lint, "clippy", 10, 1),
+            )],
+        );
+        assert!(!lint.has_new_test_failures());
     }
 
     #[test]

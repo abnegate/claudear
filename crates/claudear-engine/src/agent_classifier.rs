@@ -10,7 +10,9 @@
 //! completion parsed leniently.
 
 use crate::intent::CATEGORY_RULES;
-use crate::intent::{intent_body, intent_title, parse_intent, Intent, IntentClassifier};
+use crate::intent::{
+    intent_body, intent_conversation_section, intent_title, parse_intent, Intent, IntentClassifier,
+};
 use async_trait::async_trait;
 use claudear_analysis::inference::{ClassificationRequest, RepoClassifier};
 use claudear_core::types::Issue;
@@ -288,8 +290,8 @@ impl AgentIntentClassifier {
 
 #[async_trait]
 impl IntentClassifier for AgentIntentClassifier {
-    async fn classify_intent(&self, issue: &Issue) -> Option<Intent> {
-        let prompt = build_intent_prompt(issue);
+    async fn classify_intent(&self, issue: &Issue, conversation: Option<&str>) -> Option<Intent> {
+        let prompt = build_intent_prompt(issue, conversation);
         let temp_dir = std::env::temp_dir();
 
         let start = Instant::now();
@@ -382,14 +384,16 @@ pub async fn score_chunk_relevance_via_agent(
 
 /// Build the intent-classification prompt for the coding agent (plain text; the
 /// `--json-schema` result shape is enforced by constrained decoding, not prose).
-fn build_intent_prompt(issue: &Issue) -> String {
+fn build_intent_prompt(issue: &Issue, conversation: Option<&str>) -> String {
     format!(
         "You classify an incoming developer-support message into exactly one of:\n\
          {rules}\n\
+         {conversation}\
          Set `intent` to the single matching category.\n\n\
          Title: {title}\n\
          {body}",
         rules = CATEGORY_RULES,
+        conversation = intent_conversation_section(conversation),
         title = intent_title(issue),
         body = intent_body(issue),
     )
@@ -678,7 +682,7 @@ mod tests {
     #[test]
     fn test_intent_prompt_is_plain_text_with_contract() {
         let issue = intent_issue("Realtime onClose error", Some("triggerStats() null given"));
-        let prompt = build_intent_prompt(&issue);
+        let prompt = build_intent_prompt(&issue, None);
 
         assert!(prompt.contains("Realtime onClose error"));
         assert!(prompt.contains("triggerStats()"));
@@ -687,6 +691,23 @@ mod tests {
         // No local-LLM control tokens leak into an external-agent prompt.
         assert!(!prompt.contains("<|system|>"));
         assert!(!prompt.contains("<|assistant|>"));
+    }
+
+    #[test]
+    fn test_intent_prompt_includes_conversation_when_present() {
+        let issue = intent_issue("yes create a pr now", None);
+        let convo = "[User]: can you add dedicated scopes?\n[Claudear]: here is the plan ...";
+        let prompt = build_intent_prompt(&issue, Some(convo));
+
+        assert!(prompt.contains("can you add dedicated scopes?"));
+        assert!(prompt.contains("Classify the LATEST message"));
+        // The current message is still present and classified.
+        assert!(prompt.contains("yes create a pr now"));
+
+        // Absent conversation leaves the prompt unchanged (no dangling framing).
+        let plain = build_intent_prompt(&issue, None);
+        assert!(!plain.contains("Classify the LATEST message"));
+        assert!(!plain.contains("ongoing conversation"));
     }
 
     #[test]
@@ -703,7 +724,7 @@ mod tests {
         }));
         let issue = intent_issue("SQL injection in login", None);
         assert_eq!(
-            classifier.classify_intent(&issue).await,
+            classifier.classify_intent(&issue, None).await,
             Some(Intent::Security)
         );
     }
@@ -714,7 +735,7 @@ mod tests {
             response: Err("not supported".to_string()),
         }));
         let issue = intent_issue("anything", None);
-        assert_eq!(classifier.classify_intent(&issue).await, None);
+        assert_eq!(classifier.classify_intent(&issue, None).await, None);
     }
 
     // --- Retrieval relevance judge (agent backend) ---

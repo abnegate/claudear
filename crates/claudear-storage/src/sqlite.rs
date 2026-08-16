@@ -1324,22 +1324,43 @@ impl AttemptTracker for SqliteTracker {
         Ok(())
     }
 
-    fn mark_answered(&self, source: &str, issue_id: &str, summary: &str) -> Result<()> {
+    fn mark_answered(
+        &self,
+        source: &str,
+        issue_id: &str,
+        summary: &str,
+        intent: Option<&str>,
+    ) -> Result<()> {
         tracing::info!(
             source = source,
             issue_id = issue_id,
             "Marking attempt as answered"
         );
         let conn = self.acquire_lock()?;
+        // COALESCE keeps any previously-stored intent when this call omits one.
         conn.execute(
             r#"
             UPDATE fix_attempts
-            SET status = 'answered', error_message = ?
+            SET status = 'answered', error_message = ?, routing_intent = COALESCE(?, routing_intent)
             WHERE source = ? AND issue_id = ?
             "#,
-            params![summary, source, issue_id],
+            params![summary, intent, source, issue_id],
         )?;
         Ok(())
+    }
+
+    /// Read the routing intent classified for an attempt, if one was stored.
+    fn get_routing_intent(&self, source: &str, issue_id: &str) -> Result<Option<String>> {
+        let conn = self.acquire_lock()?;
+        let intent = conn
+            .query_row(
+                "SELECT routing_intent FROM fix_attempts WHERE source = ? AND issue_id = ?",
+                params![source, issue_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(intent)
     }
 
     fn record_answer_message_ids(
@@ -1814,9 +1835,10 @@ impl ActivityStore for SqliteTracker {
             INSERT INTO pr_review_states (
                 pr_url, repo, pr_number, issue_id, source,
                 last_review_id, last_review_time, last_comment_id, last_comment_time,
+                last_issue_comment_id, last_issue_comment_time,
                 is_active, created_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'))
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, datetime('now'))
             ON CONFLICT(pr_url) DO UPDATE SET
                 repo = excluded.repo,
                 pr_number = excluded.pr_number,
@@ -1826,6 +1848,8 @@ impl ActivityStore for SqliteTracker {
                 last_review_time = excluded.last_review_time,
                 last_comment_id = excluded.last_comment_id,
                 last_comment_time = excluded.last_comment_time,
+                last_issue_comment_id = excluded.last_issue_comment_id,
+                last_issue_comment_time = excluded.last_issue_comment_time,
                 is_active = excluded.is_active
             "#,
             params![
@@ -1838,6 +1862,8 @@ impl ActivityStore for SqliteTracker {
                 state.last_review_time,
                 state.last_comment_id,
                 state.last_comment_time,
+                state.last_issue_comment_id,
+                state.last_issue_comment_time,
                 state.is_active as i32,
             ],
         )?;
@@ -1858,6 +1884,7 @@ impl ActivityStore for SqliteTracker {
             r#"
             SELECT pr_url, repo, pr_number, issue_id, source,
                    last_review_id, last_review_time, last_comment_id, last_comment_time,
+                   last_issue_comment_id, last_issue_comment_time,
                    is_active
             FROM pr_review_states
             WHERE is_active = 1
@@ -1902,19 +1929,30 @@ impl ActivityStore for SqliteTracker {
     ) -> Result<i64> {
         let conn = self.acquire_lock()?;
 
+        // Conversation comments (issues/{n}/comments) carry no file path; inline
+        // review comments (pulls/{n}/comments) always do. The two are separate
+        // GitHub id sequences, so uniqueness is keyed on (comment_kind, id) to keep
+        // a colliding id in one namespace from overwriting the other's row.
+        let comment_kind = if comment.path.is_empty() {
+            "conversation"
+        } else {
+            "inline"
+        };
+
         conn.execute(
             r#"
             INSERT INTO pr_review_comments (
-                scm_comment_id, pr_url, review_id, path, position, line,
+                scm_comment_id, comment_kind, pr_url, review_id, path, position, line,
                 body, author, created_at, updated_at, html_url
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-            ON CONFLICT(scm_comment_id) DO UPDATE SET
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            ON CONFLICT(comment_kind, scm_comment_id) DO UPDATE SET
                 body = excluded.body,
                 updated_at = excluded.updated_at
             "#,
             params![
                 comment.id,
+                comment_kind,
                 pr_url,
                 comment.pull_request_review_id,
                 comment.path,
@@ -1952,6 +1990,153 @@ impl ActivityStore for SqliteTracker {
         }
 
         Ok(results)
+    }
+
+    fn get_unhandled_pr_review_comments(
+        &self,
+        pr_url: &str,
+    ) -> Result<Vec<claudear_core::types::ReviewComment>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT scm_comment_id, review_id, path, position, line,
+                   body, author, created_at, updated_at, html_url
+            FROM pr_review_comments
+            WHERE pr_url = ? AND handled_at IS NULL
+            ORDER BY scm_comment_id ASC
+            "#,
+        )?;
+
+        let rows = stmt.query_map(params![pr_url], |row| {
+            Ok(claudear_core::types::ReviewComment {
+                id: row.get(0)?,
+                pull_request_review_id: row.get(1)?,
+                path: row.get(2)?,
+                position: row.get(3)?,
+                line: row.get(4)?,
+                body: row.get(5)?,
+                user: claudear_core::types::ReviewUser {
+                    id: 0,
+                    login: row.get(6)?,
+                    user_type: None,
+                },
+                created_at: row.get(7)?,
+                updated_at: row.get(8)?,
+                html_url: row.get(9)?,
+                original_position: None,
+                start_line: None,
+                side: None,
+            })
+        })?;
+
+        let mut results = Vec::new();
+        for row in rows.flatten() {
+            results.push(row);
+        }
+        Ok(results)
+    }
+
+    fn mark_pr_review_comments_handled(&self, pr_url: &str) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            "UPDATE pr_review_comments SET handled_at = datetime('now') \
+             WHERE pr_url = ? AND handled_at IS NULL",
+            params![pr_url],
+        )?;
+        Ok(())
+    }
+
+    fn mark_pr_review_comments_handled_by_ids(
+        &self,
+        pr_url: &str,
+        comments: &[(i64, &str)],
+    ) -> Result<()> {
+        if comments.is_empty() {
+            return Ok(());
+        }
+        let conn = self.acquire_lock()?;
+        // Match (comment_kind, scm_comment_id) pairs so a colliding id in the other
+        // namespace is not acknowledged by mistake.
+        let pair_clause =
+            vec!["(comment_kind = ? AND scm_comment_id = ?)"; comments.len()].join(" OR ");
+        let sql = format!(
+            "UPDATE pr_review_comments SET handled_at = datetime('now') \
+             WHERE pr_url = ? AND handled_at IS NULL AND ({})",
+            pair_clause
+        );
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(comments.len() * 2 + 1);
+        binds.push(Box::new(pr_url.to_string()));
+        for (id, kind) in comments {
+            binds.push(Box::new(kind.to_string()));
+            binds.push(Box::new(*id));
+        }
+        conn.execute(&sql, rusqlite::params_from_iter(binds.iter().map(|b| &**b)))?;
+        Ok(())
+    }
+
+    fn note_pr_review_comment_failure_by_ids(
+        &self,
+        pr_url: &str,
+        comments: &[(i64, &str)],
+        max_attempts: i64,
+    ) -> Result<()> {
+        if comments.is_empty() {
+            return Ok(());
+        }
+        let conn = self.acquire_lock()?;
+        // Match (comment_kind, scm_comment_id) pairs so a colliding id in the other
+        // namespace is not charged by mistake.
+        let pair_clause =
+            vec!["(comment_kind = ? AND scm_comment_id = ?)"; comments.len()].join(" OR ");
+
+        // Count this failed cycle against exactly the comments we tried.
+        let bump_sql = format!(
+            "UPDATE pr_review_comments SET attempts = attempts + 1 \
+             WHERE pr_url = ? AND handled_at IS NULL AND ({})",
+            pair_clause
+        );
+        // Give up on at most ONE comment per failed cycle: the single worst
+        // offender (most attempts) that has hit the cap. A batch failure can't be
+        // attributed to a specific comment, so retiring the whole over-cap set at
+        // once would drop valid comments that merely co-occur with a poison one.
+        // Retiring one per cycle lets a poison comment drain out first, after which
+        // the remaining comments get a fresh batch that can succeed.
+        let giveup_sql = format!(
+            "UPDATE pr_review_comments SET handled_at = datetime('now') \
+             WHERE id = ( \
+                 SELECT id FROM pr_review_comments \
+                 WHERE pr_url = ? AND handled_at IS NULL AND attempts >= ? AND ({}) \
+                 ORDER BY attempts DESC, scm_comment_id ASC \
+                 LIMIT 1 \
+             )",
+            pair_clause
+        );
+
+        let mut bump_binds: Vec<Box<dyn rusqlite::ToSql>> =
+            Vec::with_capacity(comments.len() * 2 + 1);
+        bump_binds.push(Box::new(pr_url.to_string()));
+        for (id, kind) in comments {
+            bump_binds.push(Box::new(kind.to_string()));
+            bump_binds.push(Box::new(*id));
+        }
+        conn.execute(
+            &bump_sql,
+            rusqlite::params_from_iter(bump_binds.iter().map(|b| &**b)),
+        )?;
+
+        let mut giveup_binds: Vec<Box<dyn rusqlite::ToSql>> =
+            Vec::with_capacity(comments.len() * 2 + 2);
+        giveup_binds.push(Box::new(pr_url.to_string()));
+        giveup_binds.push(Box::new(max_attempts));
+        for (id, kind) in comments {
+            giveup_binds.push(Box::new(kind.to_string()));
+            giveup_binds.push(Box::new(*id));
+        }
+        conn.execute(
+            &giveup_sql,
+            rusqlite::params_from_iter(giveup_binds.iter().map(|b| &**b)),
+        )?;
+        Ok(())
     }
 
     /// Get metric row counts grouped by name since a timestamp.
@@ -2967,6 +3152,28 @@ impl KnowledgeStore for SqliteTracker {
         repo: &str,
     ) -> Result<Vec<claudear_core::types::PromotedInstruction>> {
         SqliteTracker::get_promoted_instructions(self, repo)
+    }
+
+    fn upsert_agent_instruction(
+        &self,
+        scope: claudear_core::types::InstructionScope,
+        repo: Option<&str>,
+        text: &str,
+        updated_by: Option<&str>,
+    ) -> Result<i64> {
+        SqliteTracker::upsert_agent_instruction(self, scope, repo, text, updated_by)
+    }
+
+    fn get_agent_instruction(
+        &self,
+        scope: claudear_core::types::InstructionScope,
+        repo: Option<&str>,
+    ) -> Result<Option<claudear_core::types::AgentInstruction>> {
+        SqliteTracker::get_agent_instruction(self, scope, repo)
+    }
+
+    fn resolve_agent_instructions(&self, repo: Option<&str>) -> Result<Option<String>> {
+        SqliteTracker::resolve_agent_instructions(self, repo)
     }
 
     fn upsert_repo_knowledge(&self, entry: &claudear_core::types::RepoKnowledge) -> Result<i64> {
@@ -5050,7 +5257,8 @@ impl SqliteTracker {
 
     /// Convert a database row to a PrReviewState.
     /// Expects columns: pr_url, repo, pr_number, issue_id, source,
-    /// last_review_id, last_review_time, last_comment_id, last_comment_time, is_active
+    /// last_review_id, last_review_time, last_comment_id, last_comment_time,
+    /// last_issue_comment_id, last_issue_comment_time, is_active
     fn row_to_pr_review_state(
         row: &rusqlite::Row<'_>,
     ) -> rusqlite::Result<claudear_core::types::PrReviewState> {
@@ -5064,7 +5272,9 @@ impl SqliteTracker {
             last_review_time: row.get(6)?,
             last_comment_id: row.get(7)?,
             last_comment_time: row.get(8)?,
-            is_active: row.get::<_, i32>(9)? != 0,
+            last_issue_comment_id: row.get(9)?,
+            last_issue_comment_time: row.get(10)?,
+            is_active: row.get::<_, i32>(11)? != 0,
         })
     }
 
@@ -7632,6 +7842,115 @@ impl SqliteTracker {
         Ok(rows)
     }
 
+    /// Upsert the single agent-instruction row for a scope. `repo` is None for
+    /// the global row and Some(`org/name`) for a per-repo row.
+    pub fn upsert_agent_instruction(
+        &self,
+        scope: claudear_core::types::InstructionScope,
+        repo: Option<&str>,
+        text: &str,
+        updated_by: Option<&str>,
+    ) -> Result<i64> {
+        let conn = self.acquire_lock()?;
+        let now = Utc::now().to_rfc3339();
+        let scope_str = scope.to_string();
+
+        // Match on IFNULL so the NULL-repo global row is addressable.
+        let updated = conn.execute(
+            "UPDATE agent_instructions SET instruction_text = ?1, is_active = 1, updated_by = ?2, updated_at = ?3
+             WHERE scope = ?4 AND IFNULL(repo, '') = IFNULL(?5, '')",
+            params![text, updated_by, now, scope_str, repo],
+        )?;
+
+        if updated > 0 {
+            let id: i64 = conn
+                .query_row(
+                    "SELECT id FROM agent_instructions WHERE scope = ?1 AND IFNULL(repo, '') = IFNULL(?2, '')",
+                    params![scope_str, repo],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            return Ok(id);
+        }
+
+        conn.execute(
+            "INSERT INTO agent_instructions (scope, repo, instruction_text, is_active, updated_by, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 1, ?4, ?5, ?5)",
+            params![scope_str, repo, text, updated_by, now],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Get the active agent instruction for a scope, if any.
+    pub fn get_agent_instruction(
+        &self,
+        scope: claudear_core::types::InstructionScope,
+        repo: Option<&str>,
+    ) -> Result<Option<claudear_core::types::AgentInstruction>> {
+        let conn = self.acquire_lock()?;
+        let scope_str = scope.to_string();
+        let row = conn
+            .query_row(
+                "SELECT id, scope, repo, instruction_text, is_active, updated_at
+                 FROM agent_instructions
+                 WHERE scope = ?1 AND IFNULL(repo, '') = IFNULL(?2, '') AND is_active = 1",
+                params![scope_str, repo],
+                |row| {
+                    let scope_val: String = row.get(1)?;
+                    Ok(claudear_core::types::AgentInstruction {
+                        id: row.get(0)?,
+                        scope: scope_val
+                            .parse()
+                            .unwrap_or(claudear_core::types::InstructionScope::Global),
+                        repo: row.get(2)?,
+                        instruction_text: row.get(3)?,
+                        is_active: row.get::<_, i32>(4)? != 0,
+                        updated_at: Self::parse_datetime(&row.get::<_, String>(5)?)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Resolve the effective instruction block: global first, then the per-repo
+    /// override, concatenated with clear provenance. `repo` is None when the run
+    /// has no resolved repo (e.g. skipped resolution or a QA answer); global
+    /// instructions still apply in that case. Returns None when neither scope has
+    /// active text.
+    pub fn resolve_agent_instructions(&self, repo: Option<&str>) -> Result<Option<String>> {
+        let global = self
+            .get_agent_instruction(claudear_core::types::InstructionScope::Global, None)?
+            .map(|i| i.instruction_text)
+            .filter(|t| !t.trim().is_empty());
+        let per_repo = match repo {
+            Some(r) => self
+                .get_agent_instruction(claudear_core::types::InstructionScope::Repo, Some(r))?
+                .map(|i| i.instruction_text)
+                .filter(|t| !t.trim().is_empty()),
+            None => None,
+        };
+
+        if global.is_none() && per_repo.is_none() {
+            return Ok(None);
+        }
+
+        let mut block = String::from(
+            "# Operator Instructions (claudear)\nThese instructions were configured by your operators. Follow them.\n",
+        );
+        if let Some(g) = global {
+            block.push_str("\n## Global\n");
+            block.push_str(g.trim());
+            block.push('\n');
+        }
+        if let (Some(r), Some(repo)) = (per_repo, repo) {
+            block.push_str(&format!("\n## Repository: {}\n", repo));
+            block.push_str(r.trim());
+            block.push('\n');
+        }
+        Ok(Some(block))
+    }
+
     /// System 4: Upsert a repo knowledge entry.
     pub fn upsert_repo_knowledge(
         &self,
@@ -9632,6 +9951,81 @@ mod tests {
     use chrono::{Datelike, Timelike, Utc};
 
     #[test]
+    fn test_agent_instructions_scope_and_resolve() {
+        use claudear_core::types::InstructionScope;
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Nothing set: resolve is None.
+        assert!(tracker
+            .resolve_agent_instructions(Some("org/repo"))
+            .unwrap()
+            .is_none());
+
+        // Global only.
+        tracker
+            .upsert_agent_instruction(InstructionScope::Global, None, "Be terse.", Some("admin"))
+            .unwrap();
+        let g = tracker
+            .get_agent_instruction(InstructionScope::Global, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(g.instruction_text, "Be terse.");
+        assert_eq!(g.scope, InstructionScope::Global);
+        assert!(g.repo.is_none());
+
+        let resolved = tracker
+            .resolve_agent_instructions(Some("org/repo"))
+            .unwrap()
+            .unwrap();
+        assert!(resolved.contains("## Global"));
+        assert!(resolved.contains("Be terse."));
+        assert!(!resolved.contains("## Repository:"));
+
+        // Global still applies when there is no resolved repo (e.g. QA / Skip).
+        let no_repo = tracker.resolve_agent_instructions(None).unwrap().unwrap();
+        assert!(no_repo.contains("## Global"));
+        assert!(!no_repo.contains("## Repository:"));
+
+        // Per-repo override is namespaced and concatenated after global.
+        tracker
+            .upsert_agent_instruction(
+                InstructionScope::Repo,
+                Some("org/repo"),
+                "Generated output; edit the generator instead.",
+                None,
+            )
+            .unwrap();
+        let resolved = tracker
+            .resolve_agent_instructions(Some("org/repo"))
+            .unwrap()
+            .unwrap();
+        assert!(resolved.contains("## Global"));
+        assert!(resolved.contains("## Repository: org/repo"));
+        assert!(resolved.contains("edit the generator instead"));
+
+        // A different repo does not see the override.
+        let other = tracker
+            .resolve_agent_instructions(Some("org/other"))
+            .unwrap()
+            .unwrap();
+        assert!(!other.contains("## Repository:"));
+
+        // No-repo resolution never leaks a per-repo override.
+        let no_repo = tracker.resolve_agent_instructions(None).unwrap().unwrap();
+        assert!(!no_repo.contains("## Repository:"));
+
+        // Upsert replaces text for the same scope (no duplicate row).
+        tracker
+            .upsert_agent_instruction(InstructionScope::Global, None, "Updated.", None)
+            .unwrap();
+        let g = tracker
+            .get_agent_instruction(InstructionScope::Global, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(g.instruction_text, "Updated.");
+    }
+
+    #[test]
     fn test_record_and_retrieve_attempt() {
         let tracker = SqliteTracker::in_memory().unwrap();
 
@@ -11106,6 +11500,8 @@ mod tests {
         state.last_review_time = Some("2024-01-15T10:00:00Z".to_string());
         state.last_comment_id = Some(888);
         state.last_comment_time = Some("2024-01-15T11:00:00Z".to_string());
+        state.last_issue_comment_id = Some(777);
+        state.last_issue_comment_time = Some("2024-01-15T12:00:00Z".to_string());
         tracker.save_pr_review_state(&state).unwrap();
 
         // Verify the update
@@ -11120,6 +11516,11 @@ mod tests {
         assert_eq!(
             states[0].last_comment_time,
             Some("2024-01-15T11:00:00Z".to_string())
+        );
+        assert_eq!(states[0].last_issue_comment_id, Some(777));
+        assert_eq!(
+            states[0].last_issue_comment_time,
+            Some("2024-01-15T12:00:00Z".to_string())
         );
     }
 
@@ -11193,6 +11594,230 @@ mod tests {
         assert_eq!(comments[0].body, "Consider using a const here");
         assert_eq!(comments[0].author, "reviewer1");
         assert_eq!(comments[0].line, Some(42));
+    }
+
+    #[test]
+    fn test_pr_review_comment_handled_ledger() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let pr_url = "https://github.com/owner/repo/pull/7";
+
+        let mk = |id: i64| claudear_core::types::ReviewComment {
+            id,
+            path: String::new(),
+            position: None,
+            original_position: None,
+            body: "@claudear please fix".to_string(),
+            user: claudear_core::types::ReviewUser {
+                id: 1,
+                login: "reviewer".to_string(),
+                user_type: Some("User".to_string()),
+            },
+            created_at: "2024-01-15T10:00:00Z".to_string(),
+            updated_at: "2024-01-15T10:00:00Z".to_string(),
+            html_url: format!("https://github.com/owner/repo/pull/7#c{}", id),
+            pull_request_review_id: None,
+            start_line: None,
+            line: None,
+            side: None,
+        };
+
+        // A freshly recorded comment is unhandled.
+        tracker.record_pr_review_comment(pr_url, &mk(1)).unwrap();
+        tracker.record_pr_review_comment(pr_url, &mk(2)).unwrap();
+        let unhandled = tracker.get_unhandled_pr_review_comments(pr_url).unwrap();
+        assert_eq!(unhandled.len(), 2);
+        assert_eq!(unhandled[0].id, 1);
+
+        // Marking handled clears them.
+        tracker.mark_pr_review_comments_handled(pr_url).unwrap();
+        assert!(tracker
+            .get_unhandled_pr_review_comments(pr_url)
+            .unwrap()
+            .is_empty());
+
+        // Re-recording a handled comment does not resurrect it (handled_at kept).
+        tracker.record_pr_review_comment(pr_url, &mk(1)).unwrap();
+        assert!(tracker
+            .get_unhandled_pr_review_comments(pr_url)
+            .unwrap()
+            .is_empty());
+
+        // A new comment fails repeatedly and is given up on at the cap.
+        tracker.record_pr_review_comment(pr_url, &mk(3)).unwrap();
+        assert_eq!(
+            tracker
+                .get_unhandled_pr_review_comments(pr_url)
+                .unwrap()
+                .len(),
+            1
+        );
+        tracker
+            .note_pr_review_comment_failure_by_ids(pr_url, &[(3, "conversation")], 3)
+            .unwrap(); // attempts=1
+        tracker
+            .note_pr_review_comment_failure_by_ids(pr_url, &[(3, "conversation")], 3)
+            .unwrap(); // attempts=2
+        assert_eq!(
+            tracker
+                .get_unhandled_pr_review_comments(pr_url)
+                .unwrap()
+                .len(),
+            1,
+            "should still retry below the cap"
+        );
+        tracker
+            .note_pr_review_comment_failure_by_ids(pr_url, &[(3, "conversation")], 3)
+            .unwrap(); // attempts=3 -> give up
+        assert!(
+            tracker
+                .get_unhandled_pr_review_comments(pr_url)
+                .unwrap()
+                .is_empty(),
+            "should stop retrying once the attempt cap is reached"
+        );
+    }
+
+    #[test]
+    fn test_mark_handled_by_ids_targets_only_given_comments() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let pr_url = "https://github.com/owner/repo/pull/9";
+
+        let mk = |id: i64| claudear_core::types::ReviewComment {
+            id,
+            path: String::new(),
+            position: None,
+            original_position: None,
+            body: "@claudear fix".to_string(),
+            user: claudear_core::types::ReviewUser {
+                id: 1,
+                login: "reviewer".to_string(),
+                user_type: None,
+            },
+            created_at: "2024-01-15T10:00:00Z".to_string(),
+            updated_at: "2024-01-15T10:00:00Z".to_string(),
+            html_url: format!("h{}", id),
+            pull_request_review_id: None,
+            start_line: None,
+            line: None,
+            side: None,
+        };
+        tracker.record_pr_review_comment(pr_url, &mk(1)).unwrap();
+        tracker.record_pr_review_comment(pr_url, &mk(2)).unwrap();
+
+        // Acknowledge only comment 1; comment 2 (recorded concurrently) survives.
+        tracker
+            .mark_pr_review_comments_handled_by_ids(pr_url, &[(1, "conversation")])
+            .unwrap();
+        let unhandled = tracker.get_unhandled_pr_review_comments(pr_url).unwrap();
+        assert_eq!(unhandled.len(), 1);
+        assert_eq!(unhandled[0].id, 2);
+    }
+
+    #[test]
+    fn test_inline_and_conversation_same_id_coexist() {
+        // The same numeric GitHub id can appear as both an inline review comment
+        // and a PR conversation comment (distinct id sequences). The composite
+        // (comment_kind, scm_comment_id) key must let both rows exist rather than
+        // one overwriting the other.
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let pr_url = "https://github.com/owner/repo/pull/1";
+
+        let base = |id: i64, path: &str| claudear_core::types::ReviewComment {
+            id,
+            path: path.to_string(),
+            position: None,
+            original_position: None,
+            body: format!("body for {}", path),
+            user: claudear_core::types::ReviewUser {
+                id: 1,
+                login: "reviewer".to_string(),
+                user_type: None,
+            },
+            created_at: "2024-01-15T10:00:00Z".to_string(),
+            updated_at: "2024-01-15T10:00:00Z".to_string(),
+            html_url: "h".to_string(),
+            pull_request_review_id: None,
+            start_line: None,
+            line: None,
+            side: None,
+        };
+        // Inline (non-empty path) and conversation (empty path) share id 42.
+        tracker
+            .record_pr_review_comment(pr_url, &base(42, "src/main.rs"))
+            .unwrap();
+        tracker
+            .record_pr_review_comment(pr_url, &base(42, ""))
+            .unwrap();
+
+        let comments = tracker.get_comments_for_pr(pr_url).unwrap();
+        assert_eq!(comments.len(), 2, "colliding id overwrote a row");
+        assert_eq!(
+            tracker
+                .get_unhandled_pr_review_comments(pr_url)
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // Acknowledging only the inline row must not touch the conversation row
+        // that shares the id.
+        tracker
+            .mark_pr_review_comments_handled_by_ids(pr_url, &[(42, "inline")])
+            .unwrap();
+        let unhandled = tracker.get_unhandled_pr_review_comments(pr_url).unwrap();
+        assert_eq!(unhandled.len(), 1, "colliding id acknowledged wrong row");
+        assert!(
+            unhandled[0].path.is_empty(),
+            "the surviving row should be the conversation comment"
+        );
+    }
+
+    #[test]
+    fn test_note_failure_retires_one_worst_offender() {
+        // A batch failure can't be blamed on a specific comment, so only the single
+        // worst offender (most attempts, at cap) is retired per cycle — a valid
+        // comment that merely co-occurs with a poison one isn't dropped alongside it.
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let pr_url = "https://github.com/owner/repo/pull/3";
+        let mk = |id: i64| claudear_core::types::ReviewComment {
+            id,
+            path: String::new(),
+            position: None,
+            original_position: None,
+            body: "@claudear fix".to_string(),
+            user: claudear_core::types::ReviewUser {
+                id: 1,
+                login: "reviewer".to_string(),
+                user_type: None,
+            },
+            created_at: "2024-01-15T10:00:00Z".to_string(),
+            updated_at: "2024-01-15T10:00:00Z".to_string(),
+            html_url: format!("h{}", id),
+            pull_request_review_id: None,
+            start_line: None,
+            line: None,
+            side: None,
+        };
+        tracker.record_pr_review_comment(pr_url, &mk(1)).unwrap(); // poison
+        tracker.record_pr_review_comment(pr_url, &mk(2)).unwrap(); // valid, arrives later
+
+        // Comment 1 fails once alone (attempts=1), then both fail together with
+        // cap=2: comment 1 reaches the cap, comment 2 is only at 1.
+        tracker
+            .note_pr_review_comment_failure_by_ids(pr_url, &[(1, "conversation")], 2)
+            .unwrap();
+        tracker
+            .note_pr_review_comment_failure_by_ids(
+                pr_url,
+                &[(1, "conversation"), (2, "conversation")],
+                2,
+            )
+            .unwrap();
+
+        // Only the worst offender (id 1) is retired; the valid comment survives.
+        let unhandled = tracker.get_unhandled_pr_review_comments(pr_url).unwrap();
+        assert_eq!(unhandled.len(), 1);
+        assert_eq!(unhandled[0].id, 2);
     }
 
     #[test]
