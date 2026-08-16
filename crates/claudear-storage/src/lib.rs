@@ -192,9 +192,21 @@ pub trait AttemptTracker: Send + Sync {
     ///
     /// Default no-op; persistent trackers should set the attempt status to
     /// `answered` so it is not retried or re-polled.
-    fn mark_answered(&self, source: &str, issue_id: &str, summary: &str) -> Result<()> {
-        let _ = (source, issue_id, summary);
+    fn mark_answered(
+        &self,
+        source: &str,
+        issue_id: &str,
+        summary: &str,
+        intent: Option<&str>,
+    ) -> Result<()> {
+        let _ = (source, issue_id, summary, intent);
         Ok(())
+    }
+
+    /// Read the routing intent classified for an attempt, if one was stored.
+    fn get_routing_intent(&self, source: &str, issue_id: &str) -> Result<Option<String>> {
+        let _ = (source, issue_id);
+        Ok(None)
     }
 
     /// Record the Discord message ids of the answer chunks Claudear sent for an
