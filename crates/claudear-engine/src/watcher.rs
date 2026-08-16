@@ -44,6 +44,11 @@ type QueuedIssue = (Issue, MatchResult, Option<Intent>);
 /// on (marked handled) instead of re-triggering the fix agent every cycle.
 const MAX_REVIEW_COMMENT_ATTEMPTS: i64 = 5;
 
+/// How long graceful shutdown waits for in-flight issue-processing tasks to
+/// finish before aborting the stragglers. Bounds shutdown so a task wedged in an
+/// external git/LLM operation with no internal timeout cannot stall a redeploy.
+const GRACEFUL_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Extracts the source name from a processing key of the form "source:issue_id".
 fn source_from_processing_key(key: &str) -> &str {
     key.split_once(':').map_or(key, |(source, _)| source)
@@ -1168,18 +1173,61 @@ impl Watcher {
     /// all in-progress work completes before the application exits.
     pub async fn stop_and_drain(&self) {
         self.stop();
+        self.drain_or_abort(GRACEFUL_DRAIN_BUDGET).await;
+    }
 
-        // Join every in-flight issue-processing task to completion before
-        // returning. This deliberately has no internal deadline: a fixed budget
-        // let stop_and_drain return while a task was still running, after which
-        // production tore down the Tokio runtime and aborted that task
-        // mid-operation, corrupting a partially-applied fix. `stop()` has already
-        // cleared is_running, so no new tasks are spawned; each running
-        // process_issue carries its own internal timeouts, so this terminates.
-        // Production bounds it by racing this against an operator force-quit
-        // (a second Ctrl+C -> process::exit), which is the intended hard limit.
-        self.drain_spawned_tasks().await;
-        tracing::info!("Claude Watcher stopped gracefully");
+    /// Drain in-flight issue-processing tasks, giving them `budget` to finish
+    /// gracefully and then aborting any stragglers.
+    ///
+    /// `stop()` has already cleared is_running, so no new tasks are recorded.
+    /// The two failure modes this balances, both flagged in review:
+    /// - Returning early while a task still runs let runtime teardown abort it
+    ///   mid-operation and misreport a graceful stop. So we wait for real
+    ///   completion within the budget, and any straggler is aborted *explicitly*
+    ///   and logged here rather than left to implicit teardown.
+    /// - Waiting with no deadline stalled a non-interactive shutdown (e.g. a
+    ///   redeploy's SIGTERM) when a task was wedged in an external git/LLM
+    ///   operation with no internal timeout. So the wait is bounded.
+    ///
+    /// Cancel-safe: handles are joined via `&mut`, so the timeout drops only the
+    /// borrow — the owned `handles` survive for the abort pass, never detached.
+    async fn drain_or_abort(&self, budget: std::time::Duration) {
+        // Safe to take: is_running is already false and dispatch re-checks it
+        // under this same lock, so nothing new is pushed after this take.
+        let mut handles: Vec<_> = {
+            let mut guard = self.spawn_handles.lock().await;
+            std::mem::take(&mut *guard)
+        };
+
+        let joined = tokio::time::timeout(budget, async {
+            for handle in &mut handles {
+                let _ = handle.await;
+            }
+        })
+        .await;
+
+        if joined.is_ok() {
+            tracing::info!("Claude Watcher stopped gracefully");
+            return;
+        }
+
+        // Budget exhausted: abort the still-running stragglers deterministically
+        // instead of stalling shutdown or leaving them for runtime teardown.
+        let mut aborted = 0usize;
+        for handle in &mut handles {
+            if !handle.is_finished() {
+                handle.abort();
+                aborted += 1;
+            }
+        }
+        for handle in handles {
+            let _ = handle.await;
+        }
+        tracing::warn!(
+            aborted,
+            budget_secs = budget.as_secs(),
+            "Graceful shutdown budget exhausted; aborted in-flight tasks to avoid stalling shutdown"
+        );
     }
 
     /// Check if the watcher is currently running.
@@ -5251,6 +5299,42 @@ mod tests {
         );
         assert!(watcher.spawn_handles.lock().await.is_empty());
         assert!(!watcher.is_running.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_drain_or_abort_bounds_wedged_task() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let source = Arc::new(MockSource::new("drain")) as Arc<dyn IssueSource>;
+        let watcher = create_test_watcher(notifier, tracker, vec![source], false);
+
+        // A task wedged far longer than the budget (stands in for an external
+        // git/LLM op with no internal timeout).
+        let done = Arc::new(AtomicBool::new(false));
+        let done_clone = Arc::clone(&done);
+        {
+            let mut handles = watcher.spawn_handles.lock().await;
+            handles.push(tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                done_clone.store(true, Ordering::SeqCst);
+            }));
+        }
+
+        // Shutdown must not stall: it returns within the (tiny) budget, aborting
+        // the straggler rather than waiting for it or leaving it detached.
+        let start = Instant::now();
+        watcher.drain_or_abort(Duration::from_millis(50)).await;
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "drain_or_abort stalled past its budget"
+        );
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "the wedged task was aborted, not awaited to completion"
+        );
+        assert!(watcher.spawn_handles.lock().await.is_empty());
     }
 
     #[test]
