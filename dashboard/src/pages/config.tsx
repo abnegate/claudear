@@ -384,10 +384,11 @@ function GlobalInstructionsCard() {
   const dirty = text !== serverText
 
   const handleSave = useCallback(async () => {
+    const saved = text
     setSaving(true)
     setSaveError(null)
     try {
-      await saveGlobalInstruction(text)
+      await saveGlobalInstruction(saved)
     } catch (e: any) {
       setSaveError(e?.message || 'Failed to save instructions')
       return
@@ -396,11 +397,12 @@ function GlobalInstructionsCard() {
     }
     // PUT persisted. Sync the cache optimistically from the known-saved value so
     // a background revalidation failure can't misreport the save or blank the
-    // editor.
-    setDraft(null)
+    // editor. Only clear the draft if the user has not typed more while the PUT
+    // was in flight, so newer edits are not discarded.
+    setDraft(prev => (prev === saved ? null : prev))
     setSaved(true)
     setTimeout(() => setSaved(false), 3000)
-    mutate(prev => (prev ? { ...prev, text } : prev), { revalidate: false })
+    mutate(prev => (prev ? { ...prev, text: saved } : prev), { revalidate: false })
   }, [text, mutate])
 
   return (
