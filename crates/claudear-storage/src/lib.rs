@@ -857,6 +857,31 @@ pub trait KnowledgeStore: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Upsert the single agent-instruction row for a scope (None repo = global).
+    fn upsert_agent_instruction(
+        &self,
+        _scope: claudear_core::types::InstructionScope,
+        _repo: Option<&str>,
+        _text: &str,
+        _updated_by: Option<&str>,
+    ) -> Result<i64> {
+        Ok(0)
+    }
+
+    /// Get the active agent instruction for a scope, if any.
+    fn get_agent_instruction(
+        &self,
+        _scope: claudear_core::types::InstructionScope,
+        _repo: Option<&str>,
+    ) -> Result<Option<claudear_core::types::AgentInstruction>> {
+        Ok(None)
+    }
+
+    /// Resolve the effective instruction block (global + per-repo) for a repo.
+    fn resolve_agent_instructions(&self, _repo: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// System 4: Upsert a repo knowledge entry.
     fn upsert_repo_knowledge(&self, _entry: &claudear_core::types::RepoKnowledge) -> Result<i64> {
         Ok(0)
