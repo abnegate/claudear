@@ -380,31 +380,6 @@ impl Watcher {
         }
     }
 
-    /// Join spawned tasks until they finish or `deadline` passes.
-    ///
-    /// Cancel-safe, unlike wrapping [`Self::drain_spawned_tasks`] in a
-    /// `timeout`: that takes every handle out of `spawn_handles` first, so a
-    /// firing timeout drops the taken handles and *detaches* the still-running
-    /// tasks, which the runtime then aborts mid-operation. Here each handle is
-    /// popped one at a time and joined via `&mut handle`, so a handle whose join
-    /// exceeds the deadline is put back into `spawn_handles` rather than dropped.
-    /// Returns `true` when every task was joined within the budget.
-    async fn drain_spawned_tasks_until(&self, deadline: std::time::Instant) -> bool {
-        loop {
-            let mut handle = match self.spawn_handles.lock().await.pop() {
-                Some(h) => h,
-                None => return true,
-            };
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            // `&mut handle` is the future, so a timeout drops only the borrow;
-            // `handle` survives and goes back into the list, never detached.
-            if remaining.is_zero() || tokio::time::timeout(remaining, &mut handle).await.is_err() {
-                self.spawn_handles.lock().await.push(handle);
-                return false;
-            }
-        }
-    }
-
     /// Get a trait-object reference to the LLM analyzer, if available.
     fn llm(&self) -> Option<&dyn claudear_analysis::llm::LlmAnalyzer> {
         self.llm_analyzer
@@ -1194,42 +1169,17 @@ impl Watcher {
     pub async fn stop_and_drain(&self) {
         self.stop();
 
-        // Wait for any active processing to complete (up to 30 seconds).
-        // Uses slot_available to wake immediately when a task finishes rather
-        // than polling on a fixed interval.
-        let max_wait = std::time::Duration::from_secs(30);
-        let start = std::time::Instant::now();
-
-        while self.active_processing.load(Ordering::SeqCst) > 0 {
-            if start.elapsed() > max_wait {
-                tracing::warn!(
-                    remaining = self.active_processing.load(Ordering::SeqCst),
-                    "Graceful shutdown timeout reached, some tasks may not have completed"
-                );
-                break;
-            }
-            tracing::info!(
-                active_count = self.active_processing.load(Ordering::SeqCst),
-                "Waiting for active tasks to complete..."
-            );
-            // Wait for a task to finish (notifies via slot_available) or fall back
-            // to a periodic check in case the notification was missed.
-            let remaining = max_wait.saturating_sub(start.elapsed());
-            let _ = tokio::time::timeout(remaining, self.slot_available.notified()).await;
-        }
-
-        // Join the spawned tasks themselves so shutdown waits for their teardown
-        // too, and so their handles are released rather than dropped with the
-        // watcher. Bounded by the same 30s budget, but cancel-safely: an
-        // unfinished task is left in spawn_handles rather than detached.
-        if self.drain_spawned_tasks_until(start + max_wait).await {
-            tracing::info!("Claude Watcher stopped gracefully");
-        } else {
-            tracing::warn!(
-                "Graceful shutdown budget exhausted while draining spawned tasks; \
-                 unfinished tasks remain and were not detached"
-            );
-        }
+        // Join every in-flight issue-processing task to completion before
+        // returning. This deliberately has no internal deadline: a fixed budget
+        // let stop_and_drain return while a task was still running, after which
+        // production tore down the Tokio runtime and aborted that task
+        // mid-operation, corrupting a partially-applied fix. `stop()` has already
+        // cleared is_running, so no new tasks are spawned; each running
+        // process_issue carries its own internal timeouts, so this terminates.
+        // Production bounds it by racing this against an operator force-quit
+        // (a second Ctrl+C -> process::exit), which is the intended hard limit.
+        self.drain_spawned_tasks().await;
+        tracing::info!("Claude Watcher stopped gracefully");
     }
 
     /// Check if the watcher is currently running.
@@ -5271,47 +5221,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_drain_spawned_tasks_until_keeps_unfinished_handle() {
+    async fn test_stop_and_drain_joins_task_to_completion() {
         use std::sync::atomic::AtomicBool;
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
         let notifier = Arc::new(MockNotifier::new(true));
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
         let source = Arc::new(MockSource::new("drain")) as Arc<dyn IssueSource>;
         let watcher = create_test_watcher(notifier, tracker, vec![source], false);
+        watcher.is_running.store(true, Ordering::SeqCst);
 
-        // A task that outlives a short drain budget.
+        // An in-flight task that only finishes after a delay. Shutdown must wait
+        // for it to complete rather than returning and letting it be aborted.
         let done = Arc::new(AtomicBool::new(false));
         let done_clone = Arc::clone(&done);
         {
             let mut handles = watcher.spawn_handles.lock().await;
             handles.push(tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                tokio::time::sleep(Duration::from_millis(150)).await;
                 done_clone.store(true, Ordering::SeqCst);
             }));
         }
 
-        // Budget shorter than the task: reports incomplete and must NOT detach it
-        // (dropping the handle would let the runtime abort it mid-operation).
-        let ok = watcher
-            .drain_spawned_tasks_until(Instant::now() + Duration::from_millis(20))
-            .await;
-        assert!(!ok, "budget was too short, drain should report incomplete");
-        assert_eq!(
-            watcher.spawn_handles.lock().await.len(),
-            1,
-            "the unfinished task's handle must be kept, not dropped/detached"
-        );
+        watcher.stop_and_drain().await;
 
-        // The task is still alive; draining with ample budget joins it to completion.
-        let ok = watcher
-            .drain_spawned_tasks_until(Instant::now() + Duration::from_secs(5))
-            .await;
-        assert!(ok);
         assert!(
             done.load(Ordering::SeqCst),
-            "task ran to completion — it was never aborted"
+            "stop_and_drain returned before the in-flight task completed; runtime \
+             teardown would then abort it mid-operation"
         );
         assert!(watcher.spawn_handles.lock().await.is_empty());
+        assert!(!watcher.is_running.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -7688,21 +7627,30 @@ mod tests {
 
         let watcher = Arc::new(create_test_watcher(notifier, tracker, sources, false));
         watcher.is_running.store(true, Ordering::SeqCst);
-        watcher.active_processing.fetch_add(1, Ordering::SeqCst);
 
-        // Simulate task finishing after a short delay
+        // A handle-tracked in-flight task, mirroring process_issue: it holds an
+        // active_processing count and clears it only when it finishes. Shutdown
+        // must wait for the handle, so the count is 0 by the time it returns.
+        watcher.active_processing.fetch_add(1, Ordering::SeqCst);
         let release = Arc::clone(&watcher);
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            release.active_processing.fetch_sub(1, Ordering::SeqCst);
-            release.slot_available.notify_waiters();
-        });
+        {
+            let mut handles = watcher.spawn_handles.lock().await;
+            handles.push(tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                release.active_processing.fetch_sub(1, Ordering::SeqCst);
+                release.slot_available.notify_waiters();
+            }));
+        }
 
         let result =
             tokio::time::timeout(std::time::Duration::from_secs(5), watcher.stop_and_drain()).await;
         assert!(result.is_ok(), "stop_and_drain timed out");
         assert!(!watcher.is_running());
-        assert_eq!(watcher.active_count(), 0);
+        assert_eq!(
+            watcher.active_count(),
+            0,
+            "shutdown waited for the in-flight task to finish"
+        );
     }
 
     #[test]
@@ -10100,23 +10048,17 @@ mod tests {
         let watcher = Arc::new(create_test_watcher(notifier, tracker, vec![], false));
         watcher.is_running.store(true, Ordering::SeqCst);
 
-        // Simulate a task that never completes (active count stays > 0)
-        watcher.active_processing.store(1, Ordering::SeqCst);
-
-        // stop_and_drain has a 5-minute internal timeout, but we use an outer timeout
-        // We just verify it eventually returns (the internal max_wait breaks the loop)
+        // A stray active_processing count with no recorded handle must not wedge
+        // shutdown: stop_and_drain waits on the spawn_handles, which are empty
+        // here, so it returns promptly and clears is_running.
         let result =
             tokio::time::timeout(std::time::Duration::from_secs(10), watcher.stop_and_drain())
                 .await;
-        // In test the internal max_wait is 300s which we can't wait for,
-        // so this test verifies the method was called correctly and stop was set
-        // The timeout will trigger because 300s > 10s, but that's fine
-        if result.is_err() {
-            // Timed out externally - that's expected since internal timeout is 300s
-            assert!(!watcher.is_running());
-        } else {
-            assert!(!watcher.is_running());
-        }
+        assert!(
+            result.is_ok(),
+            "stop_and_drain should return promptly with no handles"
+        );
+        assert!(!watcher.is_running());
     }
 
     #[tokio::test]
