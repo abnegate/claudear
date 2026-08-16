@@ -66,6 +66,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "agent_instructions",
         sql: include_str!("../../../migrations/V10__agent_instructions.sql"),
     },
+    Migration {
+        version: 11,
+        name: "fix_attempt_routing_intent",
+        sql: include_str!("../../../migrations/V11__fix_attempt_routing_intent.sql"),
+    },
 ];
 
 /// Run all pending migrations against the given connection.
@@ -126,7 +131,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
 
         // Verify a table from V1 exists
         let count: u32 = conn
@@ -186,6 +191,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_instructions, 1);
+
+        // Verify the V11 column exists on fix_attempts.
+        let has_routing_intent: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('fix_attempts') WHERE name = 'routing_intent'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_routing_intent, 1);
     }
 
     #[test]
@@ -200,7 +215,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
     }
 
     #[test]
