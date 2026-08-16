@@ -1923,6 +1923,50 @@ pub struct PromotedInstruction {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Scope of an operator-authored agent instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstructionScope {
+    /// Applies to every repo.
+    Global,
+    /// Applies to a single repo (keyed by `org/name`).
+    Repo,
+}
+
+impl std::fmt::Display for InstructionScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Global => write!(f, "global"),
+            Self::Repo => write!(f, "repo"),
+        }
+    }
+}
+
+impl std::str::FromStr for InstructionScope {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "global" => Ok(Self::Global),
+            "repo" => Ok(Self::Repo),
+            _ => Err(format!("Unknown instruction scope: {}", s)),
+        }
+    }
+}
+
+/// Operator-authored instruction injected into the agent's context on every run.
+/// Scoped either globally or to a single repo; see `InstructionScope`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentInstruction {
+    pub id: i64,
+    pub scope: InstructionScope,
+    /// Some(`org/name`) when scope is `Repo`; None for global.
+    pub repo: Option<String>,
+    pub instruction_text: String,
+    pub is_active: bool,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Per-repo accumulated knowledge entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoKnowledge {
