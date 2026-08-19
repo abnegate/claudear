@@ -1695,10 +1695,20 @@ fn main() -> anyhow::Result<()> {
         scope.set_tag("app.component", "claudear-backend");
     });
 
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?
-        .block_on(async_main(cli))
+        .build()?;
+    let result = runtime.block_on(async_main(cli));
+
+    // Bound runtime teardown. The watcher's shutdown drain aborts stragglers and
+    // detaches any still parked in non-preemptible blocking work (block_in_place
+    // bridging a wedged LLM call), but dropping the runtime by default waits
+    // indefinitely for such work to return, so an orphaned operation could still
+    // stall a redeploy's SIGTERM. shutdown_timeout caps that wait and detaches
+    // whatever remains, which the process exit then reclaims.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+
+    result
 }
 
 async fn async_main(cli: Cli) -> anyhow::Result<()> {
