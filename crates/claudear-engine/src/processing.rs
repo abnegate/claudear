@@ -2522,6 +2522,12 @@ impl IssueProcessor {
     /// else (routes to Reply). Uses the LLM classifier when available, falling
     /// back to the label/source heuristic (matching `FixAttempt::is_bug`).
     async fn classify_is_bug_or_security(&self, issue: &Issue) -> bool {
+        // Sentry issues are genuine errors and always route to the fix pipeline;
+        // enforce that before the classifier, which could otherwise misroute them
+        // to the QA/reply path (matches heuristic_is_bug / FixAttempt::is_bug).
+        if issue.source == "sentry" {
+            return true;
+        }
         if let Some(classifier) = self.intent_classifier.as_ref() {
             // Classify against the reply thread so a follow-up is judged in context,
             // but only Claudear's own answers — never untrusted user text — feed the
@@ -5927,7 +5933,44 @@ mod tests {
             .is_none());
     }
 
+    // Reproduces: a Sentry issue reaching classify_is_bug_or_security with an
+    // active LLM classifier is routed by the classifier verdict, bypassing the
+    // "sentry is always a bug" invariant that heuristic_is_bug enforces. If the
+    // classifier calls it a Question, the genuine Sentry error lands on the QA
+    // (reply) path instead of the fix pipeline.
+    #[tokio::test]
+    async fn test_classify_sentry_never_routed_to_qa() {
+        let tracker: Arc<dyn FixAttemptTracker> =
+            Arc::new(claudear_storage::SqliteTracker::in_memory().unwrap());
+        let mut processor = make_reply_chain_processor(tracker);
+        processor.intent_classifier = Some(Arc::new(StubIntentClassifier(Some(Intent::Question))));
+
+        // No reply_to_message_id metadata, so assemble_reply_chain short-circuits
+        // to None (no network) and the classifier verdict alone decides routing.
+        let issue = Issue::new("id-1", "S-1", "NullPointerException", "https://s/1", "sentry");
+
+        assert!(
+            processor.classify_is_bug_or_security(&issue).await,
+            "sentry errors are genuine bugs and must route to the fix pipeline, \
+             never QA, even when the classifier calls them a Question"
+        );
+    }
+
     // --- Dummy test helpers ---
+
+    /// Intent classifier stub returning a fixed verdict (for routing tests).
+    struct StubIntentClassifier(Option<Intent>);
+
+    #[async_trait]
+    impl IntentClassifier for StubIntentClassifier {
+        async fn classify_intent(
+            &self,
+            _issue: &Issue,
+            _conversation: Option<&str>,
+        ) -> Option<Intent> {
+            self.0
+        }
+    }
 
     /// Dummy agent runner that does nothing (for IssueProcessor tests).
     struct DummyAgent;
