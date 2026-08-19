@@ -1236,8 +1236,15 @@ impl Watcher {
         // despite the budget. Joined via &mut so the timeout drops only the
         // borrow; handles still unfinished are dropped when the vec goes out of
         // scope, detached for imminent runtime teardown.
+        //
+        // Skip already-finished handles: the graceful pass may have polled some
+        // to completion before it timed out on a later one, and awaiting a
+        // JoinHandle again after it returned `Ready` panics.
         let reaped = tokio::time::timeout(ABORT_JOIN_GRACE, async {
             for handle in &mut handles {
+                if handle.is_finished() {
+                    continue;
+                }
                 let _ = handle.await;
             }
         })
@@ -5440,6 +5447,49 @@ mod tests {
         assert!(
             elapsed < ABORT_JOIN_GRACE + Duration::from_secs(3),
             "post-abort join stalled shutdown past the abort grace"
+        );
+    }
+
+    /// The graceful pass may poll some handles to completion before it times out
+    /// on a later one; the post-abort pass must not re-poll those, as awaiting a
+    /// `JoinHandle` again after it returned `Ready` panics.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_drain_or_abort_no_double_poll_of_completed_handle() {
+        use std::time::Duration;
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let source = Arc::new(MockSource::new("drain")) as Arc<dyn IssueSource>;
+        let watcher = create_test_watcher(notifier, tracker, vec![source], false);
+
+        // Ordering is the point: a completed handle precedes a wedged one, so the
+        // graceful pass polls the first to completion and then times out on the
+        // second.
+        let done = tokio::spawn(async {});
+        while !done.is_finished() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let wedged = tokio::spawn(async move {
+            let _ = release_rx.recv();
+        });
+        {
+            let mut handles = watcher.spawn_handles.lock().await;
+            handles.push(done);
+            handles.push(wedged);
+        }
+
+        // Must return (not panic) despite the completed-then-wedged ordering.
+        let drained = tokio::time::timeout(
+            Duration::from_secs(20),
+            watcher.drain_or_abort(Duration::from_millis(50)),
+        )
+        .await;
+        // Release the wedged worker so runtime teardown is prompt.
+        let _ = release_tx.send(());
+
+        assert!(
+            drained.is_ok(),
+            "drain_or_abort stalled or panicked re-polling a completed handle"
         );
     }
 
