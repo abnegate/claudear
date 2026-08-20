@@ -28,6 +28,14 @@
 #   # while RESTART=1 the monitor respawns the daemon, so to stop the daemon for
 #   # real: stop the monitor first, then `claudear stop`.
 #
+# Typical droplet run (script copied to ~/monitor, daemon in ~/workspace):
+#   cd ~/monitor
+#   RESTART=1 nohup ./monitor.sh start >>monitor.out 2>&1 &
+#   disown
+#   ./monitor.sh status     # shows monitor + daemon pids
+#   ./monitor.sh once       # take one sample right now and print it
+#   tail -f memory.log      # watch samples accrue
+#
 # Config via env vars:
 #   INTERVAL   seconds between samples          (default 60)
 #   LOG        output CSV path                   (default ./memory.log)
