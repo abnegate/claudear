@@ -16,11 +16,17 @@
 #   fds                   -> leaked file descriptors / sockets / worktrees
 #   descendants/claude/git-> child processes not being reaped
 #
-# Usage:
+# Usage (start/stop the monitor whenever you want):
 #   ./monitor_claudear.sh start      # loop in foreground (nohup it for a droplet)
 #   ./monitor_claudear.sh once       # take a single sample and exit
 #   ./monitor_claudear.sh status     # show whether a monitor is running
 #   ./monitor_claudear.sh stop       # stop a running monitor (via pidfile)
+#
+# By default it ONLY observes. Set RESTART=1 to also relaunch the daemon when it
+# is found dead (opt-in supervision):
+#   RESTART=1 nohup ./monitor_claudear.sh start >/dev/null 2>&1 &
+#   # while RESTART=1 the monitor respawns the daemon, so to stop the daemon for
+#   # real: stop the monitor first, then `claudear stop`.
 #
 # Config via env vars:
 #   INTERVAL   seconds between samples          (default 60)
@@ -29,6 +35,15 @@
 #   MATCH      pgrep pattern for the daemon      (default the start --poll cmd)
 #   THRESHOLD_MB  if set, log a WARN line when rss exceeds this
 #
+# Auto-restart (only used when RESTART=1):
+#   WORKDIR       cwd for the launch             (default $HOME/workspace)
+#   CLAUDEAR_BIN  binary path                    (default /usr/bin/claudear)
+#   CONFIG        --config value                 (default claudear.toml)
+#   START_ARGS    args after --config <file>     (default "start --poll")
+#   DAEMON_LOG    daemon stdout/stderr log       (default $WORKDIR/claudear-daemon.out)
+#   RUN_AS        run the daemon as this user    (default: current user)
+#   COOLDOWN      min seconds between restarts    (default 30)
+#
 set -u
 
 INTERVAL="${INTERVAL:-60}"
@@ -36,6 +51,18 @@ LOG="${LOG:-./memory.log}"
 PIDFILE="${PIDFILE:-./claudear-monitor.pid}"
 MATCH="${MATCH:-claudear.*start}"
 THRESHOLD_MB="${THRESHOLD_MB:-}"
+
+RESTART="${RESTART:-0}"
+WORKDIR="${WORKDIR:-$HOME/workspace}"
+CLAUDEAR_BIN="${CLAUDEAR_BIN:-/usr/bin/claudear}"
+CONFIG="${CONFIG:-claudear.toml}"
+START_ARGS="${START_ARGS:-start --poll}"
+DAEMON_LOG="${DAEMON_LOG:-$WORKDIR/claudear-daemon.out}"
+RUN_AS="${RUN_AS:-}"
+COOLDOWN="${COOLDOWN:-30}"
+
+LAST_RESTART=0
+RESTART_COUNT=0
 
 HEADER="timestamp,pid,rss_mb,peak_rss_mb,vsz_mb,threads,fds,cpu_pct,descendants,claude_procs,git_procs,sys_mem_used_pct,sys_mem_avail_mb,load1"
 
@@ -63,6 +90,41 @@ list_descendants() {
 
 kb_to_mb() { awk -v k="${1:-0}" 'BEGIN{ printf "%.1f", (k+0)/1024 }'; }
 
+# Relaunch the daemon (only called when RESTART=1). `claudear start` (without
+# --foreground) self-daemonizes and cleans up stale pid/socket files on boot, so
+# this is safe whenever no live daemon is found. Cooldown-guarded so a daemon
+# that dies on boot doesn't spin-restart.
+restart_daemon() {
+  local ts n; ts="$(now)"; n="$(date +%s)"
+  if [ $((n - LAST_RESTART)) -lt "$COOLDOWN" ]; then
+    echo "$ts  restart suppressed (within ${COOLDOWN}s cooldown)"
+    return
+  fi
+  if [ ! -x "$CLAUDEAR_BIN" ]; then
+    echo "$ts,ERROR,$CLAUDEAR_BIN not executable,," >>"$LOG"
+    echo "$ts  ERROR: $CLAUDEAR_BIN not executable"; return
+  fi
+  if [ ! -d "$WORKDIR" ]; then
+    echo "$ts,ERROR,WORKDIR $WORKDIR missing,," >>"$LOG"
+    echo "$ts  ERROR: WORKDIR $WORKDIR missing"; return
+  fi
+
+  LAST_RESTART="$n"
+  RESTART_COUNT=$((RESTART_COUNT + 1))
+  echo "$ts,RESTART,#$RESTART_COUNT (cd $WORKDIR && $CLAUDEAR_BIN --config $CONFIG $START_ARGS),," >>"$LOG"
+  echo "$ts  RESTART #$RESTART_COUNT: (cd $WORKDIR && $CLAUDEAR_BIN --config $CONFIG $START_ARGS)"
+
+  # Launch from WORKDIR so the relative --config resolves; setsid-detached so the
+  # daemon survives the monitor stopping.
+  if [ -n "$RUN_AS" ]; then
+    ( cd "$WORKDIR" && setsid runuser -u "$RUN_AS" -- \
+        "$CLAUDEAR_BIN" --config "$CONFIG" $START_ARGS >>"$DAEMON_LOG" 2>&1 & )
+  else
+    ( cd "$WORKDIR" && setsid \
+        "$CLAUDEAR_BIN" --config "$CONFIG" $START_ARGS >>"$DAEMON_LOG" 2>&1 & )
+  fi
+}
+
 sample() {
   local pid ts
   ts="$(now)"
@@ -72,6 +134,7 @@ sample() {
     # Daemon not running right now - record the gap so a crash/restart is visible.
     printf '%s,,,,,,,,,,,,,\n' "$ts" >>"$LOG"
     echo "$ts  claudear not running"
+    [ "$RESTART" = "1" ] && restart_daemon
     return
   fi
 
