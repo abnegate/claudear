@@ -168,6 +168,60 @@ pub struct ProviderConfig {
     /// Provider-specific extra configuration.
     #[serde(default)]
     pub extra: std::collections::HashMap<String, serde_json::Value>,
+    /// MCP servers to attach to agent runs, keyed by server name. Gated per-run by sources.
+    #[serde(default)]
+    pub mcp: std::collections::HashMap<String, McpServerConfig>,
+}
+
+/// A single MCP server serialized into the agent's `.mcp.json` at run time.
+/// Reference secrets via `${VAR}` in `env` so they stay out of the config file.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpServerConfig {
+    /// Command for a stdio server, e.g. "uvx" or "npx".
+    pub command: Option<String>,
+    /// Arguments passed to `command`.
+    pub args: Vec<String>,
+    /// Environment for the server process. Values may contain `${VAR}` references.
+    pub env: std::collections::HashMap<String, String>,
+    /// URL for an HTTP/SSE transport server (alternative to `command`).
+    pub url: Option<String>,
+    /// Transport type: "stdio" (default when `command` is set), "http", or "sse".
+    #[serde(rename = "type")]
+    pub transport: Option<String>,
+    /// Headers for an HTTP/SSE transport server.
+    pub headers: std::collections::HashMap<String, String>,
+    /// Issue sources this server attaches for. Empty means all sources.
+    pub sources: Vec<String>,
+    /// Tool names to allow, as `mcp__<server>__<tool>`. Empty grants all of the
+    /// server's tools (`mcp__<server>`). Applies to every run that attaches this
+    /// server.
+    pub tools: Vec<String>,
+}
+
+impl McpServerConfig {
+    /// Whether this server attaches for a run from `source`. Empty sources means all.
+    pub fn matches_source(&self, source: Option<&str>) -> bool {
+        match source {
+            Some(s) => self.sources.is_empty() || self.sources.iter().any(|allowed| allowed == s),
+            // Runs without an issue never attach MCP.
+            None => false,
+        }
+    }
+
+    /// Whether exactly one transport is configured and any explicit `type` agrees
+    /// with it. `command` implies stdio; `url` implies http/sse. Rejects neither,
+    /// both, and contradictions (e.g. `command` with `type = "http"`).
+    pub fn has_valid_transport(&self) -> bool {
+        match (self.command.is_some(), self.url.is_some()) {
+            (true, false) => self.transport.as_deref().is_none_or(|t| t == "stdio"),
+            (false, true) => self
+                .transport
+                .as_deref()
+                .is_none_or(|t| t == "http" || t == "sse"),
+            _ => false,
+        }
+    }
 }
 
 /// Experiment configuration for A/B testing providers.
@@ -3531,6 +3585,87 @@ mod tests {
             Some("warm and apologetic")
         );
         assert_eq!(cfg.reply().template_for(Some("x")), Some("be nice"));
+    }
+
+    #[test]
+    fn test_mcp_config_parses_from_toml() {
+        let toml = r#"
+            [agent.providers.claude.mcp.appwrite]
+            command = "uvx"
+            args = ["mcp-server-appwrite", "--databases"]
+            sources = ["helpscout"]
+            tools = ["databases_get_document"]
+            [agent.providers.claude.mcp.appwrite.env]
+            APPWRITE_ENDPOINT = "https://fra.cloud.appwrite.io/v1"
+            APPWRITE_API_KEY = "${APPWRITE_API_KEY}"
+        "#;
+        let cfg: Config = toml::from_str(toml).expect("parse");
+        let provider = cfg.agent.providers.get("claude").expect("provider");
+        let appwrite = provider.mcp.get("appwrite").expect("mcp server");
+        assert_eq!(appwrite.command.as_deref(), Some("uvx"));
+        assert_eq!(appwrite.sources, vec!["helpscout".to_string()]);
+        assert_eq!(appwrite.tools, vec!["databases_get_document".to_string()]);
+        assert_eq!(
+            appwrite.env.get("APPWRITE_API_KEY").map(String::as_str),
+            Some("${APPWRITE_API_KEY}")
+        );
+    }
+
+    #[test]
+    fn test_mcp_matches_source() {
+        let helpscout_only = McpServerConfig {
+            sources: vec!["helpscout".to_string()],
+            ..Default::default()
+        };
+        assert!(helpscout_only.matches_source(Some("helpscout")));
+        assert!(!helpscout_only.matches_source(Some("discord")));
+        assert!(!helpscout_only.matches_source(None));
+
+        let all_sources = McpServerConfig::default();
+        assert!(all_sources.matches_source(Some("discord")));
+        assert!(all_sources.matches_source(Some("sentry")));
+        // Runs without an issue never attach, even when unrestricted.
+        assert!(!all_sources.matches_source(None));
+    }
+
+    #[test]
+    fn test_mcp_has_valid_transport() {
+        let stdio = McpServerConfig {
+            command: Some("uvx".to_string()),
+            ..Default::default()
+        };
+        assert!(stdio.has_valid_transport());
+
+        let http = McpServerConfig {
+            url: Some("https://example/mcp".to_string()),
+            transport: Some("http".to_string()),
+            ..Default::default()
+        };
+        assert!(http.has_valid_transport());
+
+        // Contradictions and ambiguity are rejected.
+        let command_with_http = McpServerConfig {
+            command: Some("uvx".to_string()),
+            transport: Some("http".to_string()),
+            ..Default::default()
+        };
+        assert!(!command_with_http.has_valid_transport());
+
+        let url_with_stdio = McpServerConfig {
+            url: Some("https://example/mcp".to_string()),
+            transport: Some("stdio".to_string()),
+            ..Default::default()
+        };
+        assert!(!url_with_stdio.has_valid_transport());
+
+        let both = McpServerConfig {
+            command: Some("uvx".to_string()),
+            url: Some("https://example/mcp".to_string()),
+            ..Default::default()
+        };
+        assert!(!both.has_valid_transport());
+
+        assert!(!McpServerConfig::default().has_valid_transport());
     }
 
     #[test]
