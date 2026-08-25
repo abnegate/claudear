@@ -805,6 +805,9 @@ pub struct ReplyConfig {
     pub templates: std::collections::HashMap<String, String>,
     /// Timeout for verifying (reproducing) a reported bug, in seconds (default: 1800).
     pub verify_timeout_secs: u64,
+    /// When verify can't run (timeout/error/unsupported), assume reproduced and fix
+    /// anyway (default: true). Set false to ask the reporter for repro steps instead.
+    pub verify_fail_open: bool,
 }
 
 impl Default for ReplyConfig {
@@ -815,6 +818,7 @@ impl Default for ReplyConfig {
             default_template: None,
             templates: std::collections::HashMap::new(),
             verify_timeout_secs: 1800,
+            verify_fail_open: true,
         }
     }
 }
@@ -1086,6 +1090,9 @@ pub struct EvaluationConfig {
     pub post_pr_comment: bool,
     /// Fail the fix attempt on regression.
     pub fail_on_regression: bool,
+    /// Enforce red->green: author a failing test first (must fail on the unfixed
+    /// code), then fix, then require it to pass. Needs test_delta enabled.
+    pub require_red_green: bool,
     /// Custom test command override.
     pub custom_test_cmd: Option<String>,
     /// Custom lint command override.
@@ -1108,6 +1115,7 @@ impl Default for EvaluationConfig {
             total_timeout_secs: 900,
             post_pr_comment: true,
             fail_on_regression: false,
+            require_red_green: false,
             custom_test_cmd: None,
             custom_lint_cmd: None,
             custom_analysis_cmd: None,
@@ -8120,6 +8128,7 @@ instructions_file = "my-instructions.md"
             total_timeout_secs: 1800,
             post_pr_comment: false,
             fail_on_regression: true,
+            require_red_green: false,
             custom_test_cmd: Some("npm test".to_string()),
             custom_lint_cmd: None,
             custom_analysis_cmd: Some("sonar".to_string()),

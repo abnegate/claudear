@@ -1139,6 +1139,30 @@ export async function saveConfig(content: string): Promise<{ ok: boolean; messag
 }
 
 
+export interface InstructionResponse {
+  scope: string
+  repo: string | null
+  text: string
+  updated_at: string | null
+}
+
+export async function fetchGlobalInstruction(): Promise<InstructionResponse> {
+  return fetchJson(`${API_BASE}/instructions/global`)
+}
+
+export async function saveGlobalInstruction(text: string): Promise<{ ok: boolean }> {
+  return putJson(`${API_BASE}/instructions/global`, { text })
+}
+
+export async function fetchRepoInstruction(repo: string): Promise<InstructionResponse> {
+  return fetchJson(`${API_BASE}/repos/${encodeURIComponent(repo)}/instructions`)
+}
+
+export async function saveRepoInstruction(repo: string, text: string): Promise<{ ok: boolean }> {
+  return putJson(`${API_BASE}/repos/${encodeURIComponent(repo)}/instructions`, { text })
+}
+
+
 export async function login(email: string, password: string): Promise<LoginResponse> {
   return postJson(`${API_BASE}/auth/login`, { email, password })
 }

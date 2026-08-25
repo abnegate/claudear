@@ -319,18 +319,11 @@ pub fn format_discord_search_context(results: &[DiscordSearchResult]) -> String 
 
     for (i, result) in results.iter().enumerate() {
         let chunk = &result.chunk;
-        let label = match chunk.guild_id.as_deref().filter(|g| !g.is_empty()) {
-            Some(guild_id) => format!(
-                "[Channel `{}`](https://discord.com/channels/{}/{}/{})",
-                chunk.channel_id, guild_id, chunk.channel_id, chunk.start_message_id,
-            ),
-            None => format!("Channel `{}`", chunk.channel_id),
-        };
         let _ = writeln!(
             context,
             "### {}. {} (Similarity: {:.0}%)",
             i + 1,
-            label,
+            discord_span_links(chunk),
             result.score * 100.0,
         );
 
@@ -359,6 +352,61 @@ pub fn format_discord_search_context(results: &[DiscordSearchResult]) -> String 
     }
 
     context
+}
+
+/// Build a Discord jump URL to a single message. Falls back to the `@me`
+/// (DM) path when the guild id is missing so we always emit a clickable link.
+fn discord_jump_url(guild_id: Option<&str>, channel_id: &str, message_id: &str) -> String {
+    match guild_id.filter(|g| !g.is_empty()) {
+        Some(guild_id) => format!(
+            "https://discord.com/channels/{}/{}/{}",
+            guild_id, channel_id, message_id
+        ),
+        None => format!(
+            "https://discord.com/channels/@me/{}/{}",
+            channel_id, message_id
+        ),
+    }
+}
+
+/// Render a chunk's channel label with jump links spanning its window: `from`
+/// (first message) and `to` (last message). Collapses to a single link when the
+/// window is one message.
+fn discord_span_links(chunk: &DiscordMessageChunk) -> String {
+    let guild = chunk.guild_id.as_deref();
+    let start = discord_jump_url(guild, &chunk.channel_id, &chunk.start_message_id);
+    if chunk.end_message_id == chunk.start_message_id {
+        format!("[Channel `{}`]({})", chunk.channel_id, start)
+    } else {
+        let end = discord_jump_url(guild, &chunk.channel_id, &chunk.end_message_id);
+        format!(
+            "Channel `{}` — [from]({}) → [to]({})",
+            chunk.channel_id, start, end
+        )
+    }
+}
+
+/// Build a compact Discord-markdown block of jump links to the retrieved
+/// discussions, for appending to an outgoing notification so readers can open
+/// the referenced conversations. Each entry links the start and end of the
+/// conversation window. Returns an empty string when there are no results.
+pub fn format_discord_reference_links(results: &[DiscordSearchResult]) -> String {
+    use std::fmt::Write;
+
+    if results.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from("\n\n\u{1F4CE} **Referenced Discord discussions**\n");
+    for result in results {
+        let _ = writeln!(
+            out,
+            "- {} ({:.0}%)",
+            discord_span_links(&result.chunk),
+            result.score * 100.0,
+        );
+    }
+    out
 }
 
 fn sha256_hex(text: &str) -> String {
@@ -450,19 +498,20 @@ mod tests {
         assert!(out.contains("95%"));
         assert!(out.contains("alice, bob"));
         assert!(out.contains("alice: hi"));
-        // Channel heading is a clickable deep link to the first message.
-        assert!(out.contains("[Channel `chan1`](https://discord.com/channels/g/chan1/1)"));
+        // A multi-message window links both the first and last message.
+        assert!(out.contains("[from](https://discord.com/channels/g/chan1/1)"));
+        assert!(out.contains("[to](https://discord.com/channels/g/chan1/2)"));
     }
 
     #[test]
-    fn test_format_context_without_guild_is_not_linked() {
+    fn test_format_context_without_guild_uses_me_fallback() {
         let chunk = DiscordMessageChunk {
             id: Some(1),
             guild_id: None,
             channel_id: "chan1".to_string(),
             channel_kind: DiscordChannelKind::Channel,
             start_message_id: "1".to_string(),
-            end_message_id: "2".to_string(),
+            end_message_id: "1".to_string(),
             participant_ids: None,
             start_message_time: "2024-01-01T10:00:00Z".to_string(),
             end_message_time: "2024-01-01T10:05:00Z".to_string(),
@@ -472,9 +521,38 @@ mod tests {
         };
         let out = format_discord_search_context(&[DiscordSearchResult { chunk, score: 0.5 }]);
 
-        assert!(out.contains("Channel `chan1`"));
-        // No guild id => no permalink.
-        assert!(!out.contains("https://discord.com/channels"));
+        // Missing guild id => still linkable via the @me path; single message
+        // collapses to one link.
+        assert!(out.contains("[Channel `chan1`](https://discord.com/channels/@me/chan1/1)"));
+    }
+
+    #[test]
+    fn test_reference_links_empty_is_empty_string() {
+        assert!(format_discord_reference_links(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_reference_links_span_and_score() {
+        let chunk = DiscordMessageChunk {
+            id: Some(1),
+            guild_id: Some("g".to_string()),
+            channel_id: "chan1".to_string(),
+            channel_kind: DiscordChannelKind::Channel,
+            start_message_id: "10".to_string(),
+            end_message_id: "20".to_string(),
+            participant_ids: None,
+            start_message_time: "2024-01-01T10:00:00Z".to_string(),
+            end_message_time: "2024-01-01T10:05:00Z".to_string(),
+            chunk_text: "hi".to_string(),
+            context_text: "ctx".to_string(),
+            content_hash: Some("h".to_string()),
+        };
+        let out = format_discord_reference_links(&[DiscordSearchResult { chunk, score: 0.87 }]);
+
+        assert!(out.contains("Referenced Discord discussions"));
+        assert!(out.contains("[from](https://discord.com/channels/g/chan1/10)"));
+        assert!(out.contains("[to](https://discord.com/channels/g/chan1/20)"));
+        assert!(out.contains("87%"));
     }
 
     // ---- end-to-end index (needs embedding model + sqlite) --------------

@@ -40,6 +40,25 @@ use tokio::time::{interval, Duration};
 /// decided routing `Intent` (`None` for non-QA-eligible / QA-disabled sources).
 type QueuedIssue = (Issue, MatchResult, Option<Intent>);
 
+/// How many times a PR review comment may fail processing before it is given up
+/// on (marked handled) instead of re-triggering the fix agent every cycle.
+const MAX_REVIEW_COMMENT_ATTEMPTS: i64 = 5;
+
+/// How long graceful shutdown waits for in-flight issue-processing tasks to
+/// finish before aborting the stragglers. Bounds shutdown so a task wedged in an
+/// external git/LLM operation with no internal timeout cannot stall a redeploy.
+const GRACEFUL_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Grace given to aborted stragglers to actually terminate before the drain
+/// stops waiting on them. `abort()` only takes effect at a task's next await, so
+/// a task parked in synchronous blocking work (`block_in_place` bridging an LLM
+/// call) won't observe it until that call returns. Capping the post-abort join
+/// keeps shutdown bounded instead of re-introducing the unbounded wait the
+/// budget exists to prevent; any handle still unfinished is dropped and left to
+/// runtime teardown, which `main` bounds via `Runtime::shutdown_timeout` so an
+/// orphaned blocking op cannot stall process exit either.
+const ABORT_JOIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Extracts the source name from a processing key of the form "source:issue_id".
 fn source_from_processing_key(key: &str) -> &str {
     key.split_once(':').map_or(key, |(source, _)| source)
@@ -247,9 +266,19 @@ pub struct Watcher {
     /// agent-based (Claude Code) by default, local-LLM-based when `qa.use_llm` is
     /// set.
     intent_classifier: Option<Arc<dyn crate::intent::IntentClassifier>>,
-    /// Join handles for spawned issue-processing tasks (used by tests to drain).
+    /// Join handles for in-flight issue-processing tasks.
+    ///
+    /// Finished handles are reaped by [`Self::reap_finished_spawn_handles`] so the
+    /// list stays bounded by concurrency rather than by issues-processed-ever.
     spawn_handles: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
+
+/// A ledger comment carried by a review batch: `(scm_comment_id, comment_kind)`.
+type CommentRef = (i64, &'static str);
+
+/// Actionable review feedback grouped for one PR:
+/// `(pr_url, feedback_summary, feedback_count, comment_refs)`.
+type PrReviewFeedback = (String, String, usize, Vec<CommentRef>);
 
 impl Watcher {
     /// Create a new watcher.
@@ -336,10 +365,26 @@ impl Watcher {
         }
     }
 
+    /// Drop the join handles of issue-processing tasks that have already finished.
+    ///
+    /// Tokio keeps a task's allocation alive until both the scheduler and the last
+    /// `JoinHandle` are dropped. Retaining handles for completed tasks therefore
+    /// pins one whole `process_issue` state machine per issue for the lifetime of
+    /// the daemon, which grows RSS without bound until the container is OOM-killed.
+    /// Called once per poll cycle and on every dispatch.
+    async fn reap_finished_spawn_handles(&self) {
+        let mut handles = self.spawn_handles.lock().await;
+        handles.retain(|handle| !handle.is_finished());
+        // Also release the backing capacity of an unusually large burst.
+        if handles.capacity() > handles.len().saturating_mul(4) + 16 {
+            handles.shrink_to_fit();
+        }
+    }
+
     /// Wait for all spawned issue-processing tasks to complete.
     ///
-    /// Primarily useful in tests that need to assert on processing outcomes
-    /// after a non-blocking `poll_source` call.
+    /// Used on graceful shutdown, and by tests that need to assert on processing
+    /// outcomes after a non-blocking `poll_source` call.
     pub async fn drain_spawned_tasks(&self) {
         let handles: Vec<_> = {
             let mut guard = self.spawn_handles.lock().await;
@@ -1138,32 +1183,83 @@ impl Watcher {
     /// all in-progress work completes before the application exits.
     pub async fn stop_and_drain(&self) {
         self.stop();
+        self.drain_or_abort(GRACEFUL_DRAIN_BUDGET).await;
+    }
 
-        // Wait for any active processing to complete (up to 30 seconds).
-        // Uses slot_available to wake immediately when a task finishes rather
-        // than polling on a fixed interval.
-        let max_wait = std::time::Duration::from_secs(30);
-        let start = std::time::Instant::now();
+    /// Drain in-flight issue-processing tasks, giving them `budget` to finish
+    /// gracefully and then aborting any stragglers.
+    ///
+    /// `stop()` has already cleared is_running, so no new tasks are recorded.
+    /// The two failure modes this balances, both flagged in review:
+    /// - Returning early while a task still runs let runtime teardown abort it
+    ///   mid-operation and misreport a graceful stop. So we wait for real
+    ///   completion within the budget, and any straggler is aborted *explicitly*
+    ///   and logged here rather than left to implicit teardown.
+    /// - Waiting with no deadline stalled a non-interactive shutdown (e.g. a
+    ///   redeploy's SIGTERM) when a task was wedged in an external git/LLM
+    ///   operation with no internal timeout. So the wait is bounded.
+    ///
+    /// Cancel-safe: handles are joined via `&mut`, so the timeout drops only the
+    /// borrow — the owned `handles` survive for the abort pass, never detached.
+    async fn drain_or_abort(&self, budget: std::time::Duration) {
+        // Safe to take: is_running is already false and dispatch re-checks it
+        // under this same lock, so nothing new is pushed after this take.
+        let mut handles: Vec<_> = {
+            let mut guard = self.spawn_handles.lock().await;
+            std::mem::take(&mut *guard)
+        };
 
-        while self.active_processing.load(Ordering::SeqCst) > 0 {
-            if start.elapsed() > max_wait {
-                tracing::warn!(
-                    remaining = self.active_processing.load(Ordering::SeqCst),
-                    "Graceful shutdown timeout reached, some tasks may not have completed"
-                );
-                break;
+        let joined = tokio::time::timeout(budget, async {
+            for handle in &mut handles {
+                let _ = handle.await;
             }
-            tracing::info!(
-                active_count = self.active_processing.load(Ordering::SeqCst),
-                "Waiting for active tasks to complete..."
-            );
-            // Wait for a task to finish (notifies via slot_available) or fall back
-            // to a periodic check in case the notification was missed.
-            let remaining = max_wait.saturating_sub(start.elapsed());
-            let _ = tokio::time::timeout(remaining, self.slot_available.notified()).await;
+        })
+        .await;
+
+        if joined.is_ok() {
+            tracing::info!("Claude Watcher stopped gracefully");
+            return;
         }
 
-        tracing::info!("Claude Watcher stopped gracefully");
+        // Budget exhausted: abort the still-running stragglers deterministically
+        // instead of stalling shutdown or leaving them for runtime teardown.
+        let mut aborted = 0usize;
+        for handle in &mut handles {
+            if !handle.is_finished() {
+                handle.abort();
+                aborted += 1;
+            }
+        }
+        // Bound the post-abort join too. Aborting a task parked in synchronous
+        // blocking work (block_in_place around an LLM call) does not preempt it,
+        // so an unbounded await here would let a wedged operation stall shutdown
+        // despite the budget. Joined via &mut so the timeout drops only the
+        // borrow; handles still unfinished are dropped when the vec goes out of
+        // scope, detached for imminent runtime teardown.
+        //
+        // Skip already-finished handles: the graceful pass may have polled some
+        // to completion before it timed out on a later one, and awaiting a
+        // JoinHandle again after it returned `Ready` panics.
+        let reaped = tokio::time::timeout(ABORT_JOIN_GRACE, async {
+            for handle in &mut handles {
+                if handle.is_finished() {
+                    continue;
+                }
+                let _ = handle.await;
+            }
+        })
+        .await;
+        let detached = if reaped.is_ok() {
+            0
+        } else {
+            handles.iter().filter(|h| !h.is_finished()).count()
+        };
+        tracing::warn!(
+            aborted,
+            detached,
+            budget_secs = budget.as_secs(),
+            "Graceful shutdown budget exhausted; aborted in-flight tasks to avoid stalling shutdown"
+        );
     }
 
     /// Check if the watcher is currently running.
@@ -1226,7 +1322,7 @@ impl Watcher {
     ///
     /// This polls the ReviewWatcher for any new CHANGES_REQUESTED or COMMENTED reviews
     /// and triggers Claude to address the feedback.
-    pub async fn check_reviews(&self) -> Result<()> {
+    pub async fn check_reviews(self: &Arc<Self>) -> Result<()> {
         let review_watcher = match &self.review_watcher {
             Some(rw) => rw,
             None => return Ok(()),
@@ -1234,7 +1330,8 @@ impl Watcher {
 
         // Check for new reviews
         let events = review_watcher.check_for_reviews().await?;
-        for (pr_url, feedback_summary, feedback_count) in Self::group_review_feedback_by_pr(events)
+        for (pr_url, feedback_summary, feedback_count, comment_refs) in
+            Self::group_review_feedback_by_pr(events)
         {
             tracing::info!(
                 pr_url = %pr_url,
@@ -1252,24 +1349,60 @@ impl Watcher {
                         status = %attempt.status,
                         "Skipping review feedback for terminal attempt status"
                     );
+                    // The PR is merged/closed/cannot-fix: close out the ledger so
+                    // its comments stop being re-surfaced, then stop watching.
+                    if let Err(e) = self.tracker.mark_pr_review_comments_handled(&pr_url) {
+                        tracing::warn!(pr_url = %pr_url, error = %e, "Failed to close review-comment ledger for terminal PR");
+                    }
                     review_watcher.unwatch_pr(&pr_url);
                     continue;
                 }
-                if let Err(e) = self
+                match self
                     .process_review_action(&attempt, &feedback_summary)
                     .await
                 {
-                    tracing::error!(
-                        pr_url = %pr_url,
-                        error = %e,
-                        "Failed to process review feedback"
-                    );
+                    Ok(()) => {
+                        // Durably handled: acknowledge exactly the comments in this
+                        // batch so they aren't re-surfaced, without touching any
+                        // comment recorded concurrently while we were processing.
+                        if let Err(e) = self
+                            .tracker
+                            .mark_pr_review_comments_handled_by_ids(&pr_url, &comment_refs)
+                        {
+                            tracing::warn!(pr_url = %pr_url, error = %e, "Failed to mark review comments handled");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            pr_url = %pr_url,
+                            error = %e,
+                            "Failed to process review feedback; will retry next cycle"
+                        );
+                        // Leave the batch's comments unhandled so they retry, but
+                        // count the failure so a poison comment eventually gives up.
+                        if let Err(e) = self.tracker.note_pr_review_comment_failure_by_ids(
+                            &pr_url,
+                            &comment_refs,
+                            MAX_REVIEW_COMMENT_ATTEMPTS,
+                        ) {
+                            tracing::warn!(pr_url = %pr_url, error = %e, "Failed to record review-comment failure");
+                        }
+                    }
                 }
             } else {
                 tracing::warn!(
                     pr_url = %pr_url,
                     "Received review for unknown PR, skipping"
                 );
+                // No attempt to act on; count it as a failure so this batch's
+                // uncorrelated comments don't re-surface forever.
+                if let Err(e) = self.tracker.note_pr_review_comment_failure_by_ids(
+                    &pr_url,
+                    &comment_refs,
+                    MAX_REVIEW_COMMENT_ATTEMPTS,
+                ) {
+                    tracing::warn!(pr_url = %pr_url, error = %e, "Failed to record review-comment failure");
+                }
             }
         }
 
@@ -1283,8 +1416,16 @@ impl Watcher {
         )
     }
 
-    fn group_review_feedback_by_pr(events: Vec<ReviewEvent>) -> Vec<(String, String, usize)> {
+    /// Group actionable review events per PR into (pr_url, feedback_summary,
+    /// feedback_count, comment_refs). `comment_refs` are exactly the ledger comments
+    /// carried by the batch as `(scm_comment_id, comment_kind)`, so acknowledgement
+    /// targets those specific rows rather than the whole PR (which would wrongly
+    /// mark a concurrently-recorded comment handled) or a colliding id in the other
+    /// namespace.
+    fn group_review_feedback_by_pr(events: Vec<ReviewEvent>) -> Vec<PrReviewFeedback> {
         let mut feedback_by_pr: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        let mut refs_by_pr: std::collections::HashMap<String, Vec<CommentRef>> =
             std::collections::HashMap::new();
         let mut pr_order: Vec<String> = Vec::new();
 
@@ -1297,6 +1438,10 @@ impl Watcher {
             if !feedback_by_pr.contains_key(&pr_url) {
                 pr_order.push(pr_url.clone());
             }
+            refs_by_pr
+                .entry(pr_url.clone())
+                .or_default()
+                .extend(event.comment_refs());
             feedback_by_pr
                 .entry(pr_url)
                 .or_default()
@@ -1306,9 +1451,10 @@ impl Watcher {
         pr_order
             .into_iter()
             .filter_map(|pr_url| {
+                let refs = refs_by_pr.remove(&pr_url).unwrap_or_default();
                 feedback_by_pr.remove(&pr_url).map(|feedbacks| {
                     let count = feedbacks.len();
-                    (pr_url, feedbacks.join("\n\n---\n\n"), count)
+                    (pr_url, feedbacks.join("\n\n---\n\n"), count, refs)
                 })
             })
             .collect()
@@ -1319,7 +1465,7 @@ impl Watcher {
     /// This creates a new Claude session with the original issue context plus
     /// the review feedback appended to help Claude understand what to fix.
     async fn process_review_action(
-        &self,
+        self: &Arc<Self>,
         attempt: &claudear_core::types::FixAttempt,
         feedback: &str,
     ) -> Result<()> {
@@ -2352,7 +2498,7 @@ Create a PR with your changes.{custom_instructions}"#,
 
     /// Run housekeeping tasks: retries, cascades, and metrics.
     /// Called on the global timer, separate from per-source polling.
-    pub async fn run_housekeeping_cycle(&self) -> Result<()> {
+    pub async fn run_housekeeping_cycle(self: &Arc<Self>) -> Result<()> {
         let housekeeping_started_at = std::time::Instant::now();
 
         // Run retries, PR merge cascades, and release cascades concurrently
@@ -2419,7 +2565,7 @@ Create a PR with your changes.{custom_instructions}"#,
     }
 
     /// Process any issues that are ready for retry.
-    async fn process_ready_retries(&self) -> Result<()> {
+    async fn process_ready_retries(self: &Arc<Self>) -> Result<()> {
         // Skip retries while paused for rate limits — attempting them would
         // just burn retry attempts without doing any work.
         if self.is_rate_limit_paused().await {
@@ -2985,6 +3131,10 @@ Create a PR with your changes.{custom_instructions}"#,
 
     /// Poll a single source.
     async fn poll_source(self: &Arc<Self>, source: &Arc<dyn IssueSource>) -> Result<()> {
+        // Release tasks that finished since the last cycle before doing anything else,
+        // so an idle or rate-limit-paused watcher still frees their allocations.
+        self.reap_finished_spawn_handles().await;
+
         if self.is_rate_limit_paused().await {
             return Ok(());
         }
@@ -3189,9 +3339,22 @@ Create a PR with your changes.{custom_instructions}"#,
                 .expect("intent_classifier present (checked by qa_split_enabled)");
             let mut intents: Vec<Intent> = Vec::with_capacity(ordered.len());
             for (issue, _) in &ordered {
+                // Ground the classification in the Discord reply thread (if any) so a
+                // follow-up in an ongoing QA conversation ("yes create a pr now") is
+                // classified in context and can escalate out of the read-only lane,
+                // instead of being judged as an isolated, ambiguous message. Only
+                // Claudear's own answers feed routing, so untrusted user text in the
+                // thread cannot inject a fix/PR escalation.
+                let conversation = crate::processing::assemble_reply_chain(
+                    &self.config,
+                    self.tracker.as_ref(),
+                    issue,
+                    crate::processing::TranscriptTrust::ClaudearOnly,
+                )
+                .await;
                 intents.push(
                     classifier
-                        .classify_intent(issue)
+                        .classify_intent(issue, conversation.as_deref())
                         .await
                         .unwrap_or(Intent::Fix),
                 );
@@ -3459,16 +3622,39 @@ Create a PR with your changes.{custom_instructions}"#,
                 self.slot_available.notified().await;
             }
 
+            // Carry the trusted routing intent (classified upstream on trusted
+            // content) so the answered attempt is stamped with it, letting the
+            // reply-chain transcript emit a structural marker instead of
+            // re-injecting the generated answer body into the classifier.
+            let mut issue = issue;
+            if let Some(intent) = intent {
+                issue.set_metadata("routing_intent", intent.routing_label());
+            }
+
             // Spawn processing as a background task so poll_source returns promptly and
             // the housekeeping loop (review checks, auto-close, retries) is not starved.
             let watcher = Arc::clone(self);
             let source_clone = Arc::clone(source);
-            let handle = tokio::spawn(async move {
-                watcher
-                    .process_issue(source_clone, issue, match_result, None, None, intent)
-                    .await;
-            });
-            self.spawn_handles.lock().await.push(handle);
+            {
+                let mut handles = self.spawn_handles.lock().await;
+                // Re-check is_running under the same lock that drain_spawned_tasks
+                // takes, then spawn+record atomically. This closes the shutdown
+                // race: once stop() has set is_running=false (before the drain),
+                // a dispatch either records its handle before the drain's take (so
+                // shutdown joins it) or sees the stop here and never spawns. The
+                // top-of-loop check is not enough on its own — it runs before the
+                // spawn, so a concurrent drain could take the vector between it and
+                // the push.
+                if !self.is_running.load(Ordering::SeqCst) {
+                    break;
+                }
+                handles.retain(|h| !h.is_finished());
+                handles.push(tokio::spawn(async move {
+                    watcher
+                        .process_issue(source_clone, issue, match_result, None, None, intent)
+                        .await;
+                }));
+            }
 
             // Add delay between starting new issues (skip trailing delay after the last item).
             if i + 1 < total && self.config.processing_delay_ms > 0 {
@@ -3870,10 +4056,13 @@ Create a PR with your changes.{custom_instructions}"#,
             review_feedback,
             existing_pr_branch,
             intent,
+            diagnosis: None,
         };
 
         let context_provider = crate::processing::SourceContext(source.as_ref());
-        let outcome = processor.run(input, &context_provider).await;
+        // Box the pipeline future: `run` inlines the whole processing state machine,
+        // so awaiting it directly would make every spawned task allocation carry it.
+        let outcome = Box::pin(processor.run(input, &context_provider)).await;
 
         // Watcher-specific: check for rate limit errors and pause if needed
         if let ProcessingOutcome::Failed { ref error } = outcome {
@@ -4448,7 +4637,7 @@ Create a PR with your changes.{custom_instructions}"#,
     }
 
     /// Manually trigger processing for a specific issue.
-    pub async fn trigger_issue(&self, source_name: &str, issue_id: &str) -> Result<()> {
+    pub async fn trigger_issue(self: &Arc<Self>, source_name: &str, issue_id: &str) -> Result<()> {
         self.trigger_issue_with_feedback(
             source_name,
             issue_id,
@@ -4461,7 +4650,7 @@ Create a PR with your changes.{custom_instructions}"#,
 
     /// Manually trigger processing for a specific issue with optional review feedback context.
     pub async fn trigger_issue_with_feedback(
-        &self,
+        self: &Arc<Self>,
         source_name: &str,
         issue_id: &str,
         review_feedback: Option<String>,
@@ -4488,16 +4677,52 @@ Create a PR with your changes.{custom_instructions}"#,
             issue.set_metadata("trigger_reason", reason);
         }
 
-        let started = self
-            .process_issue(
-                Arc::clone(source),
-                issue,
-                match_result,
-                review_feedback,
-                existing_pr_branch,
-                None,
-            )
-            .await;
+        // Run processing as a tracked background task rather than inline. Retries
+        // and review-feedback both reach this path from the housekeeping loop; if
+        // process_issue ran inline it would be part of that loop's future and get
+        // aborted mid-operation on shutdown (the select! in start() drops the
+        // losing branch, and drain_or_abort only joins spawn_handles). Spawning
+        // into spawn_handles makes the work survive the drop and be joined by the
+        // graceful drain, exactly like the poll-loop dispatch path.
+        //
+        // `started_rx` preserves the original synchronous contract: it fires at
+        // the end of process_issue, so awaiting it here blocks until processing
+        // completes and yields whether it actually began. If the caller is dropped
+        // on shutdown, the spawned task keeps running and drain joins it.
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let watcher = Arc::clone(self);
+        let source = Arc::clone(source);
+        {
+            let mut handles = self.spawn_handles.lock().await;
+            // Re-check is_running under the same lock drain_or_abort takes, then
+            // push atomically. This closes the shutdown race: a trigger either
+            // records its handle before the drain's take (so shutdown joins it)
+            // or sees the stop here and never spawns.
+            if !self.is_running.load(Ordering::SeqCst) {
+                return Err(claudear_core::error::Error::source(
+                    source_name,
+                    format!("Watcher stopping; trigger for {} not started", issue_id),
+                ));
+            }
+            handles.retain(|h| !h.is_finished());
+            handles.push(tokio::spawn(async move {
+                let started = watcher
+                    .process_issue(
+                        source,
+                        issue,
+                        match_result,
+                        review_feedback,
+                        existing_pr_branch,
+                        None,
+                    )
+                    .await;
+                let _ = started_tx.send(started);
+            }));
+        }
+
+        // A dropped sender (task aborted by drain before it finished) reports
+        // not-started; during shutdown the caller is typically already gone.
+        let started = started_rx.await.unwrap_or(false);
         if !started {
             return Err(claudear_core::error::Error::source(
                 source_name,
@@ -4568,6 +4793,7 @@ Create a PR with your changes.{custom_instructions}"#,
             review_feedback: None,
             existing_pr_branch: None,
             intent: None,
+            diagnosis: None,
         };
 
         let context_provider = crate::processing::SourceContext(source.as_ref());
@@ -5023,6 +5249,248 @@ mod tests {
             dry_run,
             llm_engine: None,
         }))
+    }
+
+    /// Completed issue-processing tasks must not stay pinned in `spawn_handles`.
+    ///
+    /// Tokio frees a task's allocation only once the scheduler *and* the last
+    /// `JoinHandle` are gone, so a push-only handle list leaks one whole
+    /// `process_issue` state machine per issue, growing the daemon's RSS until
+    /// the container is OOM-killed.
+    #[tokio::test]
+    async fn test_watcher_reaps_finished_spawn_handles() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        // Source with no issues: this test is about reaping, not dispatching.
+        let source = Arc::new(MockSource::new("reap")) as Arc<dyn IssueSource>;
+
+        let watcher = create_test_watcher(notifier, tracker, vec![source.clone()], false);
+        watcher.is_running.store(true, Ordering::SeqCst);
+
+        // Stand in for the handles left behind by 64 already-processed issues.
+        {
+            let mut handles = watcher.spawn_handles.lock().await;
+            for _ in 0..64 {
+                handles.push(tokio::spawn(async {}));
+            }
+        }
+
+        // Let every simulated task run to completion.
+        for _ in 0..1000 {
+            if watcher
+                .spawn_handles
+                .lock()
+                .await
+                .iter()
+                .all(|handle| handle.is_finished())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        // A normal poll cycle must release them; nothing calls drain in production.
+        watcher.poll_source(&source).await.unwrap();
+
+        let retained = watcher.spawn_handles.lock().await.len();
+        assert_eq!(
+            retained, 0,
+            "watcher retained {retained} handles for completed issue-processing tasks; \
+             each one pins a full process_issue allocation for the daemon's lifetime"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stop_and_drain_joins_recorded_task() {
+        use std::sync::atomic::AtomicBool;
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let source = Arc::new(MockSource::new("drain")) as Arc<dyn IssueSource>;
+        let watcher = create_test_watcher(notifier, tracker, vec![source], false);
+        watcher.is_running.store(true, Ordering::SeqCst);
+
+        // A recorded task whose teardown completes shortly after it is spawned.
+        let done = Arc::new(AtomicBool::new(false));
+        let done_clone = Arc::clone(&done);
+        {
+            let mut handles = watcher.spawn_handles.lock().await;
+            handles.push(tokio::spawn(async move {
+                tokio::task::yield_now().await;
+                done_clone.store(true, Ordering::SeqCst);
+            }));
+        }
+
+        // Graceful shutdown must wait for the recorded task's teardown rather than
+        // reporting a clean stop while it is still mutating shared state.
+        watcher.stop_and_drain().await;
+
+        assert!(
+            done.load(Ordering::SeqCst),
+            "stop_and_drain returned before the recorded task finished; a \
+             concurrently processing issue could still be mutating tracker/notifier/agent state"
+        );
+        assert!(
+            watcher.spawn_handles.lock().await.is_empty(),
+            "drain must release recorded handles"
+        );
+        assert!(!watcher.is_running.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_stop_and_drain_joins_task_to_completion() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let source = Arc::new(MockSource::new("drain")) as Arc<dyn IssueSource>;
+        let watcher = create_test_watcher(notifier, tracker, vec![source], false);
+        watcher.is_running.store(true, Ordering::SeqCst);
+
+        // An in-flight task that only finishes after a delay. Shutdown must wait
+        // for it to complete rather than returning and letting it be aborted.
+        let done = Arc::new(AtomicBool::new(false));
+        let done_clone = Arc::clone(&done);
+        {
+            let mut handles = watcher.spawn_handles.lock().await;
+            handles.push(tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                done_clone.store(true, Ordering::SeqCst);
+            }));
+        }
+
+        watcher.stop_and_drain().await;
+
+        assert!(
+            done.load(Ordering::SeqCst),
+            "stop_and_drain returned before the in-flight task completed; runtime \
+             teardown would then abort it mid-operation"
+        );
+        assert!(watcher.spawn_handles.lock().await.is_empty());
+        assert!(!watcher.is_running.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_drain_or_abort_bounds_wedged_task() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let source = Arc::new(MockSource::new("drain")) as Arc<dyn IssueSource>;
+        let watcher = create_test_watcher(notifier, tracker, vec![source], false);
+
+        // A task wedged far longer than the budget (stands in for an external
+        // git/LLM op with no internal timeout).
+        let done = Arc::new(AtomicBool::new(false));
+        let done_clone = Arc::clone(&done);
+        {
+            let mut handles = watcher.spawn_handles.lock().await;
+            handles.push(tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                done_clone.store(true, Ordering::SeqCst);
+            }));
+        }
+
+        // Shutdown must not stall: it returns within the (tiny) budget, aborting
+        // the straggler rather than waiting for it or leaving it detached.
+        let start = Instant::now();
+        watcher.drain_or_abort(Duration::from_millis(50)).await;
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "drain_or_abort stalled past its budget"
+        );
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "the wedged task was aborted, not awaited to completion"
+        );
+        assert!(watcher.spawn_handles.lock().await.is_empty());
+    }
+
+    /// A task parked in synchronous blocking work does not observe `abort()`
+    /// until it returns, so the post-abort join must be bounded too or a wedged
+    /// LLM call stalls shutdown despite the budget.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_drain_or_abort_bounds_post_abort_join_for_blocking_task() {
+        use std::time::{Duration, Instant};
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let source = Arc::new(MockSource::new("drain")) as Arc<dyn IssueSource>;
+        let watcher = create_test_watcher(notifier, tracker, vec![source], false);
+
+        // Blocking recv() never yields to the scheduler, so aborting the task has
+        // no effect until it is released — a stand-in for block_in_place bridging
+        // a wedged LLM call.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        {
+            let mut handles = watcher.spawn_handles.lock().await;
+            handles.push(tokio::spawn(async move {
+                let _ = release_rx.recv();
+            }));
+        }
+
+        // With an unbounded post-abort join this only returns once the task is
+        // released; the abort-join grace must cap it instead.
+        let start = Instant::now();
+        let drained = tokio::time::timeout(
+            Duration::from_secs(20),
+            watcher.drain_or_abort(Duration::from_millis(50)),
+        )
+        .await;
+        let elapsed = start.elapsed();
+        // Release the wedged worker so runtime teardown is prompt regardless.
+        let _ = release_tx.send(());
+
+        assert!(
+            drained.is_ok(),
+            "drain_or_abort never returned; post-abort join is unbounded for a \
+             task wedged in non-preemptible blocking work"
+        );
+        assert!(
+            elapsed < ABORT_JOIN_GRACE + Duration::from_secs(3),
+            "post-abort join stalled shutdown past the abort grace"
+        );
+    }
+
+    /// The graceful pass may poll some handles to completion before it times out
+    /// on a later one; the post-abort pass must not re-poll those, as awaiting a
+    /// `JoinHandle` again after it returned `Ready` panics.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_drain_or_abort_no_double_poll_of_completed_handle() {
+        use std::time::Duration;
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let source = Arc::new(MockSource::new("drain")) as Arc<dyn IssueSource>;
+        let watcher = create_test_watcher(notifier, tracker, vec![source], false);
+
+        // Ordering is the point: a completed handle precedes a wedged one, so the
+        // graceful pass polls the first to completion and then times out on the
+        // second.
+        let done = tokio::spawn(async {});
+        while !done.is_finished() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let wedged = tokio::spawn(async move {
+            let _ = release_rx.recv();
+        });
+        {
+            let mut handles = watcher.spawn_handles.lock().await;
+            handles.push(done);
+            handles.push(wedged);
+        }
+
+        // Must return (not panic) despite the completed-then-wedged ordering.
+        let drained = tokio::time::timeout(
+            Duration::from_secs(20),
+            watcher.drain_or_abort(Duration::from_millis(50)),
+        )
+        .await;
+        // Release the wedged worker so runtime teardown is prompt.
+        let _ = release_tx.send(());
+
+        assert!(
+            drained.is_ok(),
+            "drain_or_abort stalled or panicked re-polling a completed handle"
+        );
     }
 
     #[test]
@@ -6276,6 +6744,61 @@ mod tests {
         assert!(grouped[0].1.contains("first"));
         assert!(grouped[0].1.contains("second"));
         assert!(grouped[0].1.contains("---"));
+        // Reviews carry no ledger comment ids.
+        assert!(grouped[0].3.is_empty());
+    }
+
+    #[test]
+    fn test_group_review_feedback_collects_comment_ids() {
+        // CommentsAdded events contribute their comment ids so acknowledgement can
+        // target exactly the batch, not the whole PR.
+        let mk = |id: i64| claudear_integrations::scm::ReviewComment {
+            id,
+            path: String::new(),
+            position: None,
+            original_position: None,
+            body: "@claudear fix".to_string(),
+            user: claudear_integrations::scm::ReviewUser {
+                id: 1,
+                login: "reviewer".to_string(),
+                user_type: None,
+            },
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+            html_url: format!("h{}", id),
+            pull_request_review_id: None,
+            start_line: None,
+            line: None,
+            side: None,
+        };
+        let events = vec![
+            claudear_integrations::scm::ReviewEvent::CommentsAdded {
+                pr_url: "https://github.com/org/repo/pull/1".to_string(),
+                repo: "org/repo".to_string(),
+                pr_number: 1,
+                comments: vec![mk(101), mk(102)],
+            },
+            claudear_integrations::scm::ReviewEvent::CommentsAdded {
+                pr_url: "https://github.com/org/repo/pull/1".to_string(),
+                repo: "org/repo".to_string(),
+                pr_number: 1,
+                comments: vec![mk(103)],
+            },
+        ];
+
+        let grouped = Watcher::group_review_feedback_by_pr(events);
+        assert_eq!(grouped.len(), 1);
+        let mut refs = grouped[0].3.clone();
+        refs.sort();
+        // Empty-path comments are conversation-kind; each ref namespaces its id.
+        assert_eq!(
+            refs,
+            vec![
+                (101, "conversation"),
+                (102, "conversation"),
+                (103, "conversation")
+            ]
+        );
     }
 
     #[tokio::test]
@@ -6434,6 +6957,9 @@ mod tests {
         let sources = vec![source];
 
         let watcher = create_test_watcher(notifier, tracker, sources, true); // dry run
+                                                                             // Manual triggers only arrive while the daemon is running; the trigger now
+                                                                             // spawns tracked work and refuses once the watcher is stopping.
+        watcher.is_running.store(true, Ordering::SeqCst);
 
         let result = watcher.trigger_issue("mock", "123").await;
         // Should succeed in dry run (doesn't actually process)
@@ -6456,6 +6982,7 @@ mod tests {
         let sources = vec![source];
 
         let watcher = create_test_watcher(notifier, tracker, sources, true);
+        watcher.is_running.store(true, Ordering::SeqCst);
         {
             let mut processing = watcher.processing.write().await;
             processing.insert("mock:123".to_string());
@@ -6467,6 +6994,63 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("already being processed"));
+    }
+
+    /// Retries and review feedback trigger processing through
+    /// [`Watcher::trigger_issue_with_feedback`]. That processing must run as a
+    /// tracked task in `spawn_handles` so graceful shutdown drains it, rather
+    /// than inline where the housekeeping loop's cancellation would abort it
+    /// mid-operation. Regression for the inline-processing-escapes-drain bug.
+    #[tokio::test]
+    async fn test_trigger_records_spawn_handle_for_drain() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let issues = vec![Issue::new(
+            "123",
+            "T-123",
+            "Test Issue",
+            "http://example.com/123",
+            "mock",
+        )];
+        let source = Arc::new(MockSource::with_issues("mock", issues)) as Arc<dyn IssueSource>;
+
+        let watcher = create_test_watcher(notifier, tracker, vec![source], true); // dry run
+        watcher.is_running.store(true, Ordering::SeqCst);
+
+        assert!(watcher.spawn_handles.lock().await.is_empty());
+
+        watcher.trigger_issue("mock", "123").await.unwrap();
+
+        // The processing task was recorded in spawn_handles (retained until the
+        // next reap), so drain_or_abort will join it on shutdown.
+        assert_eq!(watcher.spawn_handles.lock().await.len(), 1);
+    }
+
+    /// A trigger that arrives after the watcher has stopped must not spawn new
+    /// tracked work, or it could push a handle into spawn_handles after
+    /// drain_or_abort already took the vector and be missed by the drain.
+    #[tokio::test]
+    async fn test_trigger_refuses_once_stopped() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let issues = vec![Issue::new(
+            "123",
+            "T-123",
+            "Test Issue",
+            "http://example.com/123",
+            "mock",
+        )];
+        let source = Arc::new(MockSource::with_issues("mock", issues)) as Arc<dyn IssueSource>;
+
+        let watcher = create_test_watcher(notifier, tracker, vec![source], true);
+        // is_running left false: watcher is stopping / not started.
+
+        let result = watcher.trigger_issue("mock", "123").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("stopping"));
+        assert!(watcher.spawn_handles.lock().await.is_empty());
     }
 
     #[test]
@@ -7344,21 +7928,30 @@ mod tests {
 
         let watcher = Arc::new(create_test_watcher(notifier, tracker, sources, false));
         watcher.is_running.store(true, Ordering::SeqCst);
-        watcher.active_processing.fetch_add(1, Ordering::SeqCst);
 
-        // Simulate task finishing after a short delay
+        // A handle-tracked in-flight task, mirroring process_issue: it holds an
+        // active_processing count and clears it only when it finishes. Shutdown
+        // must wait for the handle, so the count is 0 by the time it returns.
+        watcher.active_processing.fetch_add(1, Ordering::SeqCst);
         let release = Arc::clone(&watcher);
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            release.active_processing.fetch_sub(1, Ordering::SeqCst);
-            release.slot_available.notify_waiters();
-        });
+        {
+            let mut handles = watcher.spawn_handles.lock().await;
+            handles.push(tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                release.active_processing.fetch_sub(1, Ordering::SeqCst);
+                release.slot_available.notify_waiters();
+            }));
+        }
 
         let result =
             tokio::time::timeout(std::time::Duration::from_secs(5), watcher.stop_and_drain()).await;
         assert!(result.is_ok(), "stop_and_drain timed out");
         assert!(!watcher.is_running());
-        assert_eq!(watcher.active_count(), 0);
+        assert_eq!(
+            watcher.active_count(),
+            0,
+            "shutdown waited for the in-flight task to finish"
+        );
     }
 
     #[test]
@@ -9756,23 +10349,17 @@ mod tests {
         let watcher = Arc::new(create_test_watcher(notifier, tracker, vec![], false));
         watcher.is_running.store(true, Ordering::SeqCst);
 
-        // Simulate a task that never completes (active count stays > 0)
-        watcher.active_processing.store(1, Ordering::SeqCst);
-
-        // stop_and_drain has a 5-minute internal timeout, but we use an outer timeout
-        // We just verify it eventually returns (the internal max_wait breaks the loop)
+        // A stray active_processing count with no recorded handle must not wedge
+        // shutdown: stop_and_drain waits on the spawn_handles, which are empty
+        // here, so it returns promptly and clears is_running.
         let result =
             tokio::time::timeout(std::time::Duration::from_secs(10), watcher.stop_and_drain())
                 .await;
-        // In test the internal max_wait is 300s which we can't wait for,
-        // so this test verifies the method was called correctly and stop was set
-        // The timeout will trigger because 300s > 10s, but that's fine
-        if result.is_err() {
-            // Timed out externally - that's expected since internal timeout is 300s
-            assert!(!watcher.is_running());
-        } else {
-            assert!(!watcher.is_running());
-        }
+        assert!(
+            result.is_ok(),
+            "stop_and_drain should return promptly with no handles"
+        );
+        assert!(!watcher.is_running());
     }
 
     #[tokio::test]

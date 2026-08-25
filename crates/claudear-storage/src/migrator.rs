@@ -56,6 +56,21 @@ const MIGRATIONS: &[Migration] = &[
         name: "answer_message_ids",
         sql: include_str!("../../../migrations/V8__answer_message_ids.sql"),
     },
+    Migration {
+        version: 9,
+        name: "pr_review_states_issue_comments",
+        sql: include_str!("../../../migrations/V9__pr_review_states_issue_comments.sql"),
+    },
+    Migration {
+        version: 10,
+        name: "agent_instructions",
+        sql: include_str!("../../../migrations/V10__agent_instructions.sql"),
+    },
+    Migration {
+        version: 11,
+        name: "fix_attempt_routing_intent",
+        sql: include_str!("../../../migrations/V11__fix_attempt_routing_intent.sql"),
+    },
 ];
 
 /// Run all pending migrations against the given connection.
@@ -116,7 +131,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 11);
 
         // Verify a table from V1 exists
         let count: u32 = conn
@@ -137,6 +152,55 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_col, 1);
+
+        // Verify the V9 columns exist: the issue-comment cursor on pr_review_states
+        // and the handled ledger on pr_review_comments.
+        let has_issue_comment_col: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('pr_review_states') WHERE name = 'last_issue_comment_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_issue_comment_col, 1);
+
+        let has_handled_col: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('pr_review_comments') WHERE name = 'handled_at'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_handled_col, 1);
+
+        let has_kind_col: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('pr_review_comments') WHERE name = 'comment_kind'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_kind_col, 1);
+
+        // Verify the V10 table exists.
+        let has_instructions: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='agent_instructions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_instructions, 1);
+
+        // Verify the V11 column exists on fix_attempts.
+        let has_routing_intent: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('fix_attempts') WHERE name = 'routing_intent'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_routing_intent, 1);
     }
 
     #[test]
@@ -151,7 +215,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 11);
     }
 
     #[test]

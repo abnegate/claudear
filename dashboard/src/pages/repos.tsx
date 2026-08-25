@@ -4,12 +4,15 @@ import {
   fetchRepos,
   fetchRepoStats,
   fetchDependencies,
+  fetchRepoInstruction,
+  saveRepoInstruction,
   getWsBase,
   INDEXING_PROGRESS_WS_PATH,
   type StoredIndexedRepo,
   type IndexStats,
   type StoredDependency,
   type IndexingProgress,
+  type InstructionResponse,
 } from '../lib/api'
 import { PageHeader } from '../components/layout/page-header'
 import { BlockSkeleton, StatsGridSkeleton } from '../components/shared/page-skeletons'
@@ -20,7 +23,7 @@ import { Modal } from '../components/shared/modal'
 import { Tabs } from '../components/ui/tabs'
 import { Card, CardContent } from '../components/ui/card'
 import { formatNumber, formatDate } from '../lib/formatters'
-import { Database, FileText, Clock, ExternalLink, Loader2, GraduationCap } from 'lucide-react'
+import { Database, FileText, Clock, ExternalLink, Loader2, GraduationCap, Save, Bot, CheckCircle2, AlertTriangle } from 'lucide-react'
 import { useRouter } from '../router'
 
 const tabItems = [
@@ -112,6 +115,93 @@ function useIndexingProgress() {
   }, [connect])
 
   return progress
+}
+
+function RepoInstructionsEditor({ repo }: { repo: string }) {
+  const { data, error, isLoading, mutate } = useSWR<InstructionResponse>(
+    ['repo-instruction', repo],
+    () => fetchRepoInstruction(repo),
+  )
+  const [draft, setDraft] = useState<string | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [saved, setSaved] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
+
+  const serverText = data?.text ?? ''
+  const text = draft ?? serverText
+  const dirty = text !== serverText
+
+  const handleSave = useCallback(async () => {
+    const saved = text
+    setSaving(true)
+    setSaveError(null)
+    try {
+      await saveRepoInstruction(repo, saved)
+    } catch (e: any) {
+      setSaveError(e?.message || 'Failed to save instructions')
+      return
+    } finally {
+      setSaving(false)
+    }
+    // PUT persisted. Sync the cache optimistically from the known-saved value so
+    // a background revalidation failure can't misreport the save or blank the
+    // editor. Only clear the draft if the user has not typed more while the PUT
+    // was in flight, so newer edits are not discarded.
+    setDraft(prev => (prev === saved ? null : prev))
+    setSaved(true)
+    setTimeout(() => setSaved(false), 3000)
+    mutate(prev => (prev ? { ...prev, text: saved } : prev), { revalidate: false })
+  }, [repo, text, mutate])
+
+  return (
+    <div className="space-y-2 border-t pt-4">
+      <div className="flex items-center gap-2">
+        <Bot className="h-4 w-4 text-muted-foreground" />
+        <p className="text-sm font-medium">Agent Instructions</p>
+      </div>
+      <p className="text-xs text-muted-foreground">
+        Prepended to the agent's context for this repo, after the global instructions.
+        Describe the repo's role (e.g. generated output vs source). Never overwrites the
+        repo's own AGENTS.md.
+      </p>
+      {error ? (
+        <div className="flex items-center gap-2 text-sm text-red-600">
+          <AlertTriangle className="h-4 w-4" />
+          <span>Failed to load instructions: {error.message}. Editing is disabled to avoid overwriting.</span>
+        </div>
+      ) : (
+        <textarea
+          value={text}
+          onChange={e => setDraft(e.target.value)}
+          disabled={isLoading}
+          placeholder="e.g. This repo holds generated SDK output. Do not edit here; fix the sdk-generator repo instead."
+          className="w-full font-mono text-xs bg-muted/50 border rounded-md p-3 min-h-[120px] resize-y focus:outline-none focus:ring-2 focus:ring-primary/30 disabled:opacity-50"
+          spellCheck={false}
+        />
+      )}
+      <div className="flex items-center gap-3">
+        <button
+          onClick={handleSave}
+          disabled={saving || !dirty || !!error}
+          className="inline-flex items-center gap-1.5 rounded-md bg-green-600 text-white px-3 py-1.5 text-sm font-medium hover:bg-green-700 disabled:opacity-40 disabled:pointer-events-none transition-colors"
+        >
+          <Save className="h-4 w-4" />
+          {saving ? 'Saving...' : 'Save'}
+        </button>
+        {saved && !dirty && (
+          <span className="text-xs text-green-600 inline-flex items-center gap-1">
+            <CheckCircle2 className="h-3.5 w-3.5" /> Saved
+          </span>
+        )}
+        {dirty && !saveError && <span className="text-xs text-amber-600">Unsaved changes</span>}
+        {saveError && (
+          <span className="text-xs text-red-600 inline-flex items-center gap-1">
+            <AlertTriangle className="h-3.5 w-3.5" /> {saveError}
+          </span>
+        )}
+      </div>
+    </div>
+  )
 }
 
 export default function ReposPage() {
@@ -342,6 +432,8 @@ export default function ReposPage() {
               <GraduationCap className="h-4 w-4" />
               View Learning
             </button>
+
+            <RepoInstructionsEditor repo={selectedRepo.name} />
           </div>
         )}
       </Modal>
