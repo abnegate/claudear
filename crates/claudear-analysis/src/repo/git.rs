@@ -587,6 +587,20 @@ mod tests {
     use std::process::Command as StdCommand;
     use tempfile::TempDir;
 
+    /// Build a `file://` URL from a local path.
+    ///
+    /// On Windows, `Path::display()` emits backslashes (e.g. `C:\Users\...`),
+    /// but `file://` URLs require forward slashes (`file:///C:/Users/...`).
+    fn file_url(path: &Path) -> String {
+        let s = path.display().to_string().replace('\\', "/");
+        if s.starts_with('/') {
+            format!("file://{s}")
+        } else {
+            // Windows absolute path like C:/Users/... needs an extra /
+            format!("file:///{s}")
+        }
+    }
+
     /// Create a bare-minimum git repo in `path` with one commit on "main".
     fn init_git_repo(path: &Path) {
         StdCommand::new("git")
@@ -1145,7 +1159,7 @@ mod tests {
         let target_dir = TempDir::new().unwrap();
         let target = target_dir.path().join("cloned");
 
-        let url = format!("file://{}", origin.path().display());
+        let url = file_url(origin.path());
         let result = GitOps::ensure_repo_at_path(&target, &url, "main").await;
         assert!(result.is_ok(), "clone failed: {:?}", result.unwrap_err());
         assert!(target.join(".git").exists());
@@ -1160,7 +1174,7 @@ mod tests {
         let target_dir = TempDir::new().unwrap();
         let target = target_dir.path().join("cloned");
 
-        let url = format!("file://{}", origin.path().display());
+        let url = file_url(origin.path());
         GitOps::ensure_repo_at_path(&target, &url, "main")
             .await
             .unwrap();
@@ -1195,7 +1209,7 @@ mod tests {
         let target_dir = TempDir::new().unwrap();
         let target = target_dir.path().join("cloned");
 
-        let url = format!("file://{}", origin.path().display());
+        let url = file_url(origin.path());
         // Clone first
         GitOps::ensure_repo_at_path(&target, &url, "main")
             .await
@@ -1248,7 +1262,7 @@ mod tests {
 
         let target_dir = TempDir::new().unwrap();
         let target = target_dir.path().join("cloned");
-        let url = format!("file://{}", origin.path().display());
+        let url = file_url(origin.path());
         GitOps::ensure_repo_at_path(&target, &url, "main")
             .await
             .unwrap();
@@ -1269,7 +1283,7 @@ mod tests {
 
         let target_dir = TempDir::new().unwrap();
         let target = target_dir.path().join("cloned");
-        let url = format!("file://{}", origin.path().display());
+        let url = file_url(origin.path());
         GitOps::ensure_repo_at_path(&target, &url, "main")
             .await
             .unwrap();
@@ -1295,7 +1309,7 @@ mod tests {
 
         let target_dir = TempDir::new().unwrap();
         let target = target_dir.path().join("cloned");
-        let url = format!("file://{}", origin.path().display());
+        let url = file_url(origin.path());
         GitOps::ensure_repo_at_path(&target, &url, "main")
             .await
             .unwrap();
@@ -1556,7 +1570,7 @@ mod tests {
 
         let target_dir = TempDir::new().unwrap();
         let target = target_dir.path().join("cloned");
-        let url = format!("file://{}", origin.path().display());
+        let url = file_url(origin.path());
 
         // Clone
         GitOps::ensure_repo_at_path(&target, &url, "main")
@@ -1750,7 +1764,7 @@ mod tests {
 
         let target_dir = TempDir::new().unwrap();
         let target = target_dir.path().join("cloned");
-        let url = format!("file://{}", origin.path().display());
+        let url = file_url(origin.path());
 
         GitOps::ensure_repo_at_path(&target, &url, "main")
             .await
@@ -1806,7 +1820,7 @@ mod tests {
 
         let target_dir = TempDir::new().unwrap();
         let target = target_dir.path().join("cloned");
-        let url = format!("file://{}", origin.path().display());
+        let url = file_url(origin.path());
 
         GitOps::ensure_repo_at_path(&target, &url, "main")
             .await
@@ -2051,7 +2065,7 @@ mod tests {
 
         let workspace = TempDir::new().unwrap();
         let repo_path = workspace.path().join("repo");
-        let url = format!("file://{}", origin.path().display());
+        let url = file_url(origin.path());
 
         // 1) Clone
         GitOps::ensure_repo_at_path(&repo_path, &url, "main")
@@ -2190,7 +2204,7 @@ mod tests {
 
         let target_dir = TempDir::new().unwrap();
         let target = target_dir.path().join("cloned");
-        let url = format!("file://{}", origin.path().display());
+        let url = file_url(origin.path());
 
         // Clone via ensure_repo_at_path
         GitOps::ensure_repo_at_path(&target, &url, "main")
@@ -2290,7 +2304,7 @@ mod tests {
         // Clone
         let target_dir = TempDir::new().unwrap();
         let target = target_dir.path().join("cloned");
-        let url = format!("file://{}", origin.path().display());
+        let url = file_url(origin.path());
         GitOps::ensure_repo_at_path(&target, &url, "main")
             .await
             .unwrap();

@@ -9,12 +9,15 @@ tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "process
 # HTTP server & client
 axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
 axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
-reqwest = { version = "0.13", features = ["json", "form", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "form", "stream", "rustls-no-provider", "charset", "http2"] }
 tower = { version = "0.5", features = ["limit"] }
 tower-http = { version = "0.6", features = ["trace", "cors", "fs", "limit"] }
 
+# TLS (ring crypto provider for all rustls consumers)
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+
 # TLS auto-provisioning (Let's Encrypt ACME)
-rustls-acme = { version = "0.15", features = ["axum", "aws-lc-rs"] }
+rustls-acme = { version = "0.15", default-features = false, features = ["axum", "ring", "tls12", "webpki-roots"] }
 
 # Database
 rusqlite = { version = "0.39", features = ["bundled", "load_extension"] }
@@ -188,6 +191,9 @@ reqwest = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
 
+# TLS (ring crypto provider)
+rustls = { workspace = true }
+
 # TLS auto-provisioning (Let's Encrypt ACME)
 rustls-acme = { workspace = true }
 
@@ -320,6 +326,11 @@ openssl = { version = "0.10", features = ["vendored"] }
 # Process checking and IPC on Unix
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Process checking on Windows
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
 
 [dev-dependencies]
 mockall = { workspace = true }

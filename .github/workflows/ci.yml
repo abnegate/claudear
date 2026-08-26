@@ -17,6 +17,9 @@ jobs:
   compile:
     name: Compile
     runs-on: ubuntu-latest
+    env:
+      FASTEMBED_CACHE_DIR: /home/runner/.cache/fastembed
+      HF_HOME: /home/runner/.cache/fastembed
     steps:
       - uses: actions/checkout@v6
 
@@ -169,10 +172,23 @@ jobs:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
   build:
-    name: Build (macOS)
-    runs-on: macos-latest
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     env:
       RUSTFLAGS: "-Dwarnings"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS
+            os: macos-latest
+            artifact: claudear-macos
+            binary_path: target/release/claudear
+          - name: Windows
+            os: windows-latest
+            artifact: claudear-windows
+            binary_path: target/release/claudear.exe
     steps:
       - uses: actions/checkout@v6
 
@@ -192,6 +208,7 @@ jobs:
 
       - name: Create dashboard dist stub
         run: mkdir -p dashboard/dist && touch dashboard/dist/index.html
+        shell: bash
 
       - name: Build release
         run: cargo build --release
@@ -199,8 +216,55 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: claudear-macos
-          path: target/release/claudear
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.binary_path }}
+
+  test-windows:
+    name: Test (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Configure git
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Cache fastembed model
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}\.cache\fastembed
+          key: fastembed-nomic-v15-windows
+
+      - name: Compile tests
+        run: cargo test --all-features --no-run
+
+      - name: Warmup embedding model
+        timeout-minutes: 5
+        run: cargo test --all-features -- feedback::embeddings::tests::test_warmup_downloads_model --exact --nocapture
+        env:
+          FASTEMBED_CACHE_DIR: ${{ runner.temp }}\.cache\fastembed
+          HF_HOME: ${{ runner.temp }}\.cache\fastembed
+
+      - name: Run tests
+        timeout-minutes: 10
+        run: cargo test --all-features
+        env:
+          FASTEMBED_CACHE_DIR: ${{ runner.temp }}\.cache\fastembed
+          HF_HOME: ${{ runner.temp }}\.cache\fastembed
 
   dashboard:
     name: Dashboard

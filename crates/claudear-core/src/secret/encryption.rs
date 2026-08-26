@@ -196,13 +196,8 @@ pub fn write_key_file(path: &Path, key: &MasterKey) -> Result<(), String> {
         .map_err(|e| format!("Failed to write key file '{}': {}", path.display(), e))?;
 
     // Set restrictive permissions (owner read/write only)
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(path, perms)
-            .map_err(|e| format!("Failed to set key file permissions: {}", e))?;
-    }
+    crate::platform::set_file_permissions_secure(path)
+        .map_err(|e| format!("Failed to set key file permissions: {}", e))?;
 
     Ok(())
 }

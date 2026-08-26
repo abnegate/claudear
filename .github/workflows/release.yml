@@ -13,7 +13,7 @@ env:
 
 jobs:
   build-release:
-    name: Build Release
+    name: Build Release (${{ matrix.asset_name }})
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -21,21 +21,49 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             asset_name: claudear-linux-amd64
+            binary_name: claudear
           - os: macos-latest
             target: aarch64-apple-darwin
             asset_name: claudear-macos-arm64
+            binary_name: claudear
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset_name: claudear-windows-amd64
+            binary_name: claudear.exe
 
     steps:
       - uses: actions/checkout@v6
 
-      - name: Set version from tag
-        id: version
+      - name: Set version from tag (Unix)
+        if: runner.os != 'Windows'
+        id: version_unix
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           VERSION="${RELEASE_TAG#v}"
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
           sed -i.bak '/^\[package\]/,/^$/ s/^version = .*/version = "'"${VERSION}"'"/' Cargo.toml && rm -f Cargo.toml.bak
+
+      - name: Set version from tag (Windows)
+        if: runner.os == 'Windows'
+        id: version_windows
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        shell: pwsh
+        run: |
+          $VERSION = $env:RELEASE_TAG -replace '^v', ''
+          echo "version=$VERSION" >> $env:GITHUB_OUTPUT
+          (Get-Content Cargo.toml) -replace '^version = ".*"', "version = `"$VERSION`"" | Set-Content Cargo.toml
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          if [ -n "${{ steps.version_unix.outputs.version }}" ]; then
+            echo "version=${{ steps.version_unix.outputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${{ steps.version_windows.outputs.version }}" >> $GITHUB_OUTPUT
+          fi
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -64,17 +92,33 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package binary
+      - name: Package binary (Unix)
+        if: runner.os != 'Windows'
         run: |
           mkdir -p release
-          cp target/${{ matrix.target }}/release/claudear release/${{ matrix.asset_name }}
+          cp target/${{ matrix.target }}/release/${{ matrix.binary_name }} release/${{ matrix.asset_name }}
           cd release
           tar -czvf ${{ matrix.asset_name }}.tar.gz ${{ matrix.asset_name }}
 
-      - name: Upload Release Asset
+      - name: Package binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "release/${{ matrix.asset_name }}.exe"
+          Compress-Archive -Path "release/${{ matrix.asset_name }}.exe" -DestinationPath "release/${{ matrix.asset_name }}.zip"
+
+      - name: Upload Release Asset (Unix)
+        if: runner.os != 'Windows'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release upload "${{ github.ref_name }}" release/${{ matrix.asset_name }}.tar.gz --clobber
+
+      - name: Upload Release Asset (Windows)
+        if: runner.os == 'Windows'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.ref_name }}" release/${{ matrix.asset_name }}.zip --clobber
 
   publish-docker:
     name: Publish Docker Image

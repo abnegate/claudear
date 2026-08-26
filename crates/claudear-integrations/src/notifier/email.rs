@@ -39,7 +39,13 @@ impl EmailNotifier {
                 AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(host)
             };
 
-            Some(builder.port(config.smtp_port).credentials(creds).build())
+            Some(
+                builder
+                    .port(config.smtp_port)
+                    .credentials(creds)
+                    .timeout(Some(std::time::Duration::from_secs(10)))
+                    .build(),
+            )
         } else {
             None
         };

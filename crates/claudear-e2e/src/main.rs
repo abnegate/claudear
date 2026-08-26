@@ -252,6 +252,8 @@ fn reviewer_token(scm: &str) -> Option<String> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    claudear::init_tls();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

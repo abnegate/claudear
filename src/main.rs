@@ -1659,6 +1659,9 @@ fn daemonize() -> anyhow::Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Install ring as the global TLS crypto provider (must happen before any HTTPS calls)
+    claudear::init_tls();
+
     // Resolve the user's login shell PATH so that user-local binaries
     // (e.g. claude via nvm/node) are discoverable when started via systemd.
     enrich_path_from_login_shell();

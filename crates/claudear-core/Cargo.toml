@@ -51,6 +51,14 @@ dirs = { workspace = true }
 # Database (optional, just for From<rusqlite::Error>)
 rusqlite = { workspace = true, optional = true }
 
+# Process checking and IPC on Unix
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Process checking on Windows
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 toml = { workspace = true }

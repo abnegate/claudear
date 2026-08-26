@@ -496,7 +496,7 @@ mod tests {
 
     #[test]
     fn test_validate_model_path_directory() {
-        let result = validate_model_path(&PathBuf::from("/tmp"));
+        let result = validate_model_path(&std::env::temp_dir());
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not a file"));
     }

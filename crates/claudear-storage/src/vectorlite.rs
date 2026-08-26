@@ -45,6 +45,8 @@ pub fn try_load_vectorlite(conn: &Connection) -> Result<bool> {
         // Local development
         "./vectorlite.so",
         "./vectorlite.dylib",
+        // Windows paths
+        "./vectorlite.dll",
     ];
 
     for path in common_paths {

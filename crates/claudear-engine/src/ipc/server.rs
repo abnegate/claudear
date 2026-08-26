@@ -1,13 +1,18 @@
-//! IPC server implementation using Unix sockets.
+//! IPC server implementation.
+//!
+//! Transport details (Unix sockets vs TCP) are abstracted by the
+//! [`super::transport`] module — this file is platform-agnostic.
 
 use super::protocol::{
     ActivityEntry, ActivityType, IpcCommand, IpcData, IpcResponse, WatcherState,
 };
+use super::transport::{self, IpcStream};
 use super::{
     cleanup_stale_files, default_socket_path, remove_pid_file, remove_socket_file, write_pid_file,
 };
 use crate::watcher::Watcher;
 use claudear_core::error::Result;
+use claudear_core::platform;
 use claudear_core::types::{ActivityLogEntry, FixAttemptStatus};
 use claudear_integrations::notifier::Notifier;
 use claudear_integrations::source::IssueSource;
@@ -19,7 +24,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, Mutex, RwLock, Semaphore};
 
 /// Default maximum number of activity entries to keep (can be overridden via config).
@@ -28,7 +32,7 @@ const DEFAULT_MAX_ACTIVITY_ENTRIES: usize = 10_000;
 /// Maximum number of concurrent IPC connections.
 const MAX_CONCURRENT_CONNECTIONS: usize = 64;
 
-/// IPC server that listens on a Unix socket.
+/// IPC server that listens on a Unix socket (or TCP on Windows).
 pub struct IpcServer {
     socket_path: PathBuf,
     tracker: Arc<dyn FixAttemptTracker>,
@@ -237,7 +241,7 @@ impl IpcServer {
         // Clean up any stale files from previous runs
         cleanup_stale_files();
 
-        // Remove existing socket file if present
+        // Remove existing socket/port file if present
         if self.socket_path.exists() {
             std::fs::remove_file(&self.socket_path)?;
         }
@@ -245,17 +249,12 @@ impl IpcServer {
         // Write PID file
         write_pid_file()?;
 
-        // Bind to socket
-        let listener = UnixListener::bind(&self.socket_path)?;
+        // Bind the IPC listener (Unix socket or TCP — handled by transport)
+        let listener = transport::bind(&self.socket_path)?;
         tracing::info!("IPC server listening on {:?}", self.socket_path);
 
-        // Set permissions (owner only)
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            std::fs::set_permissions(&self.socket_path, perms)?;
-        }
+        // Restrict socket file permissions on Unix (no-op on Windows)
+        platform::set_file_permissions_secure(&self.socket_path)?;
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let conn_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
@@ -315,9 +314,9 @@ impl IpcServer {
     }
 }
 
-/// Handle a single IPC connection.
+/// Handle a single IPC connection (platform-agnostic via [`IpcStream`]).
 async fn handle_connection(
-    stream: UnixStream,
+    stream: IpcStream,
     tracker: Arc<dyn FixAttemptTracker>,
     sources: Vec<Arc<dyn IssueSource>>,
     notifier: Arc<dyn Notifier>,

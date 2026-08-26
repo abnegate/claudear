@@ -286,13 +286,8 @@ fn save_credentials(creds: &ManifestConversionResponse, base_url: &str) -> Resul
         ))
     })?;
 
-    // Set restrictive permissions on the PEM file (Unix only)
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        fs::set_permissions(pem_path, perms).ok();
-    }
+    // Set restrictive permissions on the PEM file
+    claudear_core::platform::set_file_permissions_secure(pem_path.as_ref()).ok();
 
     // Update .env file
     let env_path = Path::new(".env");

@@ -1,0 +1,20 @@
+# Ensure consistent line endings across all platforms.
+# This prevents Windows autocrlf from changing file contents and
+# causing test failures or unexpected diffs.
+* text=auto eol=lf
+
+# Explicitly mark binary files
+*.png binary
+*.ico binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.eot binary
+
+# Windows-specific files keep CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf

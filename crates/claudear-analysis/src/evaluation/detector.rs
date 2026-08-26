@@ -598,13 +598,7 @@ pub fn detect_tools(project_dir: &Path, overrides: &ToolOverrides) -> Vec<Detect
 }
 
 fn which_exists(binary: &str) -> bool {
-    std::process::Command::new("which")
-        .arg(binary)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    claudear_core::platform::command_exists(binary)
 }
 
 fn shell_words(cmd: &str) -> Vec<String> {
@@ -878,8 +872,11 @@ mod tests {
 
     #[test]
     fn test_which_exists_for_known_binary() {
-        // "ls" should exist on all Unix systems
+        // Use a binary that exists on all platforms
+        #[cfg(not(windows))]
         assert!(which_exists("ls"));
+        #[cfg(windows)]
+        assert!(which_exists("cmd"));
     }
 
     #[test]
