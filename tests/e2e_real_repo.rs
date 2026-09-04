@@ -162,7 +162,7 @@ struct E2eHarness {
     source: Arc<TaskSource>,
     notifier: Arc<RecordingNotifier>,
     tracker: Arc<SqliteTracker>,
-    watcher: Arc<Watcher>,
+    watcher: Watcher,
 }
 
 fn run_git(cwd: &Path, args: &[&str]) {
@@ -359,7 +359,7 @@ fn create_harness(tasks: Vec<Issue>) -> E2eHarness {
             tracker.clone(),
         ));
 
-    let watcher = Arc::new(Watcher::new(WatcherOptions {
+    let watcher = Watcher::new(WatcherOptions {
         config: build_config(&temp_dir),
         sources: vec![source.clone() as Arc<dyn IssueSource>],
         notifier: notifier.clone() as Arc<dyn Notifier>,
@@ -381,10 +381,7 @@ fn create_harness(tasks: Vec<Issue>) -> E2eHarness {
         qa_agent: None,
         dry_run: false,
         llm_engine: None,
-    }));
-    // trigger_issue spawns tracked processing and refuses once the watcher is
-    // stopping, so mark it running for these one-shot triggers.
-    watcher.set_running(true);
+    });
 
     E2eHarness {
         _temp_dir: temp_dir,
