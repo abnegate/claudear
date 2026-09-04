@@ -1695,20 +1695,10 @@ fn main() -> anyhow::Result<()> {
         scope.set_tag("app.component", "claudear-backend");
     });
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?;
-    let result = runtime.block_on(async_main(cli));
-
-    // Bound runtime teardown. The watcher's shutdown drain aborts stragglers and
-    // detaches any still parked in non-preemptible blocking work (block_in_place
-    // bridging a wedged LLM call), but dropping the runtime by default waits
-    // indefinitely for such work to return, so an orphaned operation could still
-    // stall a redeploy's SIGTERM. shutdown_timeout caps that wait and detaches
-    // whatever remains, which the process exit then reclaims.
-    runtime.shutdown_timeout(std::time::Duration::from_secs(5));
-
-    result
+        .build()?
+        .block_on(async_main(cli))
 }
 
 async fn async_main(cli: Cli) -> anyhow::Result<()> {
@@ -3820,7 +3810,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 tracker.clone(),
             )));
 
-        let watcher = Arc::new(Watcher::new(WatcherOptions {
+        let watcher = Watcher::new(WatcherOptions {
             config: config.clone(),
             sources,
             notifier,
@@ -3842,10 +3832,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             qa_agent: None,
             dry_run: false,
             llm_engine: None,
-        }));
-        // One-shot retry: trigger_issue spawns tracked processing and refuses
-        // once the watcher is stopping, so mark it running for the duration.
-        watcher.set_running(true);
+        });
 
         for attempt in ready {
             println!("\n  Retrying [{}] {}...", attempt.source, attempt.short_id);
@@ -4375,9 +4362,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 }
 
                 Commands::Trigger { source, issue_id } => {
-                    // trigger_issue spawns tracked processing and refuses once the
-                    // watcher is stopping, so mark it running for this one-shot.
-                    watcher.set_running(true);
                     watcher.trigger_issue(&source, &issue_id).await?;
                 }
 
