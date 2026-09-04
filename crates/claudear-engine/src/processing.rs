@@ -5951,7 +5951,13 @@ mod tests {
 
         // No reply_to_message_id metadata, so assemble_reply_chain short-circuits
         // to None (no network) and the classifier verdict alone decides routing.
-        let issue = Issue::new("id-1", "S-1", "NullPointerException", "https://s/1", "sentry");
+        let issue = Issue::new(
+            "id-1",
+            "S-1",
+            "NullPointerException",
+            "https://s/1",
+            "sentry",
+        );
 
         assert!(
             processor.classify_is_bug_or_security(&issue).await,
