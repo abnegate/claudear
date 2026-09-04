@@ -1290,7 +1290,7 @@ impl Watcher {
     ///
     /// This polls the ReviewWatcher for any new CHANGES_REQUESTED or COMMENTED reviews
     /// and triggers Claude to address the feedback.
-    pub async fn check_reviews(self: &Arc<Self>) -> Result<()> {
+    pub async fn check_reviews(&self) -> Result<()> {
         let review_watcher = match &self.review_watcher {
             Some(rw) => rw,
             None => return Ok(()),
@@ -1433,7 +1433,7 @@ impl Watcher {
     /// This creates a new Claude session with the original issue context plus
     /// the review feedback appended to help Claude understand what to fix.
     async fn process_review_action(
-        self: &Arc<Self>,
+        &self,
         attempt: &claudear_core::types::FixAttempt,
         feedback: &str,
     ) -> Result<()> {
@@ -2466,7 +2466,7 @@ Create a PR with your changes.{custom_instructions}"#,
 
     /// Run housekeeping tasks: retries, cascades, and metrics.
     /// Called on the global timer, separate from per-source polling.
-    pub async fn run_housekeeping_cycle(self: &Arc<Self>) -> Result<()> {
+    pub async fn run_housekeeping_cycle(&self) -> Result<()> {
         let housekeeping_started_at = std::time::Instant::now();
 
         // Run retries, PR merge cascades, and release cascades concurrently
@@ -2533,7 +2533,7 @@ Create a PR with your changes.{custom_instructions}"#,
     }
 
     /// Process any issues that are ready for retry.
-    async fn process_ready_retries(self: &Arc<Self>) -> Result<()> {
+    async fn process_ready_retries(&self) -> Result<()> {
         // Skip retries while paused for rate limits — attempting them would
         // just burn retry attempts without doing any work.
         if self.is_rate_limit_paused().await {
@@ -4605,7 +4605,7 @@ Create a PR with your changes.{custom_instructions}"#,
     }
 
     /// Manually trigger processing for a specific issue.
-    pub async fn trigger_issue(self: &Arc<Self>, source_name: &str, issue_id: &str) -> Result<()> {
+    pub async fn trigger_issue(&self, source_name: &str, issue_id: &str) -> Result<()> {
         self.trigger_issue_with_feedback(
             source_name,
             issue_id,
@@ -4618,7 +4618,7 @@ Create a PR with your changes.{custom_instructions}"#,
 
     /// Manually trigger processing for a specific issue with optional review feedback context.
     pub async fn trigger_issue_with_feedback(
-        self: &Arc<Self>,
+        &self,
         source_name: &str,
         issue_id: &str,
         review_feedback: Option<String>,
@@ -4645,52 +4645,16 @@ Create a PR with your changes.{custom_instructions}"#,
             issue.set_metadata("trigger_reason", reason);
         }
 
-        // Run processing as a tracked background task rather than inline. Retries
-        // and review-feedback both reach this path from the housekeeping loop; if
-        // process_issue ran inline it would be part of that loop's future and get
-        // aborted mid-operation on shutdown (the select! in start() drops the
-        // losing branch, and drain_or_abort only joins spawn_handles). Spawning
-        // into spawn_handles makes the work survive the drop and be joined by the
-        // graceful drain, exactly like the poll-loop dispatch path.
-        //
-        // `started_rx` preserves the original synchronous contract: it fires at
-        // the end of process_issue, so awaiting it here blocks until processing
-        // completes and yields whether it actually began. If the caller is dropped
-        // on shutdown, the spawned task keeps running and drain joins it.
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let watcher = Arc::clone(self);
-        let source = Arc::clone(source);
-        {
-            let mut handles = self.spawn_handles.lock().await;
-            // Re-check is_running under the same lock drain_or_abort takes, then
-            // push atomically. This closes the shutdown race: a trigger either
-            // records its handle before the drain's take (so shutdown joins it)
-            // or sees the stop here and never spawns.
-            if !self.is_running.load(Ordering::SeqCst) {
-                return Err(claudear_core::error::Error::source(
-                    source_name,
-                    format!("Watcher stopping; trigger for {} not started", issue_id),
-                ));
-            }
-            handles.retain(|h| !h.is_finished());
-            handles.push(tokio::spawn(async move {
-                let started = watcher
-                    .process_issue(
-                        source,
-                        issue,
-                        match_result,
-                        review_feedback,
-                        existing_pr_branch,
-                        None,
-                    )
-                    .await;
-                let _ = started_tx.send(started);
-            }));
-        }
-
-        // A dropped sender (task aborted by drain before it finished) reports
-        // not-started; during shutdown the caller is typically already gone.
-        let started = started_rx.await.unwrap_or(false);
+        let started = self
+            .process_issue(
+                Arc::clone(source),
+                issue,
+                match_result,
+                review_feedback,
+                existing_pr_branch,
+                None,
+            )
+            .await;
         if !started {
             return Err(claudear_core::error::Error::source(
                 source_name,
@@ -6837,9 +6801,6 @@ mod tests {
         let sources = vec![source];
 
         let watcher = create_test_watcher(notifier, tracker, sources, true); // dry run
-                                                                             // Manual triggers only arrive while the daemon is running; the trigger now
-                                                                             // spawns tracked work and refuses once the watcher is stopping.
-        watcher.is_running.store(true, Ordering::SeqCst);
 
         let result = watcher.trigger_issue("mock", "123").await;
         // Should succeed in dry run (doesn't actually process)
@@ -6862,7 +6823,6 @@ mod tests {
         let sources = vec![source];
 
         let watcher = create_test_watcher(notifier, tracker, sources, true);
-        watcher.is_running.store(true, Ordering::SeqCst);
         {
             let mut processing = watcher.processing.write().await;
             processing.insert("mock:123".to_string());
@@ -6874,63 +6834,6 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("already being processed"));
-    }
-
-    /// Retries and review feedback trigger processing through
-    /// [`Watcher::trigger_issue_with_feedback`]. That processing must run as a
-    /// tracked task in `spawn_handles` so graceful shutdown drains it, rather
-    /// than inline where the housekeeping loop's cancellation would abort it
-    /// mid-operation. Regression for the inline-processing-escapes-drain bug.
-    #[tokio::test]
-    async fn test_trigger_records_spawn_handle_for_drain() {
-        let notifier = Arc::new(MockNotifier::new(true));
-        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
-
-        let issues = vec![Issue::new(
-            "123",
-            "T-123",
-            "Test Issue",
-            "http://example.com/123",
-            "mock",
-        )];
-        let source = Arc::new(MockSource::with_issues("mock", issues)) as Arc<dyn IssueSource>;
-
-        let watcher = create_test_watcher(notifier, tracker, vec![source], true); // dry run
-        watcher.is_running.store(true, Ordering::SeqCst);
-
-        assert!(watcher.spawn_handles.lock().await.is_empty());
-
-        watcher.trigger_issue("mock", "123").await.unwrap();
-
-        // The processing task was recorded in spawn_handles (retained until the
-        // next reap), so drain_or_abort will join it on shutdown.
-        assert_eq!(watcher.spawn_handles.lock().await.len(), 1);
-    }
-
-    /// A trigger that arrives after the watcher has stopped must not spawn new
-    /// tracked work, or it could push a handle into spawn_handles after
-    /// drain_or_abort already took the vector and be missed by the drain.
-    #[tokio::test]
-    async fn test_trigger_refuses_once_stopped() {
-        let notifier = Arc::new(MockNotifier::new(true));
-        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
-
-        let issues = vec![Issue::new(
-            "123",
-            "T-123",
-            "Test Issue",
-            "http://example.com/123",
-            "mock",
-        )];
-        let source = Arc::new(MockSource::with_issues("mock", issues)) as Arc<dyn IssueSource>;
-
-        let watcher = create_test_watcher(notifier, tracker, vec![source], true);
-        // is_running left false: watcher is stopping / not started.
-
-        let result = watcher.trigger_issue("mock", "123").await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("stopping"));
-        assert!(watcher.spawn_handles.lock().await.is_empty());
     }
 
     #[test]
