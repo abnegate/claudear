@@ -251,10 +251,7 @@ pub struct Watcher {
     /// agent-based (Claude Code) by default, local-LLM-based when `qa.use_llm` is
     /// set.
     intent_classifier: Option<Arc<dyn crate::intent::IntentClassifier>>,
-    /// Join handles for in-flight issue-processing tasks.
-    ///
-    /// Finished handles are reaped by [`Self::reap_finished_spawn_handles`] so the
-    /// list stays bounded by concurrency rather than by issues-processed-ever.
+    /// Join handles for spawned issue-processing tasks (used by tests to drain).
     spawn_handles: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
@@ -350,26 +347,10 @@ impl Watcher {
         }
     }
 
-    /// Drop the join handles of issue-processing tasks that have already finished.
-    ///
-    /// Tokio keeps a task's allocation alive until both the scheduler and the last
-    /// `JoinHandle` are dropped. Retaining handles for completed tasks therefore
-    /// pins one whole `process_issue` state machine per issue for the lifetime of
-    /// the daemon, which grows RSS without bound until the container is OOM-killed.
-    /// Called once per poll cycle and on every dispatch.
-    async fn reap_finished_spawn_handles(&self) {
-        let mut handles = self.spawn_handles.lock().await;
-        handles.retain(|handle| !handle.is_finished());
-        // Also release the backing capacity of an unusually large burst.
-        if handles.capacity() > handles.len().saturating_mul(4) + 16 {
-            handles.shrink_to_fit();
-        }
-    }
-
     /// Wait for all spawned issue-processing tasks to complete.
     ///
-    /// Used on graceful shutdown, and by tests that need to assert on processing
-    /// outcomes after a non-blocking `poll_source` call.
+    /// Primarily useful in tests that need to assert on processing outcomes
+    /// after a non-blocking `poll_source` call.
     pub async fn drain_spawned_tasks(&self) {
         let handles: Vec<_> = {
             let mut guard = self.spawn_handles.lock().await;
@@ -1192,11 +1173,6 @@ impl Watcher {
             let remaining = max_wait.saturating_sub(start.elapsed());
             let _ = tokio::time::timeout(remaining, self.slot_available.notified()).await;
         }
-
-        // Join the spawned tasks themselves so shutdown waits for their teardown too,
-        // and so their handles are released rather than dropped with the watcher.
-        let remaining = max_wait.saturating_sub(start.elapsed());
-        let _ = tokio::time::timeout(remaining, self.drain_spawned_tasks()).await;
 
         tracing::info!("Claude Watcher stopped gracefully");
     }
@@ -3070,10 +3046,6 @@ Create a PR with your changes.{custom_instructions}"#,
 
     /// Poll a single source.
     async fn poll_source(self: &Arc<Self>, source: &Arc<dyn IssueSource>) -> Result<()> {
-        // Release tasks that finished since the last cycle before doing anything else,
-        // so an idle or rate-limit-paused watcher still frees their allocations.
-        self.reap_finished_spawn_handles().await;
-
         if self.is_rate_limit_paused().await {
             return Ok(());
         }
@@ -3579,11 +3551,7 @@ Create a PR with your changes.{custom_instructions}"#,
                     .process_issue(source_clone, issue, match_result, None, None, intent)
                     .await;
             });
-            {
-                let mut handles = self.spawn_handles.lock().await;
-                handles.retain(|h| !h.is_finished());
-                handles.push(handle);
-            }
+            self.spawn_handles.lock().await.push(handle);
 
             // Add delay between starting new issues (skip trailing delay after the last item).
             if i + 1 < total && self.config.processing_delay_ms > 0 {
@@ -3989,9 +3957,7 @@ Create a PR with your changes.{custom_instructions}"#,
         };
 
         let context_provider = crate::processing::SourceContext(source.as_ref());
-        // Box the pipeline future: `run` inlines the whole processing state machine,
-        // so awaiting it directly would make every spawned task allocation carry it.
-        let outcome = Box::pin(processor.run(input, &context_provider)).await;
+        let outcome = processor.run(input, &context_provider).await;
 
         // Watcher-specific: check for rate limit errors and pause if needed
         if let ProcessingOutcome::Failed { ref error } = outcome {
@@ -5142,55 +5108,6 @@ mod tests {
             dry_run,
             llm_engine: None,
         }))
-    }
-
-    /// Completed issue-processing tasks must not stay pinned in `spawn_handles`.
-    ///
-    /// Tokio frees a task's allocation only once the scheduler *and* the last
-    /// `JoinHandle` are gone, so a push-only handle list leaks one whole
-    /// `process_issue` state machine per issue, growing the daemon's RSS until
-    /// the container is OOM-killed.
-    #[tokio::test]
-    async fn test_watcher_reaps_finished_spawn_handles() {
-        let notifier = Arc::new(MockNotifier::new(true));
-        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
-        // Source with no issues: this test is about reaping, not dispatching.
-        let source = Arc::new(MockSource::new("reap")) as Arc<dyn IssueSource>;
-
-        let watcher = create_test_watcher(notifier, tracker, vec![source.clone()], false);
-        watcher.is_running.store(true, Ordering::SeqCst);
-
-        // Stand in for the handles left behind by 64 already-processed issues.
-        {
-            let mut handles = watcher.spawn_handles.lock().await;
-            for _ in 0..64 {
-                handles.push(tokio::spawn(async {}));
-            }
-        }
-
-        // Let every simulated task run to completion.
-        for _ in 0..1000 {
-            if watcher
-                .spawn_handles
-                .lock()
-                .await
-                .iter()
-                .all(|handle| handle.is_finished())
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-
-        // A normal poll cycle must release them; nothing calls drain in production.
-        watcher.poll_source(&source).await.unwrap();
-
-        let retained = watcher.spawn_handles.lock().await.len();
-        assert_eq!(
-            retained, 0,
-            "watcher retained {retained} handles for completed issue-processing tasks; \
-             each one pins a full process_issue allocation for the daemon's lifetime"
-        );
     }
 
     #[test]
