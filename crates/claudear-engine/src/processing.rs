@@ -2426,7 +2426,11 @@ impl IssueProcessor {
                     input.attempt_id,
                 )
                 .await;
-            if verdict.reproduced {
+            // Telemetry sources (Sentry) ship a stacktrace that already pinpoints
+            // the defect; an inability to reproduce at runtime is expected and must
+            // not deflect to a "share repro steps" reply. Always fix these.
+            let always_fix = input.issue.source == "sentry";
+            if verdict.reproduced || always_fix {
                 // Carry the diagnosis into the fix run.
                 input.diagnosis = Some(verdict);
                 return match self.run_inner(input, context_provider).await {
