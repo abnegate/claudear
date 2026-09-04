@@ -49,15 +49,6 @@ const MAX_REVIEW_COMMENT_ATTEMPTS: i64 = 5;
 /// external git/LLM operation with no internal timeout cannot stall a redeploy.
 const GRACEFUL_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Grace given to aborted stragglers to actually terminate before the drain
-/// stops waiting on them. `abort()` only takes effect at a task's next await, so
-/// a task parked in synchronous blocking work (`block_in_place` bridging an LLM
-/// call) won't observe it until that call returns. Capping the post-abort join
-/// keeps shutdown bounded instead of re-introducing the unbounded wait the
-/// budget exists to prevent; any handle still unfinished is dropped and left to
-/// runtime teardown, which is imminent on the shutdown path anyway.
-const ABORT_JOIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
-
 /// Extracts the source name from a processing key of the form "source:issue_id".
 fn source_from_processing_key(key: &str) -> &str {
     key.split_once(':').map_or(key, |(source, _)| source)
@@ -1229,26 +1220,11 @@ impl Watcher {
                 aborted += 1;
             }
         }
-        // Bound the post-abort join too. Aborting a task parked in synchronous
-        // blocking work (block_in_place around an LLM call) does not preempt it,
-        // so an unbounded await here would let a wedged operation stall shutdown
-        // despite the budget. Joined via &mut so the timeout drops only the
-        // borrow; handles still unfinished are dropped when the vec goes out of
-        // scope, detached for imminent runtime teardown.
-        let reaped = tokio::time::timeout(ABORT_JOIN_GRACE, async {
-            for handle in &mut handles {
-                let _ = handle.await;
-            }
-        })
-        .await;
-        let detached = if reaped.is_ok() {
-            0
-        } else {
-            handles.iter().filter(|h| !h.is_finished()).count()
-        };
+        for handle in handles {
+            let _ = handle.await;
+        }
         tracing::warn!(
             aborted,
-            detached,
             budget_secs = budget.as_secs(),
             "Graceful shutdown budget exhausted; aborted in-flight tasks to avoid stalling shutdown"
         );
@@ -5395,51 +5371,6 @@ mod tests {
             "the wedged task was aborted, not awaited to completion"
         );
         assert!(watcher.spawn_handles.lock().await.is_empty());
-    }
-
-    /// A task parked in synchronous blocking work does not observe `abort()`
-    /// until it returns, so the post-abort join must be bounded too or a wedged
-    /// LLM call stalls shutdown despite the budget.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn test_drain_or_abort_bounds_post_abort_join_for_blocking_task() {
-        use std::time::{Duration, Instant};
-        let notifier = Arc::new(MockNotifier::new(true));
-        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
-        let source = Arc::new(MockSource::new("drain")) as Arc<dyn IssueSource>;
-        let watcher = create_test_watcher(notifier, tracker, vec![source], false);
-
-        // Blocking recv() never yields to the scheduler, so aborting the task has
-        // no effect until it is released — a stand-in for block_in_place bridging
-        // a wedged LLM call.
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        {
-            let mut handles = watcher.spawn_handles.lock().await;
-            handles.push(tokio::spawn(async move {
-                let _ = release_rx.recv();
-            }));
-        }
-
-        // With an unbounded post-abort join this only returns once the task is
-        // released; the abort-join grace must cap it instead.
-        let start = Instant::now();
-        let drained = tokio::time::timeout(
-            Duration::from_secs(20),
-            watcher.drain_or_abort(Duration::from_millis(50)),
-        )
-        .await;
-        let elapsed = start.elapsed();
-        // Release the wedged worker so runtime teardown is prompt regardless.
-        let _ = release_tx.send(());
-
-        assert!(
-            drained.is_ok(),
-            "drain_or_abort never returned; post-abort join is unbounded for a \
-             task wedged in non-preemptible blocking work"
-        );
-        assert!(
-            elapsed < ABORT_JOIN_GRACE + Duration::from_secs(3),
-            "post-abort join stalled shutdown past the abort grace"
-        );
     }
 
     #[test]
