@@ -55,8 +55,7 @@ const GRACEFUL_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_sec
 /// call) won't observe it until that call returns. Capping the post-abort join
 /// keeps shutdown bounded instead of re-introducing the unbounded wait the
 /// budget exists to prevent; any handle still unfinished is dropped and left to
-/// runtime teardown, which `main` bounds via `Runtime::shutdown_timeout` so an
-/// orphaned blocking op cannot stall process exit either.
+/// runtime teardown, which is imminent on the shutdown path anyway.
 const ABORT_JOIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Extracts the source name from a processing key of the form "source:issue_id".
